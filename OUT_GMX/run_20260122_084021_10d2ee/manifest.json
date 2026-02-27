@@ -1,0 +1,80 @@
+{
+  "version": "1.0",
+  "created_at": "2026-01-22T08:40:21.472917",
+  "updated_at": "2026-01-22T08:40:23.126262",
+  "options": {
+    "forcefield": "GAFF2",
+    "charge_method": "CM5",
+    "system_id": "SYS_001",
+    "run_id": "run_20260122_084021_10d2ee",
+    "stage": "packmol",
+    "resume": true,
+    "force": false
+  },
+  "tool_versions": {
+    "packmol": "not found",
+    "gromacs": "2021.4-Ubuntu-2021.4-2",
+    "htpolynet": "detected"
+  },
+  "input_assets": [],
+  "composition": {
+    "molecule_counts": {
+      "LiTFSI": 52,
+      "PC": 244,
+      "tetraglyme": 67,
+      "OEGMA": 42,
+      "UEMA": 50,
+      "MPB": 28,
+      "PEGDMA": 11,
+      "TPO-L": 6
+    },
+    "mw_used": {
+      "LiTFSI": 287.09,
+      "PC": 102.09,
+      "tetraglyme": 222.28,
+      "OEGMA": 475.0,
+      "UEMA": 201.22,
+      "MPB": 178.19,
+      "PEGDMA": 750.0,
+      "TPO-L": 316.37
+    },
+    "target_wt_pct": {
+      "LiTFSI": 15.0,
+      "PC": 25.0,
+      "tetraglyme": 15.0,
+      "OEGMA": 20.0,
+      "UEMA": 10.0,
+      "MPB": 5.0,
+      "PEGDMA": 8.0,
+      "TPO-L": 2.0
+    },
+    "actual_wt_pct": {
+      "LiTFSI": 14.9466249178764,
+      "PC": 24.939902847358535,
+      "tetraglyme": 14.910661740485626,
+      "OEGMA": 19.97398076130202,
+      "UEMA": 10.07309375636389,
+      "MPB": 4.99531737804408,
+      "PEGDMA": 8.259916856177526,
+      "TPO-L": 1.9005017423919155
+    },
+    "max_deviation_pct": 0.2599168561775258,
+    "total_mass_g": 1.6585454239697978e-19,
+    "total_molecules": 500,
+    "box_length_nm": 5.494258939392672,
+    "rho0_g_cm3": 1.0,
+    "box_volume_nm3": 165.85454239697978,
+    "dry_run": true
+  },
+  "mdp_patches": {},
+  "sanitizer_outputs": {},
+  "commands": [],
+  "charge_corrections": [],
+  "stages": {
+    "packmol": {
+      "status": "completed",
+      "message": null,
+      "updated_at": "2026-01-22T08:40:23.126258"
+    }
+  }
+}

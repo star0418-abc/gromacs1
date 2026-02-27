@@ -1,0 +1,64 @@
+; NVT Equilibration MDP Template (GPE-optimized)
+; Canonical ensemble with V-rescale thermostat
+; Gel-safe LINCS settings for crosslinked polymer networks
+
+title           = NVT equilibration
+
+; Run parameters
+integrator      = md
+dt              = 0.002         ; 2 fs timestep
+nsteps          = 500000        ; 1 ns total (science-quality default for polymer relaxation)
+continuation    = no            ; Fresh start for NVT
+
+; Output control (avoid redundant IO: use compressed trajectory only)
+nstxout         = 0             ; Don't write full-precision coords
+nstvout         = 0             ; Don't write velocities
+nstlog          = 1000          ; Write log every 2 ps
+nstenergy       = 1000          ; Write energies every 2 ps
+nstxout-compressed = 1000       ; Compressed trajectory every 2 ps
+
+; Neighbor searching
+cutoff-scheme   = Verlet
+nstlist         = 20
+rlist           = 1.2
+verlet-buffer-tolerance = 0.005
+
+; Electrostatics
+coulombtype     = PME
+rcoulomb        = 1.2
+pme_order       = 4
+fourierspacing  = 0.16
+
+; Van der Waals
+vdwtype         = Cut-off
+rvdw            = 1.2
+DispCorr        = EnerPres
+
+; Temperature coupling
+tcoupl          = V-rescale
+tc-grps         = System
+tau_t           = 0.1
+ref_t           = 300
+
+; Pressure coupling (off for NVT)
+pcoupl          = no
+
+; Velocity generation (deterministic seed for reproducibility)
+gen_vel         = yes
+gen_temp        = 300
+gen_seed        = 20260123      ; Fixed seed for reproducibility (override via CLI --gen-seed)
+
+; Constraints (gel-safe LINCS settings)
+constraints     = h-bonds
+constraint_algorithm = LINCS
+lincs_iter      = 3             ; Increased for stressed crosslinked regions
+lincs_order     = 8             ; Higher accuracy for gel systems
+lincs_warnangle = 30            ; Warn if bond angle deviation > 30 degrees
+
+; Periodic boundary conditions
+pbc             = xyz
+
+; COM motion removal
+comm-mode       = Linear
+comm-grps       = System
+nstcomm         = 100

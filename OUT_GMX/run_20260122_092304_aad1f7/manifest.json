@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "created_at": "2026-01-22T09:23:04.393750",
+  "updated_at": "2026-01-22T09:23:05.295735",
+  "options": {
+    "forcefield": "GAFF2",
+    "charge_method": "CM5",
+    "system_id": "SYS_001",
+    "run_id": "run_20260122_092304_aad1f7",
+    "stage": "gmx_em",
+    "resume": true,
+    "force": false
+  },
+  "tool_versions": {
+    "packmol": "not found",
+    "gromacs": "2021.4-Ubuntu-2021.4-2",
+    "htpolynet": "detected"
+  },
+  "input_assets": [],
+  "composition": {},
+  "mdp_patches": {},
+  "sanitizer_outputs": {},
+  "commands": [],
+  "charge_corrections": [],
+  "stages": {
+    "gmx_em": {
+      "status": "failed",
+      "message": "Stage returned False",
+      "updated_at": "2026-01-22T09:23:05.295729"
+    }
+  }
+}

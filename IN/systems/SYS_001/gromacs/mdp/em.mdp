@@ -1,0 +1,40 @@
+; Energy Minimization MDP Template (GPE-optimized)
+; Steepest descent for robust initial minimization of crosslinked gel systems
+
+; Run parameters
+integrator      = steep         ; Steepest descent energy minimization
+emtol           = 500.0         ; Stop when max force < 500 kJ/mol/nm
+emstep          = 0.005         ; Energy step size (reduced for dense/crosslinked systems)
+nsteps          = 50000         ; Maximum number of steps
+
+; Output control
+nstxout         = 0             ; Don't write full coords (no trajectory needed for EM)
+nstlog          = 500           ; Write log every 500 steps
+nstenergy       = 500           ; Write energies every 500 steps
+
+; Neighbor searching
+cutoff-scheme   = Verlet
+nstlist         = 10
+rlist           = 1.2           ; Consistent with NVT/NPT/MD stages
+
+; Electrostatics
+coulombtype     = PME
+rcoulomb        = 1.2           ; Consistent across all stages
+pme_order       = 4             ; Explicit PME interpolation order
+fourierspacing  = 0.16          ; Explicit PME grid spacing
+
+; Van der Waals
+vdwtype         = Cut-off
+rvdw            = 1.2           ; Consistent across all stages
+DispCorr        = Ener          ; Long-range dispersion correction (no pressure in EM)
+
+; Constraints (optional for EM, but consistent with later stages if enabled)
+constraints     = none
+
+; Periodic boundary conditions
+pbc             = xyz
+
+; LINCS settings (for reference; not used with constraints=none)
+lincs_warnangle = 30            ; Warn if bond angle deviation exceeds 30 degrees
+
+; Note: EM does not use temperature or pressure coupling

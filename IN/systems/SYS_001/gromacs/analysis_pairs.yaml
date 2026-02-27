@@ -1,0 +1,25 @@
+# Create placeholder analysis_pairs.yaml
+# This file defines atom pairs for RDF/CN analysis
+
+pairs:
+  - name: "Li-O_ether"
+    group1: "Li"
+    group2: "resname PEO and name O*"
+    description: "Li+ coordination with ether oxygens"
+  
+  - name: "Li-O_TFSI"
+    group1: "Li"
+    group2: "resname TFSI and name O*"
+    description: "Li+ coordination with TFSI oxygens"
+  
+  - name: "Li-N_TFSI"
+    group1: "Li"
+    group2: "resname TFSI and name N*"
+    description: "Li+ coordination with TFSI nitrogen"
+
+rdf_settings:
+  bin_width: 0.002  # nm
+  max_r: 1.5  # nm
+
+cn_settings:
+  cutoff_nm: 0.35  # First solvation shell cutoff
