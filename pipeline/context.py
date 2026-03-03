@@ -624,6 +624,13 @@ _CONTEXT_ARG_SPECS = (
         numeric_or_bool=True,
     ),
     ContextArgSpec(
+        "strict_gro_conversion",
+        "strict_gro_conversion",
+        _as_bool,
+        False,
+        numeric_or_bool=True,
+    ),
+    ContextArgSpec(
         "packmol_max_box_expand_fraction",
         "packmol_max_box_expand_fraction",
         _as_float,
@@ -1164,6 +1171,7 @@ class PipelineContext:
     packmol_pdb_scale: Optional[float] = None  # Override: 0.1 for Å, 1.0 for nm
     packmol_edge_margin_nm: float = 0.2  # Edge margin for molecule placement
     strict_packmol_units: bool = True  # Fail-fast on ambiguous unit inference
+    strict_gro_conversion: bool = False  # Fail-fast if PDB->GRO conversion command is missing/fails
     packmol_max_box_expand_fraction: float = 0.03  # Hard cap for auto box expansion during PDB->GRO
     packmol_min_contact_nm: float = 0.18  # Li-heavy minimum safe contact distance
     packmol_random_seed: bool = False  # Explicit opt-in for non-deterministic PACKMOL seed

@@ -1586,6 +1586,19 @@ Forcefield internal naming:
         help="Allow ambiguous unit inference to fallback to scale=1.0 (nm) instead of failing.",
     )
     parser.add_argument(
+        "--strict-gro-conversion",
+        dest="strict_gro_conversion",
+        action="store_true",
+        default=False,
+        help="Fail-fast if PDB->GRO conversion cannot run or editconf fails.",
+    )
+    parser.add_argument(
+        "--no-strict-gro-conversion",
+        dest="strict_gro_conversion",
+        action="store_false",
+        help="Allow non-strict behavior for PDB->GRO conversion failures.",
+    )
+    parser.add_argument(
         "--packmol-edge-margin",
         type=float,
         default=0.2,

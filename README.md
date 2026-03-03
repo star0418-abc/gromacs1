@@ -317,12 +317,15 @@ python run_pipeline.py ... --stage packmol
 python run_pipeline.py ... --stage packmol --allow-partial-publish
 ```
 
-Manifest records `publish_status`: `complete`, `partial`, or `failed`.
-Manifest also records `packmol_publish_ok` (boolean). In non-strict mode, publish failures set `packmol_publish_ok=false` and emit a strong stale-asset warning.
+Manifest records `publish_status` and explicit `publish_details` (`pdb_published`, `gro_published`, `both_published`).
+`packmol_publish_ok` is only true when **both** PDB and GRO were updated.
+If GRO conversion is not publishable, PACKMOL publish is blocked to prevent `new PDB + stale GRO` drift and the stage is marked non-complete.
 
 ### Strict GRO Conversion Mode
 
-When `--strict-gro-conversion` is enabled (recommended for production), the pipeline fails immediately if `gmx` is not found in PATH during PDB→GRO conversion:
+When `--strict-gro-conversion` is enabled (recommended for production), the pipeline fails immediately if:
+- the resolved GROMACS command is missing, or
+- `editconf` execution fails / returns nonzero.
 
 ```bash
 # Strict mode (recommended) - fail if gmx missing
@@ -369,14 +372,14 @@ python run_pipeline.py ... --stage packmol --no-strict-gro-conversion
 |-------------------------|---------|
 | `success` | GRO file created successfully |
 | `skipped_no_gmx` | gmx not found, non-strict mode, continued with PDB |
-| `skipped_strict_fail` | gmx not found, strict mode, stage failed |
-| `failed` | gmx found but conversion failed |
+| `skipped_strict_fail` | strict mode blocked conversion due missing/invalid gmx command |
+| `failed` | command executed but conversion failed |
 
 ### Versioned Publishing
 
 Before overwriting `IN/systems/<SYS_ID>/packmol/{pdb,gro}/initial.*`:
-1. Previous files archived to `_archive/YYYYMMDD-HHMMSS/`
-2. SHA256 hashes written to `current.sha256`
+1. Previous files archived to `_archive/YYYYMMDD-HHMMSS/` (with collision-safe `-NN` suffix if needed)
+2. SHA256 hashes written to `current.sha256` via atomic temp-file + `os.replace`
 3. `os.replace()` used for atomic overwrites (safe on Windows/Linux)
 4. Temp files use collision-safe naming: `.{name}.tmp.{pid}_{uuid8}` (safe for parallel runs)
 
@@ -444,6 +447,7 @@ The PACKMOL stage catches and handles errors gracefully instead of crashing with
 | Error Condition | Behavior |
 |-----------------|----------|
 | Missing `composition.yaml` (no `--allow-default-recipe`) | `mark_failed()` + actionable error message + return False |
+| Malformed/invalid `composition.yaml` schema | `mark_failed()` + schema/type/value error message + return False |
 | Malformed/Empty PDB (no atoms parsed) | `mark_failed()` + error message + return False |
 | Publish failure (strict mode) | `mark_failed()` + error message + return False |
 
@@ -593,7 +597,8 @@ How it works:
   - fraction of Li within `r_li_polymer` of polymer oxygen
   - fraction of Li within `r_li_solvent` of solvent oxygen
   - fraction of Li within `r_li_tfsi` of any TFSI atom (close-pair proxy)
-- Computes Li-to-nearest-heavy-atom distances and fails fast when `min_distance_nm < packmol_min_contact_nm` (default `0.18 nm`).
+- If polymer/solvent oxygen separation is unreliable (weak/ambiguous resname metadata), metrics are marked degraded instead of silently reusing one oxygen pool for both.
+- Computes Li-to-nearest-heavy-atom distances for diagnostics in all modes; hard-fail enforcement remains preassembly-bias-only (`li_near_polymer` / `li_solvent_shell`) by design.
 - If thresholds are not met, runs deterministic preassembly repair rounds controlled by `packmol_preassembly_retry_count` (independent of `--allow-density-reduction`).
 
 Default metric cutoffs and thresholds:
@@ -2015,6 +2020,7 @@ python run_pipeline.py ... --omp-num-threads 4
 - If a context override exists, it is used.
 - Else if `GMX_CMD` is set (e.g., `GMX_CMD=gmx_mpi`), it is used.
 - Otherwise defaults to `gmx`.
+This resolution order is used consistently across GROMACS stages and PACKMOL PDB→GRO conversion.
 
 **GPU rule:**
 - Normal command path uses `-gpu_id`.
@@ -2355,10 +2361,11 @@ Per-pair analysis results include:
 | `--min-conversion` | Float (0-1) | None | Minimum crosslinking conversion threshold |
 | `--htpolynet-timeout` | Integer (s) | 43200 | HTPolyNet subprocess timeout (`0` disables timeout) |
 | `--unsafe-allow-out-fallback` | Flag | False | Allow reading initial structure from `OUT_GMX` when IN/published asset is missing |
-| `--allow-partial-publish` | Flag | False | Allow PACKMOL to succeed on publish failure |
+| `--allow-partial-publish` | Flag | False | Downgrade immediate strict publish raise, but stage is still non-complete when both PDB+GRO are not updated |
 | `--allow-density-reduction` | Flag | False | Explicitly allow density-backoff retries (still floor/cap constrained and audited) |
 | `--packmol-pdb-scale` | `0.1`, `1.0` | None | Explicit PACKMOL PDB scale override (Å→nm or nm→nm) |
 | `--no-strict-packmol-units` | Flag | False | Relax non-scale checks; ambiguous unit scale still requires explicit `--packmol-pdb-scale` |
+| `--strict-gro-conversion` / `--no-strict-gro-conversion` | Flag pair | False | Fail-fast on missing/failed `editconf` conversion command (strict) or allow non-strict conversion warnings |
 | `--packmol-edge-margin` | Float (nm) | 0.2 | Placement edge margin for PACKMOL inside-box constraints |
 | `--packmol-preassembly-mode` | `none`, `li_near_polymer`, `li_solvent_shell` | `none` | Optional Li preassembly bias mode |
 | `--packmol-preassembly-li-fraction` | Float (0-1) | 1.0 | Fraction of Li molecules targeted by preassembly hints |

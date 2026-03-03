@@ -477,7 +477,7 @@ class PackmolStage(BaseStage):
         print(f"\n  Loading composition...")
         try:
             config, composition_source, composition_extras = self._load_composition_config(ctx)
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValueError, TypeError) as e:
             print(f"\n  [ERROR] {e}")
             self.mark_failed(ctx, str(e))
             return False
@@ -806,6 +806,8 @@ class PackmolStage(BaseStage):
             sample_cap=int(preassembly_settings.get("sample_cap", 4000)),
         )
         if li_contact_diag:
+            li_contact_diag["enforcement_scope"] = "preassembly_bias_modes_only"
+            li_contact_diag["enforced"] = preassembly_mode != "none"
             unit_diagnostics["li_heavy_contact"] = li_contact_diag
             li_min = li_contact_diag.get("min_distance_nm")
             if (
@@ -847,6 +849,15 @@ class PackmolStage(BaseStage):
                 )
                 self.mark_failed(ctx, msg)
                 return False
+            if (
+                preassembly_mode == "none"
+                and li_min is not None
+                and li_min < float(getattr(ctx, "packmol_min_contact_nm", 0.18))
+            ):
+                print(
+                    "  [WARNING] Dangerous Li-heavy close contact detected, but hard-fail "
+                    "is preassembly-bias-only by design (mode=none)."
+                )
 
         # === Recompute achieved density from FINAL box ===
         unit_diagnostics["packmol_box_nm"] = box.length_nm
@@ -913,34 +924,91 @@ class PackmolStage(BaseStage):
                 )
                 self.mark_failed(ctx, msg)
                 return False
+
+        # Prevent publishing mixed freshness states (new PDB + stale/missing GRO).
+        gro_publish_ready = bool(
+            gro_path
+            and gro_path.exists()
+            and unit_diagnostics.get("gro_conversion_status") == "success"
+        )
+        unit_diagnostics["gro_publish_ready"] = gro_publish_ready
+        unit_diagnostics["strict_gro_conversion"] = bool(
+            getattr(ctx, "strict_gro_conversion", False)
+        )
+        if not gro_publish_ready:
+            msg = (
+                "GRO conversion did not produce a fresh publishable initial.gro; "
+                "skipping IN publish to prevent PDB/GRO drift."
+            )
+            print(f"\n  [ERROR] {msg}")
+            self._record_manifest(
+                ctx, composition, box, config,
+                target_density=target_density,
+                achieved_density=achieved_density,
+                retries_used=retries_used,
+                publish_status="incomplete_missing_gro",
+                packmol_publish_ok=False,
+                composition_source=composition_source,
+                unit_diagnostics=unit_diagnostics,
+                retry_attempts=retry_attempts,
+                retry_meta=retry_meta,
+                box_length_target_nm=target_box_length_nm,
+                box_length_final_nm=final_box_nm,
+                publish_details={
+                    "pdb_published": False,
+                    "gro_published": False,
+                    "both_published": False,
+                    "gro_conversion_status": unit_diagnostics.get("gro_conversion_status"),
+                    "publish_guard": "blocked_missing_gro",
+                },
+                preassembly_info=(
+                    {
+                        "mode": preassembly_mode,
+                        "settings": preassembly_settings,
+                        "round_reports": preassembly_reports,
+                        "final_report": preassembly_reports[-1] if preassembly_reports else None,
+                        "repair_attempted": bool(max_repair_rounds > 0),
+                        "repair_retries_used": max(0, len(preassembly_reports) - 1),
+                        "contact_safety": li_contact_diag if li_contact_diag else None,
+                    }
+                    if preassembly_mode != "none"
+                    else None
+                ),
+            )
+            self.mark_failed(ctx, msg)
+            return False
         
         # === Step 7: Atomic publish with versioning ===
         print(f"\n  Publishing output to IN/systems/{ctx.system_id}/packmol/...")
         
         published_files = []
         publish_errors = []
+        publish_status = "failed"
+        published_pdb = False
+        published_gro = False
         
         try:
             # Archive previous versions before overwriting
             self._archive_previous_versions(system_packmol_dir)
             
-            # Publish initial.pdb
+            # Publish GRO first so a missing/failed GRO never leaves new PDB + old GRO drift.
+            dest_gro = system_packmol_dir / "gro" / "initial.gro"
+            gro_hash = self._atomic_publish(gro_path, dest_gro)
+            published_files.append({"path": str(dest_gro), "sha256": gro_hash})
+            published_gro = True
+            print(f"  - Published: {dest_gro}")
+
+            # Publish PDB second once GRO update is guaranteed.
             dest_pdb = system_packmol_dir / "pdb" / "initial.pdb"
             pdb_hash = self._atomic_publish(output_pdb, dest_pdb)
             published_files.append({"path": str(dest_pdb), "sha256": pdb_hash})
+            published_pdb = True
             print(f"  - Published: {dest_pdb}")
-            
-            # Publish initial.gro if conversion succeeded
-            if gro_path and gro_path.exists():
-                dest_gro = system_packmol_dir / "gro" / "initial.gro"
-                gro_hash = self._atomic_publish(gro_path, dest_gro)
-                published_files.append({"path": str(dest_gro), "sha256": gro_hash})
-                print(f"  - Published: {dest_gro}")
             
             # Write current.sha256 for traceability
             self._write_hash_manifest(system_packmol_dir, published_files)
             
-            publish_status = "complete"
+            publish_status = "complete" if (published_pdb and published_gro) else "partial"
                 
         except Exception as e:
             publish_errors.append(str(e))
@@ -955,6 +1023,13 @@ class PackmolStage(BaseStage):
                     "packmol_publish_ok=false; downstream stages may read stale IN/packmol assets."
                 )
                 publish_status = "partial" if published_files else "failed"
+
+        publish_details = {
+            "pdb_published": bool(published_pdb),
+            "gro_published": bool(published_gro),
+            "both_published": bool(published_pdb and published_gro),
+            "gro_conversion_status": unit_diagnostics.get("gro_conversion_status"),
+        }
         
         # === Step 8: Record in manifest ===
         self._record_manifest(
@@ -964,13 +1039,14 @@ class PackmolStage(BaseStage):
             retries_used=retries_used,
             published_files=published_files,
             publish_status=publish_status,
-            packmol_publish_ok=(publish_status == "complete"),
+            packmol_publish_ok=(published_pdb and published_gro),
             composition_source=composition_source,
             unit_diagnostics=unit_diagnostics,
             retry_attempts=retry_attempts,  # NEW: Include all attempt diagnostics
             retry_meta=retry_meta,
             box_length_target_nm=target_box_length_nm,
             box_length_final_nm=final_box_nm,
+            publish_details=publish_details,
             preassembly_info=(
                 {
                     "mode": preassembly_mode,
@@ -985,6 +1061,14 @@ class PackmolStage(BaseStage):
                 else None
             ),
         )
+
+        if not (published_pdb and published_gro):
+            msg = (
+                f"PACKMOL publish did not update both PDB and GRO (status={publish_status}). "
+                "Stage marked failed to avoid false-success state."
+            )
+            self.mark_failed(ctx, msg)
+            return False
         
         print(f"\n  PACKMOL stage completed successfully!")
         return True
@@ -1014,44 +1098,54 @@ class PackmolStage(BaseStage):
             content_hash = self._compute_file_hash(system_composition_path)
             
             # Load YAML
-            with open(system_composition_path, "r") as f:
-                data = yaml.safe_load(f)
-            if not isinstance(data, dict):
-                data = {}
+            try:
+                with open(system_composition_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                raise ValueError(
+                    f"Malformed YAML in composition file '{system_composition_path}': {e}"
+                ) from e
+
+            data = self._validate_composition_yaml_schema(data, system_composition_path)
             
             # Parse into CompositionConfig
             molecules = []
-            for mol_data in data.get("molecules", []):
-                molecules.append(MoleculeSpec(
-                    name=mol_data["name"],
-                    mw_g_mol=mol_data["mw_g_mol"],
-                    wt_pct=mol_data["wt_pct"],
-                    min_count=mol_data.get("min_count", 1),
-                    role=mol_data.get("role"),
-                    mw_note=mol_data.get("mw_note"),
-                    pdi=mol_data.get("pdi"),
-                ))
-            
-            config = CompositionConfig(
-                molecules=molecules,
-                anchor_name=data.get("anchor_name"),
-                anchor_count=data.get("anchor_count"),
-                target_total_molecules=data.get("target_total_molecules", 500),
-                wt_deviation_threshold=data.get("wt_deviation_threshold", 2.0),
-                rho0_g_cm3=data.get("rho0_g_cm3", 1.0),
-                rho0_min_g_cm3=data.get("rho0_min_g_cm3", 0.95),
-                rho0_max_g_cm3=data.get("rho0_max_g_cm3", 1.05),
-                gel_min_crosslinker_count=data.get("gel_min_crosslinker_count", 0),
-                gel_policy=data.get("gel_policy"),
-                auto_scale_to_gel_min_crosslinker=data.get(
-                    "auto_scale_to_gel_min_crosslinker",
-                    False,
-                ),
-                polymerization_shrinkage_vol_frac=data.get(
-                    "polymerization_shrinkage_vol_frac",
-                    0.0,
-                ),
-            )
+            try:
+                for mol_data in data["molecules"]:
+                    molecules.append(MoleculeSpec(
+                        name=mol_data["name"],
+                        mw_g_mol=mol_data["mw_g_mol"],
+                        wt_pct=mol_data["wt_pct"],
+                        min_count=mol_data.get("min_count", 1),
+                        role=mol_data.get("role"),
+                        mw_note=mol_data.get("mw_note"),
+                        pdi=mol_data.get("pdi"),
+                    ))
+
+                config = CompositionConfig(
+                    molecules=molecules,
+                    anchor_name=data.get("anchor_name"),
+                    anchor_count=data.get("anchor_count"),
+                    target_total_molecules=data.get("target_total_molecules", 500),
+                    wt_deviation_threshold=data.get("wt_deviation_threshold", 2.0),
+                    rho0_g_cm3=data.get("rho0_g_cm3", 1.0),
+                    rho0_min_g_cm3=data.get("rho0_min_g_cm3", 0.95),
+                    rho0_max_g_cm3=data.get("rho0_max_g_cm3", 1.05),
+                    gel_min_crosslinker_count=data.get("gel_min_crosslinker_count", 0),
+                    gel_policy=data.get("gel_policy"),
+                    auto_scale_to_gel_min_crosslinker=data.get(
+                        "auto_scale_to_gel_min_crosslinker",
+                        False,
+                    ),
+                    polymerization_shrinkage_vol_frac=data.get(
+                        "polymerization_shrinkage_vol_frac",
+                        0.0,
+                    ),
+                )
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    f"Invalid composition schema/values in '{system_composition_path}': {e}"
+                ) from e
 
             preassembly_cfg = data.get("packmol_preassembly", {})
             if not isinstance(preassembly_cfg, dict):
@@ -1097,6 +1191,87 @@ class PackmolStage(BaseStage):
                 "default_recipe:get_default_recipe()",
                 {"packmol_preassembly": {}},
             )
+
+    @staticmethod
+    def _is_numeric(value: Any) -> bool:
+        """Return True for int/float-like scalars except booleans."""
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def _validate_composition_yaml_schema(self, data: Any, source_path: Path) -> Dict[str, Any]:
+        """Validate composition.yaml structure before constructing CompositionConfig."""
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"composition.yaml at '{source_path}' must be a mapping with a 'molecules' list."
+            )
+
+        molecules = data.get("molecules")
+        if not isinstance(molecules, list) or not molecules:
+            raise ValueError(
+                f"composition.yaml at '{source_path}' must define a non-empty 'molecules' list."
+            )
+
+        for idx, mol in enumerate(molecules):
+            prefix = f"molecules[{idx}]"
+            if not isinstance(mol, dict):
+                raise ValueError(f"{prefix} must be a mapping.")
+            for key in ("name", "mw_g_mol", "wt_pct"):
+                if key not in mol:
+                    raise ValueError(f"{prefix} is missing required key '{key}'.")
+            if not isinstance(mol.get("name"), str) or not mol.get("name", "").strip():
+                raise ValueError(f"{prefix}.name must be a non-empty string.")
+            if not self._is_numeric(mol.get("mw_g_mol")):
+                raise ValueError(f"{prefix}.mw_g_mol must be numeric.")
+            if not self._is_numeric(mol.get("wt_pct")):
+                raise ValueError(f"{prefix}.wt_pct must be numeric.")
+            if "min_count" in mol:
+                min_count = mol.get("min_count")
+                if not isinstance(min_count, int) or isinstance(min_count, bool):
+                    raise ValueError(f"{prefix}.min_count must be an integer.")
+                if min_count < 0:
+                    raise ValueError(f"{prefix}.min_count must be >= 0.")
+            for opt_key in ("role", "mw_note"):
+                if opt_key in mol and mol.get(opt_key) is not None and not isinstance(mol.get(opt_key), str):
+                    raise ValueError(f"{prefix}.{opt_key} must be a string when provided.")
+            if "pdi" in mol and mol.get("pdi") is not None:
+                pdi = mol.get("pdi")
+                if not self._is_numeric(pdi):
+                    raise ValueError(f"{prefix}.pdi must be numeric when provided.")
+                if float(pdi) <= 0:
+                    raise ValueError(f"{prefix}.pdi must be > 0 when provided.")
+
+        numeric_fields = (
+            "target_total_molecules",
+            "wt_deviation_threshold",
+            "rho0_g_cm3",
+            "rho0_min_g_cm3",
+            "rho0_max_g_cm3",
+            "gel_min_crosslinker_count",
+            "anchor_count",
+            "polymerization_shrinkage_vol_frac",
+        )
+        for field in numeric_fields:
+            if field in data and data.get(field) is not None and not self._is_numeric(data.get(field)):
+                raise ValueError(f"{field} must be numeric when provided.")
+
+        if "anchor_name" in data and data.get("anchor_name") is not None:
+            if not isinstance(data.get("anchor_name"), str) or not data.get("anchor_name", "").strip():
+                raise ValueError("anchor_name must be a non-empty string when provided.")
+
+        if "gel_policy" in data and data.get("gel_policy") is not None and not isinstance(data.get("gel_policy"), str):
+            raise ValueError("gel_policy must be a string when provided.")
+
+        if (
+            "auto_scale_to_gel_min_crosslinker" in data
+            and data.get("auto_scale_to_gel_min_crosslinker") is not None
+            and not isinstance(data.get("auto_scale_to_gel_min_crosslinker"), bool)
+        ):
+            raise ValueError("auto_scale_to_gel_min_crosslinker must be boolean when provided.")
+
+        preassembly_cfg = data.get("packmol_preassembly")
+        if preassembly_cfg is not None and not isinstance(preassembly_cfg, dict):
+            raise ValueError("packmol_preassembly must be a mapping when provided.")
+
+        return data
 
     def _resolve_preassembly_settings(
         self,
@@ -1209,8 +1384,15 @@ class PackmolStage(BaseStage):
         try:
             with open(template_path, "r") as handle:
                 if template_fmt == "gro":
-                    lines = handle.readlines()[2:]
-                    for line in lines:
+                    lines = handle.readlines()
+                    if len(lines) < 3:
+                        return []
+                    try:
+                        atom_count = int(lines[1].strip())
+                    except (ValueError, IndexError):
+                        atom_count = max(0, len(lines) - 3)
+                    atom_lines = lines[2:2 + atom_count]
+                    for line in atom_lines:
                         if len(line) < 15:
                             continue
                         resname = line[5:10].strip()
@@ -1324,6 +1506,11 @@ class PackmolStage(BaseStage):
         polymer_o_coords: List[Tuple[float, float, float]] = []
         solvent_o_coords: List[Tuple[float, float, float]] = []
         tfsi_coords: List[Tuple[float, float, float]] = []
+        fallback_methods: Dict[str, str] = {
+            "polymer_oxygen": "template_resname_match",
+            "solvent_oxygen": "template_resname_match",
+        }
+        degraded_reasons: List[str] = []
 
         for atom in atoms:
             x_nm = atom["x"] * scale_factor
@@ -1346,18 +1533,63 @@ class PackmolStage(BaseStage):
                     solvent_o_coords.append(coord)
 
         # Fallbacks when template resnames are sparse (e.g., generic templates).
+        oxygen_pool_non_tfsi: List[Tuple[float, float, float, str]] = []
+        for atom in atoms:
+            if str(atom.get("element", "")).upper() != "O":
+                continue
+            res_norm = _normalize_name(atom.get("resname", ""))
+            if res_norm in tfsi_resnames:
+                continue
+            oxygen_pool_non_tfsi.append(
+                (atom["x"] * scale_factor, atom["y"] * scale_factor, atom["z"] * scale_factor, res_norm)
+            )
+
         if not polymer_o_coords and preassembly_settings.get("polymer_names"):
-            polymer_o_coords = [
-                (a["x"] * scale_factor, a["y"] * scale_factor, a["z"] * scale_factor)
-                for a in atoms
-                if str(a.get("element", "")).upper() == "O" and _normalize_name(a.get("resname", "")) not in tfsi_resnames
-            ]
+            if solvent_resnames:
+                polymer_o_coords = [
+                    (x, y, z)
+                    for x, y, z, res_norm in oxygen_pool_non_tfsi
+                    if res_norm not in solvent_resnames
+                ]
+                if polymer_o_coords:
+                    fallback_methods["polymer_oxygen"] = "fallback_non_tfsi_excluding_solvent_resnames"
+                else:
+                    fallback_methods["polymer_oxygen"] = "unresolved"
+                    degraded_reasons.append(
+                        "polymer oxygen fallback unresolved: solvent/non-solvent separation unavailable."
+                    )
+            else:
+                fallback_methods["polymer_oxygen"] = "unresolved"
+                degraded_reasons.append(
+                    "polymer oxygen fallback unresolved: missing solvent resname metadata."
+                )
         if not solvent_o_coords and preassembly_settings.get("solvent_names"):
-            solvent_o_coords = [
-                (a["x"] * scale_factor, a["y"] * scale_factor, a["z"] * scale_factor)
-                for a in atoms
-                if str(a.get("element", "")).upper() == "O" and _normalize_name(a.get("resname", "")) not in tfsi_resnames
-            ]
+            if polymer_resnames:
+                solvent_o_coords = [
+                    (x, y, z)
+                    for x, y, z, res_norm in oxygen_pool_non_tfsi
+                    if res_norm not in polymer_resnames
+                ]
+                if solvent_o_coords:
+                    fallback_methods["solvent_oxygen"] = "fallback_non_tfsi_excluding_polymer_resnames"
+                else:
+                    fallback_methods["solvent_oxygen"] = "unresolved"
+                    degraded_reasons.append(
+                        "solvent oxygen fallback unresolved: polymer/non-polymer separation unavailable."
+                    )
+            else:
+                fallback_methods["solvent_oxygen"] = "unresolved"
+                degraded_reasons.append(
+                    "solvent oxygen fallback unresolved: missing polymer resname metadata."
+                )
+
+        if polymer_o_coords and solvent_o_coords:
+            if set(polymer_o_coords) == set(solvent_o_coords):
+                solvent_o_coords = []
+                fallback_methods["solvent_oxygen"] = "disabled_identical_pool"
+                degraded_reasons.append(
+                    "polymer and solvent oxygen fallback pools became identical; solvent metric disabled."
+                )
 
         li_polymer = self._fraction_within_cutoff(
             li_coords,
@@ -1396,6 +1628,9 @@ class PackmolStage(BaseStage):
                 "solvent_resnames": sorted(solvent_resnames),
                 "tfsi_resnames": sorted(tfsi_resnames),
                 "method": "template_resname_plus_atom_element",
+                "fallback_methods": fallback_methods,
+                "degraded": bool(degraded_reasons),
+                "degraded_reasons": degraded_reasons,
             },
         }
 
@@ -1655,6 +1890,7 @@ class PackmolStage(BaseStage):
         box_length_final_nm: Optional[float] = None,
         density_reduction_used: Optional[bool] = None,
         density_reduction_reason: Optional[str] = None,
+        publish_details: Optional[Dict[str, Any]] = None,
         preassembly_info: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record composition and box data in manifest with canonical keys."""
@@ -1782,6 +2018,8 @@ class PackmolStage(BaseStage):
         
         if published_files:
             comp_data["published_files"] = published_files
+        if publish_details:
+            comp_data["publish_details"] = publish_details
         
         # Add unit handling diagnostics (Part B)
         if unit_diagnostics:
@@ -1902,10 +2140,15 @@ class PackmolStage(BaseStage):
         if not files_to_archive:
             return
         
-        # Create archive directory
+        # Create archive directory with collision-safe suffixes.
+        archive_root = system_packmol_dir / "_archive"
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        archive_dir = system_packmol_dir / "_archive" / timestamp
-        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir = archive_root / timestamp
+        suffix = 1
+        while archive_dir.exists():
+            archive_dir = archive_root / f"{timestamp}-{suffix:02d}"
+            suffix += 1
+        archive_dir.mkdir(parents=True, exist_ok=False)
         
         # Copy files to archive
         for src_file in files_to_archive:
@@ -1927,8 +2170,21 @@ class PackmolStage(BaseStage):
             path = Path(pf["path"])
             lines.append(f"{pf['sha256']}  {path.name}")
         
-        hash_file.parent.mkdir(parents=True, exist_ok=True)
-        hash_file.write_text("\n".join(lines) + "\n")
+        self._atomic_write_text(hash_file, "\n".join(lines) + "\n")
+
+    def _atomic_write_text(self, path: Path, content: str, encoding: str = "utf-8") -> None:
+        """Write text atomically via temp-file + replace."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.parent / f".{path.name}.tmp.{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        try:
+            temp_path.write_text(content, encoding=encoding)
+            os.replace(temp_path, path)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
     def _write_scaled_pdb(self, src_path: Path, dest_path: Path, scale_factor: float) -> None:
         """
@@ -1985,7 +2241,9 @@ class PackmolStage(BaseStage):
         Returns:
             Tuple of (gro_path or None, final_box_nm, unit_diagnostics dict)
         """
+        import shlex
         import subprocess
+        from ..gromacs_cmd import resolve_gmx_command
         
         margin_nm_requested = ctx.packmol_edge_margin_nm  # Default 0.2 nm
         max_margin_fraction = 0.02  # Adaptive cap (2% of smallest box dimension)
@@ -1993,6 +2251,7 @@ class PackmolStage(BaseStage):
         margin_nm_effective = min(margin_nm_requested, max_margin_nm)
         max_expand_fraction = max(0.0, float(getattr(ctx, "packmol_max_box_expand_fraction", 0.03)))
         epsilon_nm = 1e-3  # Small translation (<< 0.01 nm) to avoid boundary artifacts
+        strict_gro = bool(getattr(ctx, "strict_gro_conversion", False))
         
         unit_diagnostics = {
             "box_length_nm": box_length_nm,
@@ -2031,25 +2290,43 @@ class PackmolStage(BaseStage):
             "gro_conversion_status": "pending",  # enum: "success", "skipped_no_gmx", "skipped_strict_fail", "failed"
         }
         
-        gmx_exe = shutil.which("gmx")
+        gmx_cmd_used = resolve_gmx_command(ctx)
+        unit_diagnostics["gmx_cmd_used"] = gmx_cmd_used
+        try:
+            gmx_tokens = shlex.split(str(gmx_cmd_used))
+        except ValueError as e:
+            unit_diagnostics["gro_conversion_status"] = "skipped_strict_fail" if strict_gro else "failed"
+            raise PackmolConversionError(
+                f"Invalid GROMACS command in configuration: {gmx_cmd_used!r} ({e})",
+                unit_diagnostics,
+            ) from e
+        if not gmx_tokens:
+            unit_diagnostics["gro_conversion_status"] = "skipped_strict_fail" if strict_gro else "failed"
+            raise PackmolConversionError(
+                "Resolved GROMACS command is empty; cannot run editconf.",
+                unit_diagnostics,
+            )
+        gmx_frontend = gmx_tokens[0]
+        gmx_exe = shutil.which(gmx_frontend)
+        unit_diagnostics["gmx_cmd_tokens"] = gmx_tokens
+        unit_diagnostics["gmx_frontend_resolved"] = gmx_exe
         if not gmx_exe:
             # Fail-fast in strict mode when GRO conversion is required
-            strict_gro = getattr(ctx, "strict_gro_conversion", False)
             if strict_gro:
                 unit_diagnostics["gro_conversion_status"] = "skipped_strict_fail"
                 unit_diagnostics["input_units_inferred"] = "unknown"
                 unit_diagnostics["scale_override_source"] = "none"
                 raise PackmolConversionError(
-                    "PACKMOL requires GRO conversion but 'gmx' is not found in PATH.\n"
+                    f"PACKMOL requires GRO conversion but '{gmx_frontend}' (from '{gmx_cmd_used}') is not found in PATH.\n"
                     "This is a fail-fast error because --strict-gro-conversion is enabled.\n"
                     "Solutions:\n"
-                    "  1. Install GROMACS and ensure 'gmx' is in your PATH\n"
+                    f"  1. Install GROMACS and ensure '{gmx_frontend}' is in your PATH\n"
                     "  2. Use --no-strict-gro-conversion to skip GRO conversion (pipeline will use PDB)\n"
                     "Note: Downstream GROMACS stages require initial.gro; skipping may cause failures.",
                     unit_diagnostics,
                 )
             # Non-strict: warn loudly and continue
-            print(f"  [WARNING] gmx not found, skipping GRO conversion.")
+            print(f"  [WARNING] {gmx_frontend} not found, skipping GRO conversion.")
             print(f"  [WARNING] This may cause issues if downstream stages require initial.gro.")
             print(f"  [WARNING] Use --strict-gro-conversion to fail-fast in this situation.")
             unit_diagnostics["gro_conversion_status"] = "skipped_no_gmx"
@@ -2240,13 +2517,18 @@ class PackmolStage(BaseStage):
                 self._write_scaled_pdb(pdb_path, scaled_pdb, scale_factor)
                 unit_diagnostics["scaled_pdb_path"] = str(scaled_pdb)
             except Exception as e:
-                print(f"  [ERROR] Failed to write scaled PDB: {e}")
                 unit_diagnostics["gro_conversion_status"] = "failed"
+                if strict_gro:
+                    raise PackmolConversionError(
+                        f"Failed to write scaled PDB for GRO conversion: {e}",
+                        unit_diagnostics,
+                    ) from e
+                print(f"  [ERROR] Failed to write scaled PDB: {e}")
                 return None, box_length_nm, unit_diagnostics
 
         # === Step 5: Run gmx editconf with centering translation (NO -scale flag) ===
         cmd = [
-            gmx_exe, "editconf",
+            *gmx_tokens, "editconf",
             "-f", str(scaled_pdb),
             "-o", str(gro_path),
             "-box", str(required_box_nm), str(required_box_nm), str(required_box_nm),
@@ -2255,7 +2537,7 @@ class PackmolStage(BaseStage):
             "-translate", str(translation[0]), str(translation[1]), str(translation[2]),
         ]
 
-        print(f"  - Running: {' '.join(str(c) for c in cmd[:6])}...")  # Truncated for readability
+        print(f"  - Running: {' '.join(str(c) for c in cmd[:8])}...")  # Truncated for readability
         
         try:
             result = subprocess.run(
@@ -2270,12 +2552,23 @@ class PackmolStage(BaseStage):
                 unit_diagnostics["gro_conversion_status"] = "success"
                 return gro_path, required_box_nm, unit_diagnostics
             else:
-                print(f"  [WARNING] gmx editconf failed: {result.stderr[:200]}")
                 unit_diagnostics["gro_conversion_status"] = "failed"
+                stderr_preview = (result.stderr or result.stdout or "").strip()[:300]
+                msg = (
+                    "GRO conversion command failed: "
+                    f"exit_code={result.returncode}; stderr='{stderr_preview}'"
+                )
+                if strict_gro:
+                    raise PackmolConversionError(msg, unit_diagnostics)
+                print(f"  [WARNING] {msg}")
                 return None, box_length_nm, unit_diagnostics
                 
+        except PackmolConversionError:
+            raise
         except Exception as e:
-            print(f"  [WARNING] GRO conversion failed: {e}")
             unit_diagnostics["gro_conversion_status"] = "failed"
+            if strict_gro:
+                raise PackmolConversionError(f"GRO conversion failed: {e}", unit_diagnostics) from e
+            print(f"  [WARNING] GRO conversion failed: {e}")
             return None, box_length_nm, unit_diagnostics
 
