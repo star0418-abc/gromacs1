@@ -688,15 +688,18 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
 
 ## Strict Resume/Force Semantics (GROMACS)
 
-- **Resume (default)**: `resume=True` by default. With no flags, completed stages (with `done.ok`) are skipped.
+- **Resume (default)**: `resume=True` by default. With no flags, completed stages are skipped only when `done.ok` and key stage artifacts/state are coherent.
 - **No-resume**: Use `--no-resume` to run all stages even if they have `done.ok` (e.g., for validation).
 - **Force**: `--force` archives prior outputs to `<stage_dir>/_archive/YYYYmmdd-HHMMSS/` before rerun.
+- **Archive naming is collision-safe**: repeated force reruns in the same second use `-NN` suffixes to avoid collisions/overwrites.
 - **Conflict**: `--force` and `--no-resume` cannot both be set (they are redundant/ambiguous).
-- **MD resume is gated**: production resume requires `md.cpt`, `md.tpr`, `md.mdp`, and `stage_state.json` (written after grompp, before mdrun) with a fingerprint match (MDP, recorded inputs, overrides, commands, `gmx_cmd_used`, `gmx_bin_resolved`, GROMACS version, git commit/dirty). `npt.cpt` is not required for resume.
+- **MD resume is gated**: production resume requires `md.cpt`, `md.mdp`, and `stage_state.json` (plus `md.tpr` unless repair is explicitly enabled) with a compatibility-gate fingerprint match (MDP, recorded inputs, overrides, commands, GROMACS/git provenance). Mutable runtime artifacts (`md.cpt`/`md.tpr` hashes) remain in audit metadata but are excluded from strict resume compatibility gating.
 - **Resume fingerprint uses recorded inputs first**: MD resume comparison resolves `fingerprint_payload` recorded paths from prior `stage_state.json`; if unresolved, it falls back to current inputs with warnings.
-- **Repairable partial state**: if `md.cpt` exists but `md.tpr` is missing, pipeline fails fast by default and tells you to use `--allow-resume-repair` (or restore `md.tpr`). With `--allow-resume-repair`, it rebuilds `md.tpr` via `grompp` and continues with `mdrun -cpi md.cpt -append`.
+- **Repairable partial state**: if `md.cpt` exists but `md.tpr` is missing, pipeline fails fast by default and tells you to use `--allow-resume-repair` (or restore `md.tpr`). With `--allow-resume-repair`, compatibility is validated first, then `md.tpr` is rebuilt via `grompp`, then continuation runs with `mdrun -cpi md.cpt -append`.
 - **Non-repairable partial state**: if `md.tpr` exists but `md.cpt` is missing, continuation is blocked with actionable guidance (restore `md.cpt` or start fresh with `--force`).
 - **No destructive “repair”**: resume-repair never archives/deletes prior outputs.
+- **Resume state refresh**: after successful production resume, `stage_state.json` is rewritten so subsequent resumes stay consistent with latest checkpoint/audit state.
+- **`done.ok` is a final marker**: GROMACS stage sentinels are only written after required outputs and metadata are persisted.
 - **No unsafe implicit restart**: missing `nvt.cpt` or `npt.cpt` is a hard error unless an explicit recovery path is selected, or non-strict auto-fallback can validate `.gro` velocities.
 - **Velocity reset is explicit**: when `--allow-velocity-reset` is used, the MDP is forced to `continuation=no`, `gen_vel=yes`, and `gen_temp` is set (from `--temperature` or template/ref_t).
 - **Velocity reset MDP validation is strict**: for both NPT and production MD velocity-reset paths, final patched MDP must still contain `continuation=no`, `gen_vel=yes`, and matching `gen_temp`.
@@ -734,7 +737,7 @@ All-mode review points:
 
 ## Audit Artifacts & SI Exporter
 
-- **Per-stage**: `OUT_GMX/<RUN_ID>/03_gromacs/<stage>/repro.json` with hashes, commands, host/git/GROMACS provenance (`gmx_cmd_used`, `gmx_bin_resolved`, `version`).
+- **Per-stage**: `OUT_GMX/<RUN_ID>/03_gromacs/<stage>/repro.json` with hashes, commands, host/git/GROMACS provenance (launcher vs binary: `gmx_launcher_token`, `gmx_binary_token`, resolved paths, and version).
 - **Run-level (dispatcher-owned)**: `OUT_GMX/<RUN_ID>/run_report.json` is always written, including on stage failure/interruption. It includes:
   - run identity + selected stage/resume/force
   - deterministic `stages_to_run`
@@ -1734,7 +1737,7 @@ For advanced workflows restarting from a `.gro` with embedded velocities (no che
 
 > [!IMPORTANT]
 > **GRO Velocity Validation**: When using `--allow-gro-velocity-restart`, the pipeline now validates
-> that the `.gro` file contains parseable velocity columns for all atom lines.
+> multiple sampled atom lines across the `.gro` atom block and requires parseable coordinate/velocity columns.
 > If velocities are missing, it fails immediately with a clear error instead of silently starting near 0K.
 
 If `.gro` velocity status is known missing, this is a hard error even in non-strict mode:
@@ -2036,14 +2039,17 @@ These settings apply to all GROMACS stages and are recorded in the manifest.
 
 ### Sentinel Files
 
-Each stage writes `done.ok` on success. With `--resume` (default), completed stages are skipped.
+Each stage writes `done.ok` as a final completion marker after required outputs + metadata are written.  
+With `--resume` (default), completed stages are skipped only when `done.ok` and key artifacts/state files are coherent.
 
 ### GROMACS Checkpoint Resume
 
 - **Same-stage resume** (e.g., continuing production):
   - Auto-detects `md.cpt` in stage directory
   - Uses `mdrun -cpi md.cpt -append`
-  - Requires `md.tpr`, `md.mdp`, and `stage_state.json` fingerprint validation
+  - Requires `md.mdp` + `stage_state.json` compatibility validation; `md.tpr` is required unless explicit repair is enabled
+  - Resume compatibility gate ignores mutable runtime hashes (`md.cpt`/`md.tpr`) while preserving them in audit metadata
+  - On successful resume, `stage_state.json` is refreshed for deterministic repeated resume
   - Optional: `--resume-ignore-runtime` can ignore runtime-only command-base changes
 
 - **Cross-stage transition** (NPT → Production):
@@ -2051,7 +2057,7 @@ Each stage writes `done.ok` on success. With `--resume` (default), completed sta
   - Preserves velocities from equilibration
 
 - **Partial-state repair (production only)**:
-  - `md.cpt` present + `md.tpr` missing: repairable with `--allow-resume-repair` (rebuild `md.tpr` then continue)
+  - `md.cpt` present + `md.tpr` missing: repairable with `--allow-resume-repair` (validate compatibility first, then rebuild `md.tpr`, then continue)
   - `md.tpr` present + `md.cpt` missing: not auto-repairable for continuation
 
 ### Force Re-run
@@ -2067,6 +2073,7 @@ On stage failure:
 3. **No cleanup**: All files preserved for debugging
 
 For long-running `mdrun`, stdout/stderr are streamed to `logs/mdrun.stdout.log` and `logs/mdrun.stderr.log`.
+When streamed commands fail, the raised error now includes bounded stdout/stderr tail excerpts and the same hint quality as non-streaming command paths.
 Crash excerpt extraction uses a bounded progressive tail search (5MB cap): scan tail windows `200 -> 800 -> 2000` lines for failure markers (`Fatal error`, `LINCS`, `constraint`, `nan`, etc.). If found, include:
 - Primary failure excerpt around the last marker (`~80` lines before + `~120` lines after)
 - Trailing tail (`last 80 lines`) for exit context
@@ -2094,6 +2101,7 @@ OUT_GMX/<RUN_ID>/03_gromacs/em/crash_report.txt
 - Stage-aware behavior:
   - `em`, `nvt`, `npt`: TRR is deleted when cleanup is enabled (equilibration TRR is disposable).
   - `md`: TRR is kept when `--analysis-requires-velocities` is set; otherwise deleted when cleanup is enabled.
+    Production note: this is generally safe for coordinate-focused analysis using `.xtc`; keep TRR when velocity/force data are needed (for example Green-Kubo transport workflows).
 
 ## Analysis Stage
 

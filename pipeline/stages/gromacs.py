@@ -53,38 +53,21 @@ from ..gromacs_cmd import resolve_gmx_command
 
 def _gro_has_velocities(gro_path: Path) -> Optional[bool]:
     """
-    Check if a GRO file contains velocity columns.
-    
-    GRO format uses fixed-width columns:
-    - Residue number: columns 1-5 (5 chars)
-    - Residue name: columns 6-10 (5 chars)  
-    - Atom name: columns 11-15 (5 chars)
-    - Atom number: columns 16-20 (5 chars)
-    - Positions X,Y,Z: columns 21-44 (3×8 chars = 24 chars)
-    - Velocities VX,VY,VZ: columns 45-68 (3×8 chars = 24 chars, optional)
-    
-    A line with velocities has at least 44 chars (positions) + 24 chars (velocities) = 68 chars.
-    This implementation is O(1) memory: it reads title, natoms, and only the first atom line.
-    
-    Args:
-        gro_path: Path to GRO file
-        
-    Returns:
-        True if the first atom line has parseable velocity columns.
-        False if file is parseable but velocities are absent/invalid.
-        None if file cannot be read or is malformed/ambiguous.
+    Check if a GRO file robustly carries parseable velocities.
+
+    The check validates multiple atom lines (up to 8 evenly sampled lines across the
+    atom block) to avoid optimistic single-line classification. Returns `None` for
+    malformed/truncated files so restart policy can fail safely.
     """
     if not gro_path.exists():
         return None
 
     try:
         with open(gro_path, "r", encoding="utf-8", errors="replace") as fh:
-            # Title/comment
             title = fh.readline()
             if title == "":
                 return None
 
-            # Atom count
             natoms_line = fh.readline()
             if natoms_line == "":
                 return None
@@ -95,19 +78,48 @@ def _gro_has_velocities(gro_path: Path) -> Optional[bool]:
             if atom_count <= 0:
                 return False
 
-            # GRO velocities are all-or-none in normal output. Check only the first atom line.
-            first_atom_line = fh.readline()
-            if first_atom_line == "":
+            sample_count = min(atom_count, 8)
+            if sample_count <= 1:
+                sample_indices = {1}
+            else:
+                sample_indices = {
+                    1 + int(round(i * (atom_count - 1) / float(sample_count - 1)))
+                    for i in range(sample_count)
+                }
+
+            sampled = 0
+            for atom_idx in range(1, atom_count + 1):
+                atom_line = fh.readline()
+                if atom_line == "":
+                    return None
+                if atom_idx not in sample_indices:
+                    continue
+                sampled += 1
+                line = atom_line.rstrip("\r\n")
+                if len(line) < 44:
+                    return None
+                try:
+                    # Position columns must parse for the line to be considered structurally valid.
+                    float(line[20:28])
+                    float(line[28:36])
+                    float(line[36:44])
+                except ValueError:
+                    return None
+                if len(line) < 68:
+                    return False
+                try:
+                    float(line[44:52])
+                    float(line[52:60])
+                    float(line[60:68])
+                except ValueError:
+                    return False
+
+            if sampled != len(sample_indices):
                 return None
-            line = first_atom_line.rstrip("\r\n")
-            if len(line) < 68:
-                return False
-            try:
-                float(line[44:52])
-                float(line[52:60])
-                float(line[60:68])
-            except ValueError:
-                return False
+
+            # Box line must exist for a structurally valid GRO.
+            if fh.readline() == "":
+                return None
             return True
     except OSError:
         return None
@@ -760,7 +772,22 @@ def _split_command_tokens(cmd: Any) -> List[str]:
     if cmd is None:
         return []
     if isinstance(cmd, (list, tuple)):
-        return [str(part) for part in cmd if part is not None and str(part).strip()]
+        tokens: List[str] = []
+        for idx, part in enumerate(cmd):
+            if part is None:
+                continue
+            raw = str(part).strip()
+            if not raw:
+                continue
+            if idx == 0:
+                # Allow wrapped launcher strings in argv[0], e.g. "mpirun -np 4 gmx_mpi".
+                try:
+                    tokens.extend(shlex.split(raw, posix=True))
+                    continue
+                except ValueError:
+                    pass
+            tokens.append(raw)
+        return tokens
     raw = str(cmd).strip()
     if not raw:
         return []
@@ -770,17 +797,84 @@ def _split_command_tokens(cmd: Any) -> List[str]:
         return raw.split()
 
 
+_KNOWN_LAUNCHER_TOKENS = {
+    "mpirun",
+    "mpiexec",
+    "srun",
+    "jsrun",
+    "aprun",
+    "orterun",
+    "ibrun",
+    "time",
+    "env",
+    "numactl",
+}
+
+
+def _looks_like_gromacs_token(token: str) -> bool:
+    """Heuristic: token points to a gmx/gmx_mpi-style executable."""
+    base = Path(token).name.lower()
+    if not base:
+        return False
+    return base.startswith("gmx")
+
+
+def _is_env_assignment_token(token: str) -> bool:
+    """Return True for shell-style KEY=VALUE assignment tokens."""
+    if "=" not in token:
+        return False
+    key, _, _ = token.partition("=")
+    if not key:
+        return False
+    return key.replace("_", "").isalnum()
+
+
+def _resolve_gmx_command_tokens(
+    *,
+    ctx: Optional["PipelineContext"],
+    grompp_cmd: Any = None,
+    mdrun_cmd_base: Any = None,
+) -> List[str]:
+    """Resolve full command tokens used to launch gmx/gmx_mpi."""
+    for cmd in (grompp_cmd, mdrun_cmd_base):
+        tokens = _split_command_tokens(cmd)
+        if tokens:
+            return tokens
+    return _split_command_tokens(resolve_gmx_command(ctx) if ctx is not None else "gmx")
+
+
+def _extract_gromacs_binary_token(tokens: List[str]) -> Optional[str]:
+    """Extract the actual gmx/gmx_mpi token from a possibly wrapped command."""
+    for token in tokens:
+        stripped = token.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("-"):
+            continue
+        lower = Path(stripped).name.lower()
+        if lower in _KNOWN_LAUNCHER_TOKENS:
+            continue
+        if _is_env_assignment_token(stripped):
+            continue
+        if _looks_like_gromacs_token(stripped):
+            return stripped
+    return None
+
+
 def _resolve_gmx_cmd_used(
     *,
     ctx: Optional["PipelineContext"],
     grompp_cmd: Any = None,
     mdrun_cmd_base: Any = None,
 ) -> Optional[str]:
-    """Resolve the exact GROMACS frontend command used by stage commands."""
-    for cmd in (grompp_cmd, mdrun_cmd_base):
-        tokens = _split_command_tokens(cmd)
-        if tokens:
-            return tokens[0]
+    """Resolve launcher/front-end token used by stage commands (legacy field)."""
+    tokens = _resolve_gmx_command_tokens(
+        ctx=ctx,
+        grompp_cmd=grompp_cmd,
+        mdrun_cmd_base=mdrun_cmd_base,
+    )
+    if tokens:
+        return tokens[0]
     return resolve_gmx_command(ctx) if ctx is not None else "gmx"
 
 
@@ -811,18 +905,31 @@ def _get_gromacs_provenance(
     ctx: Optional["PipelineContext"],
     grompp_cmd: Any = None,
     mdrun_cmd_base: Any = None,
-) -> Dict[str, Optional[str]]:
-    """Collect reproducibility metadata for the exact gmx command in use."""
+) -> Dict[str, Any]:
+    """Collect reproducibility metadata for launchers and the actual gmx binary."""
+    command_tokens = _resolve_gmx_command_tokens(
+        ctx=ctx,
+        grompp_cmd=grompp_cmd,
+        mdrun_cmd_base=mdrun_cmd_base,
+    )
+    launcher_token = command_tokens[0] if command_tokens else None
     gmx_cmd_used = _resolve_gmx_cmd_used(
         ctx=ctx,
         grompp_cmd=grompp_cmd,
         mdrun_cmd_base=mdrun_cmd_base,
     )
+    gmx_binary_token = _extract_gromacs_binary_token(command_tokens) or gmx_cmd_used
     gmx_bin_resolved = shutil.which(gmx_cmd_used) if gmx_cmd_used else None
-    gmx_version = _get_gromacs_version(gmx_cmd_used)
+    gmx_binary_resolved = shutil.which(gmx_binary_token) if gmx_binary_token else None
+    gmx_version = _get_gromacs_version(gmx_binary_token)
     return {
+        "gmx_command_tokens": command_tokens,
+        "gmx_launcher_token": launcher_token,
+        "gmx_launcher_resolved": gmx_bin_resolved,
         "gmx_cmd_used": gmx_cmd_used,
         "gmx_bin_resolved": gmx_bin_resolved,
+        "gmx_binary_token": gmx_binary_token,
+        "gmx_binary_resolved": gmx_binary_resolved,
         "gromacs_version": gmx_version,
     }
 
@@ -846,8 +953,13 @@ def _stage_state_payload(
     grompp_maxwarn: int,
     grompp_cmd: str,
     mdrun_cmd_base: str,
+    gmx_command_tokens: Optional[List[str]],
+    gmx_launcher_token: Optional[str],
+    gmx_launcher_resolved: Optional[str],
     gmx_cmd_used: Optional[str],
     gmx_bin_resolved: Optional[str],
+    gmx_binary_token: Optional[str],
+    gmx_binary_resolved: Optional[str],
     gromacs_version: Optional[str],
     git_info: Dict[str, Optional[str]],
     allow_velocity_reset: bool,
@@ -873,8 +985,13 @@ def _stage_state_payload(
         "grompp_maxwarn": grompp_maxwarn,
         "grompp_command": grompp_cmd,
         "mdrun_command_base": mdrun_cmd_base,
+        "gmx_command_tokens": gmx_command_tokens or [],
+        "gmx_launcher_token": gmx_launcher_token,
+        "gmx_launcher_resolved": gmx_launcher_resolved,
         "gmx_cmd_used": gmx_cmd_used,
         "gmx_bin_resolved": gmx_bin_resolved,
+        "gmx_binary_token": gmx_binary_token,
+        "gmx_binary_resolved": gmx_binary_resolved,
         "gromacs_version": gromacs_version,
         "git_commit": git_info.get("commit"),
         "git_dirty": git_info.get("dirty"),
@@ -882,6 +999,26 @@ def _stage_state_payload(
         "allow_gro_velocity_restart": allow_gro_velocity_restart,
         "velocity_mode": velocity_mode,
     }
+
+
+_MD_MUTABLE_RESUME_KEYS = {"md_tpr_sha256", "md_cpt_sha256"}
+
+
+def _build_resume_gate_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Build compatibility-gate payload from full stage fingerprint payload.
+
+    Mutable runtime artifacts are excluded from resume gating while retained in
+    stage_state audit metadata.
+    """
+    stage_name = str(payload.get("stage") or "").strip().lower()
+    excluded = _MD_MUTABLE_RESUME_KEYS if stage_name == "md" else set()
+    gate_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in excluded
+    }
+    return gate_payload, sorted(excluded)
 
 
 def _build_stage_state(
@@ -950,16 +1087,25 @@ def _build_stage_state(
         grompp_maxwarn=grompp_maxwarn,
         grompp_cmd=grompp_cmd_str,
         mdrun_cmd_base=mdrun_cmd_base_str,
+        gmx_command_tokens=gmx_provenance.get("gmx_command_tokens"),
+        gmx_launcher_token=gmx_provenance.get("gmx_launcher_token"),
+        gmx_launcher_resolved=gmx_provenance.get("gmx_launcher_resolved"),
         gmx_cmd_used=gmx_provenance.get("gmx_cmd_used"),
         gmx_bin_resolved=gmx_provenance.get("gmx_bin_resolved"),
+        gmx_binary_token=gmx_provenance.get("gmx_binary_token"),
+        gmx_binary_resolved=gmx_provenance.get("gmx_binary_resolved"),
         gromacs_version=gmx_provenance.get("gromacs_version"),
         git_info=git_info,
         allow_velocity_reset=ctx.allow_velocity_reset,
         allow_gro_velocity_restart=getattr(ctx, "allow_gro_velocity_restart", False),
         velocity_mode=velocity_mode,
     )
+    resume_gate_payload, resume_gate_excluded_keys = _build_resume_gate_payload(payload)
     fingerprint = hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    resume_gate_fingerprint = hashlib.sha256(
+        json.dumps(resume_gate_payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
     data = {
         "stage": stage,
@@ -983,8 +1129,13 @@ def _build_stage_state(
         "grompp_maxwarn": grompp_maxwarn,
         "grompp_command": grompp_cmd_str,
         "mdrun_command_base": mdrun_cmd_base_str,
+        "gmx_command_tokens": gmx_provenance.get("gmx_command_tokens"),
+        "gmx_launcher_token": gmx_provenance.get("gmx_launcher_token"),
+        "gmx_launcher_resolved": gmx_provenance.get("gmx_launcher_resolved"),
         "gmx_cmd_used": gmx_provenance.get("gmx_cmd_used"),
         "gmx_bin_resolved": gmx_provenance.get("gmx_bin_resolved"),
+        "gmx_binary_token": gmx_provenance.get("gmx_binary_token"),
+        "gmx_binary_resolved": gmx_provenance.get("gmx_binary_resolved"),
         "gromacs_version": gmx_provenance.get("gromacs_version"),
         "git": git_info,
         "allow_velocity_reset": ctx.allow_velocity_reset,
@@ -992,6 +1143,9 @@ def _build_stage_state(
         "velocity_mode": velocity_mode,
         "fingerprint": fingerprint,
         "fingerprint_payload": payload,
+        "resume_gate_fingerprint": resume_gate_fingerprint,
+        "resume_gate_payload": resume_gate_payload,
+        "resume_gate_excluded_keys": resume_gate_excluded_keys,
     }
     if posres_info:
         data["posres"] = posres_info
@@ -1194,8 +1348,13 @@ def _archive_stage_outputs(stage_dir: Path, deffnm: str, ctx: "PipelineContext")
     if not unique_files:
         return
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    archive_dir = stage_dir / "_archive" / timestamp
-    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_root = stage_dir / "_archive"
+    archive_dir = archive_root / timestamp
+    suffix = 1
+    while archive_dir.exists():
+        archive_dir = archive_root / f"{timestamp}-{suffix:02d}"
+        suffix += 1
+    archive_dir.mkdir(parents=True, exist_ok=False)
     for path in unique_files:
         shutil.move(str(path), str(archive_dir / path.name))
     print(f"  [FORCE] Archived {len(unique_files)} items to {archive_dir}")
@@ -1306,8 +1465,13 @@ def _build_repro_json(
         "gromacs": {
             "version": gmx_provenance.get("gromacs_version"),
             "gmx_bin": gmx_provenance.get("gmx_bin_resolved"),
+            "gmx_command_tokens": gmx_provenance.get("gmx_command_tokens"),
+            "gmx_launcher_token": gmx_provenance.get("gmx_launcher_token"),
+            "gmx_launcher_resolved": gmx_provenance.get("gmx_launcher_resolved"),
             "gmx_cmd_used": gmx_provenance.get("gmx_cmd_used"),
             "gmx_bin_resolved": gmx_provenance.get("gmx_bin_resolved"),
+            "gmx_binary_token": gmx_provenance.get("gmx_binary_token"),
+            "gmx_binary_resolved": gmx_provenance.get("gmx_binary_resolved"),
         },
         "inputs": inputs,
         "mdp": {
@@ -1374,6 +1538,70 @@ def _write_run_report(ctx: "PipelineContext") -> None:
         "summary": summary,
     }
     _atomic_write_json(report_path, report, sort_keys=True)
+
+
+def _invalidate_done_sentinel(done_sentinel: Path, ctx: "PipelineContext", reason: str) -> None:
+    """Best-effort invalidation of stale completion sentinel."""
+    print(f"  [WARN] Ignoring stale done.ok in {done_sentinel.parent}: {reason}")
+    if ctx.dry_run:
+        return
+    try:
+        done_sentinel.unlink()
+        print(f"  [WARN] Removed stale sentinel: {done_sentinel}")
+    except OSError as exc:
+        print(f"  [WARN] Failed to remove stale sentinel {done_sentinel}: {exc}")
+
+
+def _is_valid_completed_stage(
+    *,
+    ctx: "PipelineContext",
+    stage_label: str,
+    stage_dir: Path,
+    done_sentinel: Path,
+    expected_state_stage: str,
+    required_files: List[str],
+    require_any_of: Optional[List[str]] = None,
+) -> bool:
+    """Validate done.ok against key outputs and stage_state coherence before skip."""
+    if not done_sentinel.exists():
+        return False
+
+    missing = [name for name in required_files if not (stage_dir / name).exists()]
+    if require_any_of:
+        if not any((stage_dir / name).exists() for name in require_any_of):
+            missing.append("one_of(" + ", ".join(require_any_of) + ")")
+
+    state_path = stage_dir / "stage_state.json"
+    state_problems: List[str] = []
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+            if not isinstance(state, dict):
+                state_problems.append("stage_state.json is not a JSON object")
+            else:
+                state_stage = state.get("stage")
+                if str(state_stage) != expected_state_stage:
+                    state_problems.append(
+                        f"stage_state.stage={state_stage!r} (expected {expected_state_stage!r})"
+                    )
+                if not isinstance(state.get("fingerprint_payload"), dict):
+                    state_problems.append("fingerprint_payload missing/invalid in stage_state.json")
+        except Exception as exc:
+            state_problems.append(f"failed to parse stage_state.json: {type(exc).__name__}: {exc}")
+    else:
+        state_problems.append("stage_state.json missing")
+
+    if missing or state_problems:
+        details: List[str] = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if state_problems:
+            details.extend(state_problems)
+        _invalidate_done_sentinel(done_sentinel, ctx, "; ".join(details))
+        return False
+
+    print(f"  [SKIP] {stage_label} already complete (validated artifacts + stage_state)")
+    return True
 
 
 def verify_staged_inputs(ctx: "PipelineContext") -> Tuple[Path, Path]:
@@ -1617,6 +1845,25 @@ def _tail_text(text: str, max_lines: int = 60, max_chars: int = 2000) -> str:
     if len(excerpt) > max_chars:
         excerpt = excerpt[-max_chars:]
     return excerpt.strip()
+
+
+def _tail_file_text(path: Path, max_bytes: int = 65536, max_lines: int = 60, max_chars: int = 2000) -> str:
+    """Return bounded tail excerpt from a text file."""
+    if not path.exists():
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            read_size = min(size, max_bytes)
+            if read_size <= 0:
+                return ""
+            fh.seek(-read_size, os.SEEK_END)
+            raw = fh.read(read_size)
+        text = raw.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    return _tail_text(text, max_lines=max_lines, max_chars=max_chars)
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -1896,6 +2143,17 @@ def _gromacs_failure_hints(stderr: str, stdout: str) -> List[str]:
             "Likely cause: MDP/index group mismatch. Suggested fix: check tc-grps/comm-grps/energygrps "
             "against index.ndx group names."
         )
+    if any(marker in combined for marker in ("lincs", "constraint", "shake", "settle")):
+        hints.append(
+            "Likely cause: unstable starting structure or aggressive early coupling. Suggested fix: "
+            "reduce bad contacts (e.g., overly dense PACKMOL packing), strengthen EM relaxation, and "
+            "use gentler early NVT/NPT settings before production."
+        )
+    if any(marker in combined for marker in ("nan", "not a number", "blow up", "step too small")):
+        hints.append(
+            "Likely cause: integration instability. Suggested fix: verify topology/parameters, inspect "
+            "EM convergence, and consider a smaller timestep or more conservative equilibration."
+        )
     return hints
 
 
@@ -2042,7 +2300,25 @@ def run_gromacs_command(
             returncode,
             log_paths=[stdout_path, stderr_path],
         )
-        raise RuntimeError(f"Command failed with exit code {returncode}")
+        stderr_tail = _tail_file_text(stderr_path)
+        stdout_tail = _tail_file_text(stdout_path)
+        hints = _gromacs_failure_hints(stderr_tail, stdout_tail)
+        msg_lines = [
+            f"Command failed with exit code {returncode}.",
+            f"Command: {cmd_str}",
+            f"stdout log: {stdout_path}",
+            f"stderr log: {stderr_path}",
+        ]
+        if stderr_tail:
+            msg_lines.append("stderr tail:")
+            msg_lines.append(stderr_tail)
+        if stdout_tail:
+            msg_lines.append("stdout tail:")
+            msg_lines.append(stdout_tail)
+        if hints:
+            msg_lines.append("Likely cause / Suggested fix:")
+            msg_lines.extend(f"- {hint}" for hint in hints)
+        raise RuntimeError("\n".join(msg_lines))
 
     return subprocess.CompletedProcess(cmd, returncode, "", "")
 
@@ -2089,7 +2365,14 @@ def cleanup_large_files(stage_dir: Path, ctx: "PipelineContext", stage_tag: str)
             ctx.manifest.set("trr_cleanup", {"records": records})
         return []
 
-    print(f"  [CLEANUP] TRR deletion enabled for stage '{stage_tag}' (explicit opt-in).")
+    if stage_tag == "md":
+        print(
+            "  [CLEANUP] Production TRR deletion enabled (explicit opt-in). "
+            "Safe for coordinate-focused workflows (XTC-based); keep TRR for analyses "
+            "that require velocities/forces (e.g., transport/Green-Kubo)."
+        )
+    else:
+        print(f"  [CLEANUP] TRR deletion enabled for stage '{stage_tag}' (explicit opt-in).")
     deleted = []
     failed_deletes: List[Dict[str, str]] = []
     for trr_file in stage_dir.glob("*.trr"):
@@ -2145,6 +2428,10 @@ class GmxEmStage(BaseStage):
     @property
     def output_subdir(self) -> str:
         return "03_gromacs/em"
+
+    def should_skip(self, ctx: "PipelineContext") -> bool:
+        # Stage-specific skip checks are performed inside run() with artifact validation.
+        return False
     
     def run(self, ctx: "PipelineContext") -> bool:
         """Execute GROMACS energy minimization."""
@@ -2155,15 +2442,22 @@ class GmxEmStage(BaseStage):
         print(f"  - Output dir: {output_dir}")
         done_sentinel = output_dir / "done.ok"
 
-        # Skip if already complete
-        if done_sentinel.exists() and ctx.resume and not ctx.force:
-            print(f"  [SKIP] EM already complete")
-            _record_stage_manifest(ctx, "gmx_em", {
-                "decision": "skip",
-                "reason": "done.ok exists and resume=true",
-                "stage_dir": str(output_dir),
-            })
-            return True
+        # Skip only when done.ok exists AND key artifacts/state are coherent.
+        if ctx.resume and not ctx.force and done_sentinel.exists():
+            if _is_valid_completed_stage(
+                ctx=ctx,
+                stage_label="EM",
+                stage_dir=output_dir,
+                done_sentinel=done_sentinel,
+                expected_state_stage="em",
+                required_files=["em.mdp", "em.tpr", "em.gro", "stage_state.json", "repro.json"],
+            ):
+                _record_stage_manifest(ctx, "gmx_em", {
+                    "decision": "skip",
+                    "reason": "validated done.ok exists and resume=true",
+                    "stage_dir": str(output_dir),
+                })
+                return True
 
         # Force rerun: archive prior outputs
         if ctx.force:
@@ -2258,7 +2552,6 @@ class GmxEmStage(BaseStage):
             return False
 
         if not ctx.dry_run:
-            done_sentinel.write_text("EM complete\n")
             _write_stage_state(output_dir / "stage_state.json", stage_state, ctx)
 
         # Record resources in manifest
@@ -2335,6 +2628,10 @@ class GmxEqStage(BaseStage):
     @property
     def output_subdir(self) -> str:
         return "03_gromacs/nvt"  # Primary for sentinel
+
+    def should_skip(self, ctx: "PipelineContext") -> bool:
+        # NVT/NPT skip semantics are validated per-substage in run().
+        return False
     
     def run(self, ctx: "PipelineContext") -> bool:
         """Execute GROMACS equilibration (NVT + NPT)."""
@@ -2358,15 +2655,22 @@ class GmxEqStage(BaseStage):
         nvt_dir = ctx.ensure_output_dir("03_gromacs", "nvt")
         nvt_sentinel = nvt_dir / "done.ok"
         
-        # Check if NVT already complete
-        if nvt_sentinel.exists() and ctx.resume and not ctx.force:
-            print(f"  [SKIP] NVT already complete")
-            _record_stage_manifest(ctx, "gmx_eq_nvt", {
-                "decision": "skip",
-                "reason": "done.ok exists and resume=true",
-                "stage_dir": str(nvt_dir),
-            })
-            return True
+        # Check if NVT already complete (validated done sentinel + key artifacts).
+        if ctx.resume and not ctx.force and nvt_sentinel.exists():
+            if _is_valid_completed_stage(
+                ctx=ctx,
+                stage_label="NVT",
+                stage_dir=nvt_dir,
+                done_sentinel=nvt_sentinel,
+                expected_state_stage="nvt",
+                required_files=["nvt.mdp", "nvt.tpr", "nvt.gro", "nvt.cpt", "stage_state.json", "repro.json"],
+            ):
+                _record_stage_manifest(ctx, "gmx_eq_nvt", {
+                    "decision": "skip",
+                    "reason": "validated done.ok exists and resume=true",
+                    "stage_dir": str(nvt_dir),
+                })
+                return True
 
         if ctx.force:
             _archive_stage_outputs(nvt_dir, "nvt", ctx)
@@ -2469,9 +2773,8 @@ class GmxEqStage(BaseStage):
         except RuntimeError:
             return False
         
-        # Mark NVT complete
+        # Persist state before completion marker.
         if not ctx.dry_run:
-            nvt_sentinel.write_text("NVT equilibration complete\n")
             _write_stage_state(nvt_dir / "stage_state.json", stage_state, ctx)
 
         _record_stage_manifest(ctx, "gmx_eq_nvt", {
@@ -2525,6 +2828,8 @@ class GmxEqStage(BaseStage):
 
         _write_repro_json(ctx, nvt_dir, repro)
         _write_run_report(ctx)
+        if not ctx.dry_run:
+            nvt_sentinel.write_text("NVT equilibration complete\n")
         print(f"    [OK] NVT complete")
         return True
     
@@ -2533,15 +2838,22 @@ class GmxEqStage(BaseStage):
         npt_dir = ctx.ensure_output_dir("03_gromacs", "npt")
         npt_sentinel = npt_dir / "done.ok"
         
-        # Check if NPT already complete
-        if npt_sentinel.exists() and ctx.resume and not ctx.force:
-            print(f"  [SKIP] NPT already complete")
-            _record_stage_manifest(ctx, "gmx_eq_npt", {
-                "decision": "skip",
-                "reason": "done.ok exists and resume=true",
-                "stage_dir": str(npt_dir),
-            })
-            return True
+        # Check if NPT already complete (validated done sentinel + key artifacts).
+        if ctx.resume and not ctx.force and npt_sentinel.exists():
+            if _is_valid_completed_stage(
+                ctx=ctx,
+                stage_label="NPT",
+                stage_dir=npt_dir,
+                done_sentinel=npt_sentinel,
+                expected_state_stage="npt",
+                required_files=["npt.mdp", "npt.tpr", "npt.gro", "npt.cpt", "stage_state.json", "repro.json"],
+            ):
+                _record_stage_manifest(ctx, "gmx_eq_npt", {
+                    "decision": "skip",
+                    "reason": "validated done.ok exists and resume=true",
+                    "stage_dir": str(npt_dir),
+                })
+                return True
 
         if ctx.force:
             _archive_stage_outputs(npt_dir, "npt", ctx)
@@ -2708,9 +3020,8 @@ class GmxEqStage(BaseStage):
             except Exception as exc:
                 print(f"    [WARN] Failed to write gmx_eq stage metrics: {type(exc).__name__}: {exc}")
         
-        # Mark NPT complete
+        # Persist state before completion marker.
         if not ctx.dry_run:
-            npt_sentinel.write_text("NPT equilibration complete\n")
             _write_stage_state(npt_dir / "stage_state.json", stage_state, ctx)
         
         # Record resources
@@ -2775,6 +3086,8 @@ class GmxEqStage(BaseStage):
         
         _write_repro_json(ctx, npt_dir, repro)
         _write_run_report(ctx)
+        if not ctx.dry_run:
+            npt_sentinel.write_text("NPT equilibration complete\n")
 
         print(f"    [OK] NPT complete")
         return True
@@ -2796,6 +3109,10 @@ class GmxProdStage(BaseStage):
     @property
     def output_subdir(self) -> str:
         return "03_gromacs/md"
+
+    def should_skip(self, ctx: "PipelineContext") -> bool:
+        # Resume/skip checks must validate stage artifacts and state coherence first.
+        return False
     
     def run(self, ctx: "PipelineContext") -> bool:
         """Execute GROMACS production MD."""
@@ -2804,14 +3121,22 @@ class GmxProdStage(BaseStage):
         output_dir = self.get_output_dir(ctx)
         done_sentinel = output_dir / "done.ok"
 
-        if done_sentinel.exists() and ctx.resume and not ctx.force:
-            print(f"  [SKIP] MD already complete")
-            _record_stage_manifest(ctx, "gmx_prod", {
-                "decision": "skip",
-                "reason": "done.ok exists and resume=true",
-                "stage_dir": str(output_dir),
-            })
-            return True
+        if ctx.resume and not ctx.force and done_sentinel.exists():
+            if _is_valid_completed_stage(
+                ctx=ctx,
+                stage_label="MD",
+                stage_dir=output_dir,
+                done_sentinel=done_sentinel,
+                expected_state_stage="md",
+                required_files=["md.mdp", "md.tpr", "md.gro", "md.cpt", "stage_state.json", "repro.json"],
+                require_any_of=["md.xtc", "md.trr", "logs/mdrun.stdout.log"],
+            ):
+                _record_stage_manifest(ctx, "gmx_prod", {
+                    "decision": "skip",
+                    "reason": "validated done.ok exists and resume=true",
+                    "stage_dir": str(output_dir),
+                })
+                return True
 
         if ctx.force:
             _archive_stage_outputs(output_dir, "md", ctx)
@@ -2842,6 +3167,7 @@ class GmxProdStage(BaseStage):
 
         repair_performed = False
         repair_details: Optional[Dict[str, Any]] = None
+        repair_required = False
         if md_cpt.exists() and not md_tpr.exists():
             print("  [WARN] Partial MD outputs detected: md.cpt exists but md.tpr is missing.")
             if not ctx.resume:
@@ -2857,89 +3183,7 @@ class GmxProdStage(BaseStage):
                 print("  [ERROR] Cannot repair resume: md.mdp is missing.")
                 print("  Restore md.mdp from this run, or use --force for a clean fresh production start.")
                 return False
-
-            old_state_for_repair: Optional[Dict[str, Any]] = None
-            if stage_state_path.exists():
-                try:
-                    loaded_state = json.loads(stage_state_path.read_text())
-                    if isinstance(loaded_state, dict):
-                        old_state_for_repair = loaded_state
-                except Exception as e:
-                    print(f"  [ERROR] Failed to read stage_state.json for repair: {e}")
-                    return False
-
-            repair_gro = npt_gro
-            repair_top = top_path
-            repair_ndx: Optional[Path] = None
-            if old_state_for_repair:
-                old_gro = _resolve_recorded_path(ctx, old_state_for_repair.get("gro_path"))
-                if old_gro and old_gro.exists():
-                    repair_gro = old_gro
-                old_top = _resolve_recorded_path(ctx, old_state_for_repair.get("top_path"))
-                if old_top and old_top.exists():
-                    repair_top = old_top
-                old_ndx = _resolve_recorded_path(ctx, old_state_for_repair.get("ndx_path"))
-                if old_ndx and old_ndx.exists():
-                    repair_ndx = old_ndx
-            if repair_ndx is None:
-                try:
-                    repair_ndx = find_ndx_file(ctx)
-                except ValueError as e:
-                    print(f"  [ERROR] {e}")
-                    return False
-
-            repair_posres_ref: Optional[Path] = None
-            if old_state_for_repair and isinstance(old_state_for_repair.get("posres"), dict):
-                old_posres = old_state_for_repair["posres"]
-                old_ref = _resolve_recorded_path(ctx, old_posres.get("reference_path"))
-                if old_ref and old_ref.exists():
-                    repair_posres_ref = old_ref
-                elif old_posres.get("active"):
-                    print(
-                        "  [WARN] stage_state POSRES reference is missing on disk; "
-                        "resolving reference from current CLI policy."
-                    )
-            if repair_posres_ref is None:
-                try:
-                    repair_posres_ref, _ = _resolve_posres_info(ctx, "md", repair_gro, mdp_path)
-                except (ValueError, FileNotFoundError) as e:
-                    print(f"  [ERROR] Cannot repair md.tpr: {e}")
-                    return False
-
-            repair_maxwarn = ctx.grompp_maxwarn
-            if old_state_for_repair and isinstance(old_state_for_repair.get("grompp_maxwarn"), int):
-                if int(old_state_for_repair["grompp_maxwarn"]) >= 0:
-                    repair_maxwarn = int(old_state_for_repair["grompp_maxwarn"])
-            repair_grompp_cmd = build_grompp_command(
-                ctx=ctx,
-                mdp_path=str(mdp_path),
-                structure_path=str(repair_gro),
-                topology_path=str(repair_top),
-                output_path=str(md_tpr),
-                checkpoint_path=str(md_cpt),
-                index_path=str(repair_ndx) if repair_ndx else None,
-                reference_structure_path=str(repair_posres_ref) if repair_posres_ref else None,
-                maxwarn=repair_maxwarn,
-            )
-            print("  [REPAIR] Rebuilding md.tpr from existing md.cpt for continuation.")
-            try:
-                run_gromacs_command(ctx, repair_grompp_cmd, output_dir, self.name)
-            except RuntimeError:
-                return False
-            if not ctx.dry_run and not md_tpr.exists():
-                print("  [ERROR] Resume repair failed: md.tpr was not created.")
-                return False
-            repair_performed = True
-            repair_details = {
-                "enabled": True,
-                "tpr_rebuilt": True,
-                "mdp_path": str(mdp_path),
-                "gro_path": str(repair_gro),
-                "top_path": str(repair_top),
-                "ndx_path": str(repair_ndx) if repair_ndx else None,
-                "used_checkpoint": str(md_cpt),
-                "grompp_maxwarn": repair_maxwarn,
-            }
+            repair_required = True
         elif md_tpr.exists() and not md_cpt.exists():
             print("  [ERROR] Partial MD outputs detected: md.tpr exists but md.cpt is missing.")
             print("  Continuation cannot be reconstructed automatically without md.cpt.")
@@ -2950,7 +3194,7 @@ class GmxProdStage(BaseStage):
             print("       --allow-velocity-reset or --allow-gro-velocity-restart explicitly.")
             return False
 
-        resume_available = md_cpt.exists() and md_tpr.exists()
+        resume_available = md_cpt.exists() and (md_tpr.exists() or repair_required)
 
         # Resume path: do NOT rewrite md.mdp or require npt.cpt
         if resume_available:
@@ -3027,7 +3271,7 @@ class GmxProdStage(BaseStage):
                 ctx, "md", extra_overrides=None
             )
             mdrun_cmd_base = build_mdrun_command(ctx, "md")
-            grompp_cmd_str = old_state.get("grompp_command", "")
+            grompp_cmd_str = str(old_state.get("grompp_command", "") or "")
             stage_state = _build_stage_state(
                 ctx,
                 "md",
@@ -3045,9 +3289,16 @@ class GmxProdStage(BaseStage):
             )
 
             ignore_runtime = bool(getattr(ctx, "resume_ignore_runtime", False))
-            old_for_compare, ignored_keys = _payload_for_resume_compare(old_payload, ignore_runtime)
+            old_gate_payload = old_state.get("resume_gate_payload")
+            if not isinstance(old_gate_payload, dict):
+                old_gate_payload, _ = _build_resume_gate_payload(old_payload)
+            new_gate_payload = stage_state.get("resume_gate_payload")
+            if not isinstance(new_gate_payload, dict):
+                new_gate_payload, _ = _build_resume_gate_payload(stage_state["fingerprint_payload"])
+
+            old_for_compare, ignored_keys = _payload_for_resume_compare(old_gate_payload, ignore_runtime)
             new_for_compare, _ = _payload_for_resume_compare(
-                stage_state["fingerprint_payload"],
+                new_gate_payload,
                 ignore_runtime,
             )
             compare_keys = sorted(set(old_for_compare.keys()) & set(new_for_compare.keys()))
@@ -3068,13 +3319,22 @@ class GmxProdStage(BaseStage):
             if ignore_runtime:
                 runtime_only_diffs = [
                     key for key in ignored_keys
-                    if old_payload.get(key) != stage_state["fingerprint_payload"].get(key)
+                    if old_gate_payload.get(key) != new_gate_payload.get(key)
                 ]
                 if runtime_only_diffs:
                     print(
                         "  [WARN] Resume fingerprint ignoring runtime-only differences: "
                         + ", ".join(runtime_only_diffs)
                     )
+            mutable_audit_diffs = sorted(
+                key for key in _MD_MUTABLE_RESUME_KEYS
+                if old_payload.get(key) != stage_state["fingerprint_payload"].get(key)
+            )
+            if mutable_audit_diffs:
+                print(
+                    "  [INFO] Resume compatibility gate ignores mutable MD artifacts: "
+                    + ", ".join(mutable_audit_diffs)
+                )
             diffs = _diff_payloads(old_for_compare, new_for_compare)
             if diffs:
                 print("  [ERROR] Resume denied: fingerprint mismatch.")
@@ -3084,6 +3344,64 @@ class GmxProdStage(BaseStage):
                     print("  Runtime-only fingerprint keys were ignored during this comparison.")
                 print("  Use --force to restart cleanly.")
                 return False
+
+            grompp_cmd_for_state = grompp_cmd_str
+            if repair_required:
+                repair_gro = resume_gro
+                repair_top = resume_top
+                repair_ndx = resume_ndx
+                repair_posres_ref: Optional[Path] = None
+                if isinstance(old_state.get("posres"), dict):
+                    old_posres = old_state["posres"]
+                    old_ref = _resolve_recorded_path(ctx, old_posres.get("reference_path"))
+                    if old_ref and old_ref.exists():
+                        repair_posres_ref = old_ref
+                    elif old_posres.get("active"):
+                        print(
+                            "  [WARN] stage_state POSRES reference is missing on disk; "
+                            "resolving reference from current CLI policy."
+                        )
+                if repair_posres_ref is None:
+                    try:
+                        repair_posres_ref, _ = _resolve_posres_info(ctx, "md", repair_gro, mdp_path)
+                    except (ValueError, FileNotFoundError) as e:
+                        print(f"  [ERROR] Cannot repair md.tpr: {e}")
+                        return False
+
+                repair_maxwarn = ctx.grompp_maxwarn
+                if isinstance(old_state.get("grompp_maxwarn"), int) and int(old_state["grompp_maxwarn"]) >= 0:
+                    repair_maxwarn = int(old_state["grompp_maxwarn"])
+                repair_grompp_cmd = build_grompp_command(
+                    ctx=ctx,
+                    mdp_path=str(mdp_path),
+                    structure_path=str(repair_gro),
+                    topology_path=str(repair_top),
+                    output_path=str(md_tpr),
+                    checkpoint_path=str(md_cpt),
+                    index_path=str(repair_ndx) if repair_ndx else None,
+                    reference_structure_path=str(repair_posres_ref) if repair_posres_ref else None,
+                    maxwarn=repair_maxwarn,
+                )
+                print("  [REPAIR] Rebuilding md.tpr from existing md.cpt for continuation.")
+                try:
+                    run_gromacs_command(ctx, repair_grompp_cmd, output_dir, self.name)
+                except RuntimeError:
+                    return False
+                if not ctx.dry_run and not md_tpr.exists():
+                    print("  [ERROR] Resume repair failed: md.tpr was not created.")
+                    return False
+                repair_performed = True
+                grompp_cmd_for_state = " ".join(str(c) for c in repair_grompp_cmd)
+                repair_details = {
+                    "enabled": True,
+                    "tpr_rebuilt": True,
+                    "mdp_path": str(mdp_path),
+                    "gro_path": str(repair_gro),
+                    "top_path": str(repair_top),
+                    "ndx_path": str(repair_ndx) if repair_ndx else None,
+                    "used_checkpoint": str(md_cpt),
+                    "grompp_maxwarn": repair_maxwarn,
+                }
 
             if ctx.manifest:
                 ctx.manifest.set("resume_checkpoint", {
@@ -3103,7 +3421,22 @@ class GmxProdStage(BaseStage):
                 return False
 
             if not ctx.dry_run:
-                done_sentinel.write_text("MD complete\n")
+                stage_state = _build_stage_state(
+                    ctx,
+                    "md",
+                    mdp_path,
+                    resume_gro,
+                    resume_top,
+                    resume_ndx,
+                    grompp_cmd_for_state,
+                    mdrun_cmd_resume,
+                    ctx.grompp_maxwarn,
+                    posres_info=old_state.get("posres"),
+                    stage_overrides=stage_overrides,
+                    extra_overrides=extra_overrides_resolved,
+                    effective_overrides=effective_overrides,
+                )
+                _write_stage_state(stage_state_path, stage_state, ctx)
 
             _record_stage_manifest(ctx, "gmx_prod", {
                 "decision": "resume",
@@ -3136,6 +3469,7 @@ class GmxProdStage(BaseStage):
                 "stage_state_path": str(stage_state_path),
                 "resume_ignore_runtime": ignore_runtime,
                 "ignored_runtime_differences": runtime_only_diffs,
+                "ignored_mutable_audit_differences": mutable_audit_diffs,
                 "fingerprint_path_fallbacks": resume_fallback_warnings,
                 "resume_repair": repair_details,
                 "posres": old_state.get("posres"),
@@ -3326,7 +3660,6 @@ class GmxProdStage(BaseStage):
             return False
 
         if not ctx.dry_run:
-            done_sentinel.write_text("MD complete\n")
             stage_state = _build_stage_state(
                 ctx,
                 "md",
