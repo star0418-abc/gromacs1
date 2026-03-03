@@ -886,8 +886,8 @@ _CONTEXT_ARG_SPECS = (
     ContextArgSpec(
         "itp_include_dirs_priority",
         "itp_include_dirs_priority",
-        _as_choice("last", "first"),
-        "last",
+        _as_choice("sanitized_first", "forcefield_first", "first", "last"),
+        "forcefield_first",
     ),
     ContextArgSpec(
         "charge_fix_protect_resnames",
@@ -966,6 +966,13 @@ _CONTEXT_ARG_SPECS = (
     ContextArgSpec(
         "allow_include_shadowing",
         "allow_include_shadowing",
+        _as_bool,
+        False,
+        numeric_or_bool=True,
+    ),
+    ContextArgSpec(
+        "allow_unsafe_include_escape",
+        "allow_unsafe_include_escape",
         _as_bool,
         False,
         numeric_or_bool=True,
@@ -1262,8 +1269,10 @@ class PipelineContext:
     dipole_triclinic_policy: str = "skip"
     
     # Sanitizer v5: Include path priority (Issue D)
-    # "last" = user dirs searched last (legacy); "first" = user dirs searched first
-    itp_include_dirs_priority: str = "last"
+    # Canonical values:
+    # - forcefield_first (legacy alias: "last")
+    # - sanitized_first (legacy alias: "first")
+    itp_include_dirs_priority: str = "forcefield_first"
     
     # Sanitizer v5: Ion protection for charge-fix (Issue G)
     charge_fix_protect_resnames: Optional[str] = None  # Comma-separated resnames to protect
@@ -1290,6 +1299,7 @@ class PipelineContext:
     
     # Hardening v6: Include shadowing detection
     allow_include_shadowing: bool = False  # Allow shadowing without warning
+    allow_unsafe_include_escape: bool = False  # Allow includes to resolve outside configured roots
     
     def __post_init__(self):
         """Validate options after initialization."""

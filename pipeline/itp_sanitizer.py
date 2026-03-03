@@ -28,6 +28,7 @@ Hardening (v2):
 import math
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -149,6 +150,59 @@ class DefaultsConflictError(ItpSanitizerError):
 class PrefixUnsafeError(ItpSanitizerError):
     """Raised when atomtype prefixing would break implicit topology."""
     pass
+
+
+def _normalize_root_paths(paths: Iterable[Path]) -> List[Path]:
+    """Resolve and deduplicate root paths while preserving order."""
+    deduped: List[Path] = []
+    seen: Set[Path] = set()
+    for path in paths:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(resolved)
+    return deduped
+
+
+def _path_within_any_root(path: Path, roots: List[Path]) -> bool:
+    """Return True if path is equal to or inside at least one root."""
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """Write text atomically using a temporary file in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _atomic_copy_file(src: Path, dest: Path) -> None:
+    """Atomically copy file content to destination."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest.name}.tmp.", dir=str(dest.parent))
+    os.close(fd)
+    try:
+        shutil.copy2(src, tmp_name)
+        os.replace(tmp_name, dest)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 # =============================================================================
@@ -912,6 +966,8 @@ class ItpParser:
         diagnostics: Optional[List["IncludeResolution"]] = None,
         check_shadowing: bool = False,
         allow_shadowing: bool = False,
+        allow_unsafe_escape: bool = False,
+        allowed_roots: Optional[List[Path]] = None,
     ) -> List[Path]:
         """
         Recursively resolve #include directives.
@@ -926,6 +982,8 @@ class ItpParser:
             diagnostics: Optional list to collect resolution details
             check_shadowing: If True, check for shadowed files (Issue 1)
             allow_shadowing: If True, allow shadowing without error even in strict mode
+            allow_unsafe_escape: If True, allow includes outside allowed roots
+            allowed_roots: Explicit include boundary roots (defaults to search paths)
             
         Returns:
             List of all included files (depth-first order, deduplicated)
@@ -960,6 +1018,9 @@ class ItpParser:
                 # Search order: relative to including file, then include_dirs
                 search_paths = [itp_path.parent] + list(include_dirs)
                 search_paths = [p for p in search_paths if p.exists()]
+                boundary_roots = _normalize_root_paths(
+                    allowed_roots if allowed_roots is not None else search_paths
+                )
                 
                 include_path = None
                 resolved_from = None
@@ -972,6 +1033,19 @@ class ItpParser:
                     candidate = include_candidate.resolve()
                     attempted_paths.append(str(candidate))
                     if candidate.exists():
+                        if (not allow_unsafe_escape) and (not _path_within_any_root(candidate, boundary_roots)):
+                            roots_text = ", ".join(str(r) for r in boundary_roots) or "(none)"
+                            msg = (
+                                f"Blocked include target '{include_rel}' in {itp_path.name}: "
+                                f"resolved path escapes allowed roots.\n"
+                                f"  Resolved: {candidate}\n"
+                                f"  Allowed roots: {roots_text}\n"
+                                "Use --allow-unsafe-include-escape to override."
+                            )
+                            if strict:
+                                raise ItpSanitizerError(msg)
+                            print(f"  [WARN] {msg}")
+                            continue
                         found_paths.append(candidate)
                         include_path = candidate
                         resolved_from = str(candidate.parent)
@@ -982,6 +1056,18 @@ class ItpParser:
                         attempted_paths.append(str(candidate))
                         
                         if candidate.exists():
+                            if (not allow_unsafe_escape) and (not _path_within_any_root(candidate, boundary_roots)):
+                                roots_text = ", ".join(str(r) for r in boundary_roots) or "(none)"
+                                msg = (
+                                    f"Blocked include escape '{include_rel}' in {itp_path.name}:\n"
+                                    f"  Candidate: {candidate}\n"
+                                    f"  Allowed roots: {roots_text}\n"
+                                    "Use --allow-unsafe-include-escape to override."
+                                )
+                                if strict:
+                                    raise ItpSanitizerError(msg)
+                                print(f"  [WARN] {msg}")
+                                continue
                             if not found_paths:
                                 # First match wins
                                 include_path = candidate
@@ -1044,7 +1130,9 @@ class ItpParser:
                             strict, 
                             diagnostics,
                             check_shadowing,
-                            allow_shadowing
+                            allow_shadowing,
+                            allow_unsafe_escape,
+                            allowed_roots,
                         ))
                 else:
                     if diagnostics is not None:
@@ -2173,7 +2261,7 @@ class ItpSanitizer:
             lines.append("")
             summary["injected_counts"][section_name] = len(entries)
 
-        versioned.write_text("\n".join(lines).rstrip() + "\n")
+        _atomic_write_text(versioned, "\n".join(lines).rstrip() + "\n")
         if current.exists() or current.is_symlink():
             current.unlink()
         try:
@@ -2800,7 +2888,7 @@ class ItpSanitizer:
             "; i               j               func   V(sigma_nm)      W(epsilon_kJ_mol)",
         ]
         lines.extend(param_lines)
-        versioned_path.write_text("\n".join(lines) + "\n")
+        _atomic_write_text(versioned_path, "\n".join(lines) + "\n")
 
         if current_path.exists() or current_path.is_symlink():
             current_path.unlink()
@@ -3012,7 +3100,7 @@ class ItpSanitizer:
             "; i               j               func   C6             C12",
         ]
         content_lines.extend(param_lines)
-        versioned_path.write_text("\n".join(content_lines) + "\n")
+        _atomic_write_text(versioned_path, "\n".join(content_lines) + "\n")
 
         if current_path.exists() or current_path.is_symlink():
             current_path.unlink()
@@ -3190,6 +3278,13 @@ class ItpSanitizer:
 
         strict_includes = getattr(ctx, "strict_include_resolution", False) if ctx else False
         allow_shadowing = getattr(ctx, "allow_include_shadowing", False) if ctx else False
+        allow_unsafe_include_escape = (
+            getattr(ctx, "allow_unsafe_include_escape", False) if ctx else False
+        )
+        allowed_include_roots = list(include_dirs)
+        project_root = getattr(ctx, "project_root", None) if ctx else None
+        if project_root:
+            allowed_include_roots.append(Path(project_root))
         include_paths: Set[Path] = set()
         include_order: List[Path] = []
         include_order_seen: Set[Path] = set()
@@ -3210,6 +3305,8 @@ class ItpSanitizer:
                 diagnostics=include_diagnostics,
                 check_shadowing=True,
                 allow_shadowing=allow_shadowing,
+                allow_unsafe_escape=allow_unsafe_include_escape,
+                allowed_roots=allowed_include_roots,
             )
             for inc in resolved_includes:
                 include_paths.add(inc)
@@ -3380,7 +3477,7 @@ class ItpSanitizer:
         # Generate combined atomtypes
         combined_content = self.generate_combined_atomtypes()
         combined_path = output_dir / f"combined_atomtypes_{run_id}.itp"
-        combined_path.write_text(combined_content)
+        _atomic_write_text(combined_path, combined_content)
         print(f"  Wrote: {combined_path.name}")
         
         # Create current symlink/copy
@@ -3391,7 +3488,7 @@ class ItpSanitizer:
             combined_current.symlink_to(combined_path.name)
         except OSError:
             # Symlinks may fail on Windows, use copy instead
-            shutil.copy2(combined_path, combined_current)
+            _atomic_copy_file(combined_path, combined_current)
         print(f"  Linked: {combined_current.name} -> {combined_path.name}")
         
         # Create sanitized directory
@@ -3485,7 +3582,7 @@ class ItpSanitizer:
                 sanitized_cache[source_id] = self.sanitize_itp(source_path)
             out_path = sanitized_dir / output_rel
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(sanitized_cache[source_id])
+            _atomic_write_text(out_path, sanitized_cache[source_id])
             sanitized_files.append(out_path)
 
         # Moleculetype detection is include-aware

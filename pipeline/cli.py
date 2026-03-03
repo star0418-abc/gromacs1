@@ -1023,9 +1023,21 @@ Forcefield internal naming:
     )
     parser.add_argument(
         "--itp-include-dirs-priority",
-        choices=["last", "first"],
-        default="last",
-        help="User include-dir precedence: last (legacy) or first.",
+        choices=["sanitized_first", "forcefield_first", "first", "last"],
+        default="forcefield_first",
+        help=(
+            "Include-dir precedence: forcefield_first/sanitized_first "
+            "(legacy aliases: last/first)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unsafe-include-escape",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow #include targets that resolve outside configured include roots. "
+            "Unsafe; disabled by default."
+        ),
     )
     parser.add_argument(
         "--grompp-preprocess-timeout-s",

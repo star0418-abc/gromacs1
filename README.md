@@ -631,8 +631,9 @@ The sanitization stage enforces correctness, safety, and auditability for ITP fi
   - Strict mode (`--strict-include-resolution`): Hard error unless `--allow-include-shadowing` is present.
 - **Coverage**: The same resolver/shadowing policy is applied to forcefield and non-forcefield include-closure expansion (not just top-level forcefield files).
 - **Priority**: Search order is configurable via `--itp-include-dirs-priority`.
-  - `last` (default): Local > System > FF > User.
-  - `first`: Local > User > System > FF.
+  - `forcefield_first` (default; legacy alias: `last`): Local > System > FF > User.
+  - `sanitized_first` (legacy alias: `first`): Local > User > System > FF.
+- **Escape protection**: include targets are blocked if they resolve outside allowed roots (including file parent, configured include search dirs, project root). Use `--allow-unsafe-include-escape` only when intentional.
 
 ### Charge Neutrality Protection
 Solvents, ions, and protected polymers are guarded against accidental charge correction modification.
@@ -657,6 +658,8 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
   - Polymer correction still requires rounding-only gate pass (or explicit `--charge-fix-allow-non-rounding` override).
 - **Hetero safeguard**: any correction touching hetero atoms (`O/N/S/B/F/P`) is refused unless those atom names are explicitly allowlisted via `--charge-fix-target-atomnames`.
 - **Strict Mode**: If strict charge neutrality is enabled, modifying any protected species requires explicit opt-in.
+  - In strict mode, if any protected molecules exist, `--charge-fix-target-allowlist` is required.
+  - Protected polymer correction is allowed only with explicit allowlist and explicit `--charge-fix-polymer-method spread_safe`.
 
 ### Parameter Validation
 - **LJ Validations**:
@@ -1017,7 +1020,7 @@ The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, d
 
 ### Include Resolution (GROMACS -I)
 
-For `#include` lines, the sanitizer searches in this order:
+For `#include` lines, the sanitizer searches in this order (default `forcefield_first` priority):
 1. Including file's directory
 2. `IN/systems/<SYSTEM_ID>/gromacs/top` and `.../itp`
 3. `IN/systems/<SYSTEM_ID>/htpolynet/itp`
@@ -1027,11 +1030,13 @@ For `#include` lines, the sanitizer searches in this order:
 7. Configured GROMACS share dirs (if provided via context)
 
 Relative paths in `--itp-include-dirs` are resolved against `--project-root` for reproducible behavior across working directories.
+With `--itp-include-dirs-priority sanitized_first` (alias `first`), user include dirs are searched immediately after the including file directory.
 
 If an include cannot be resolved, the sanitizer reports attempted paths (or fails fast if `--strict-include-resolution` is set).
 `system.top` validation uses the same resolver and parses both `"file.itp"` and `<file.itp>` includes.
 
 **Shadowing**: If multiple include candidates exist, shadowing is reported. In strict mode this is a hard error unless `--allow-include-shadowing` is enabled.
+**Escape guard**: includes that resolve outside configured include roots are blocked by default; use `--allow-unsafe-include-escape` only as an explicit unsafe override.
 
 **Include-closure sanitization**: Any reachable file containing `[ defaults ]` or `[ atomtypes ]` is sanitized and written into `itp_sanitized_current/` at its include path (relative includes only; `..` is not allowed for sanitization).
 
@@ -1345,7 +1350,7 @@ The Sanitizer now uses **sentinel-block based updates** to preserve custom conte
 - `#define`, `#ifdef`, extra includes, and custom sections are preserved
 - If markers don't exist, block is inserted after forcefield include (never before `#define`)
 - If **multiple blocks** are found, the sanitizer replaces all managed blocks with one clean block (strict mode via `--strict-top-update` or `--strict-include-resolution` fails fast)
-- If markers are **malformed** (unmatched or misordered), strict mode (`--strict-top-update` or `--strict-include-resolution`) fails fast; non-strict mode warns and leaves `system.top` unchanged
+- If markers are **malformed** (unmatched or misordered), strict mode (`--strict-top-update` or `--strict-include-resolution`) fails fast; non-strict mode warns and rebuilds one clean managed block (no stale managed content left active)
 - When existing `system.top` already defines `[ defaults ]` or includes `forcefield.itp`, the managed block omits a new `[ defaults ]` section to avoid duplicates
 - Atomic writes prevent partial files on crash
 
@@ -1507,9 +1512,10 @@ For triclinic boxes, the `--dipole-triclinic-policy` controls behavior:
 
 ### v5 Hardening: Include Path Priority
 
-`--itp-include-dirs-priority {last,first}` controls user path precedence:
-- `last` (default): User paths searched last (backward compatible)
-- `first`: User paths searched first (explicit overrides)
+`--itp-include-dirs-priority {forcefield_first,sanitized_first,first,last}` controls user path precedence:
+- `forcefield_first` (default, alias `last`): User paths searched last (backward compatible)
+- `sanitized_first` (alias `first`): User paths searched first (explicit overrides)
+- invalid values are rejected with a clear error.
 
 Shadowing is logged with warnings showing all alternatives.
 
@@ -1524,7 +1530,7 @@ Post-correction verification ensures ionic species weren't modified unless `--ch
 
 ### v5 Hardening: Enhanced Signature & LJ Warnings
 
-- Moleculetype signatures now hash the full `[ atoms ]` table (streaming SHA-256, charge quantized to `1e-4`)
+- Moleculetype signatures now hash canonicalized topology-relevant sections (`[ atoms ]`, connectivity, restraints, virtual-site blocks) to catch materially different same-name definitions
 - Distinguishes same-topology neutral molecules across charge models (e.g., RESP vs CM5)
 - Conflict reporting includes deterministic winner and strict/non-strict behavior
 - LJ negative values get loud warnings; zero values (virtual sites) skipped silently
@@ -2326,6 +2332,8 @@ Per-pair analysis results include:
 | `--lj-sigma-max-nm` | Float | None | Custom sigma max (required with `--lj-bounds-profile custom`) |
 | `--lj-epsilon-max-kj-mol` | Float | None | Custom epsilon max (required with `--lj-bounds-profile custom`) |
 | `--strict-forcefield-consistency` | Flag | False | Fail on mixed forcefield atomtype conflicts |
+| `--itp-include-dirs-priority` | `forcefield_first`, `sanitized_first`, `first`, `last` | `forcefield_first` | Include search precedence (`last`/`first` are legacy aliases) |
+| `--allow-unsafe-include-escape` | Flag | False | Unsafe override: allow `#include` paths to resolve outside configured roots |
 | `--strict-top-update` | Flag | False | Fail if sanitizer managed block markers in `system.top` are malformed |
 | `--dipole-group-max-atoms` | Integer | 2048 | Skip dipole work for oversized residue groups before unwrap |
 | `--dipole-percolation-threshold` | Float (0-1) | 0.45 | Fallback span-ratio threshold for non-bonded unwrap path |

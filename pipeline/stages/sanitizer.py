@@ -114,8 +114,24 @@ PROTECTED_ION_PATTERNS = frozenset({
 })
 
 # Hardening v6: Include resolution priority defaults
-DEFAULT_INCLUDE_PRIORITY = "sanitized_first"  # sanitized_first | forcefield_first | last
+# Canonical priorities:
+# - forcefield_first (legacy "last"): search forcefield/system before user include dirs
+# - sanitized_first (legacy "first"): allow user include dirs to override earlier
+DEFAULT_INCLUDE_PRIORITY = "forcefield_first"
+INCLUDE_PRIORITY_ALIASES = {
+    "forcefield_first": "forcefield_first",
+    "ff_first": "forcefield_first",
+    "last": "forcefield_first",            # legacy alias
+    "sanitized_first": "sanitized_first",
+    "sanitizer_first": "sanitized_first",
+    "first": "sanitized_first",            # legacy alias
+}
+CANONICAL_INCLUDE_PRIORITIES = frozenset({"sanitized_first", "forcefield_first"})
 DEFAULT_ALLOW_INCLUDE_SHADOWING = False  # In strict mode, fail on shadowing
+DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE = False
+
+# Supported ptype tokens in [ atomtypes ].
+PTYPE_TOKENS = frozenset({"A", "D", "V"})
 
 # Sentinel markers for sanitizer-managed include block in system.top
 # Hardening v6: Consistent marker wording
@@ -205,6 +221,21 @@ def parse_include_target(line: str) -> Optional[str]:
         return None
     match = re.match(r'#include\s+[<"]([^">]+)[">]', stripped)
     return match.group(1) if match else None
+
+
+def normalize_include_priority(raw_value: Optional[str]) -> str:
+    """Normalize include-priority value to canonical semantics."""
+    value = str(raw_value).strip().casefold() if raw_value is not None else ""
+    if not value:
+        return DEFAULT_INCLUDE_PRIORITY
+    mapped = INCLUDE_PRIORITY_ALIASES.get(value)
+    if mapped is not None:
+        return mapped
+    valid = ", ".join(["sanitized_first", "forcefield_first", "first", "last"])
+    raise SanitizerError(
+        f"Invalid --itp-include-dirs-priority value '{raw_value}'. "
+        f"Valid values: {valid}"
+    )
 
 
 def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
@@ -399,7 +430,26 @@ class SanitizerStage(BaseStage):
                     check_shadowing=True,
                     allow_shadowing=ctx.allow_include_shadowing,
                 )
+                allow_escape = bool(
+                    getattr(ctx, "allow_unsafe_include_escape", DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE)
+                )
+                allowed_roots = self._include_allowed_roots(
+                    including_file=itp,
+                    include_dirs=include_dirs,
+                    ctx=ctx,
+                )
                 for inc in includes:
+                    if not allow_escape and not self._include_path_allowed(inc.resolve(), allowed_roots):
+                        roots_text = ", ".join(str(r) for r in allowed_roots) or "(none)"
+                        msg = (
+                            f"Blocked include escape '{inc}' while scanning {itp.name}.\n"
+                            f"  Allowed roots: {roots_text}\n"
+                            "Use --allow-unsafe-include-escape to override."
+                        )
+                        if ctx.strict_include_resolution:
+                            raise SanitizerError(msg)
+                        print(f"  [WARN] {msg}")
+                        continue
                     if str(inc) not in ff_map:
                         itp_paths.append(inc)
                         ff_map[str(inc)] = ctx.ff
@@ -709,6 +759,69 @@ class SanitizerStage(BaseStage):
             ion_classifications = self._classify_ionic_moleculetypes(
                 sanitized_molecule_itp_paths, ctx
             )
+
+            class_by_casefold = {
+                name.casefold(): cls for name, cls in ion_classifications.items()
+            }
+            protected_classes = {
+                "protected_ion",
+                "ionic",
+                "monatomic_ion",
+                "protected_solvent",
+                "protected_polymer",
+            }
+            protected_detected = any(
+                cls in protected_classes for cls in ion_classifications.values()
+            )
+
+            # Optional explicit correction target(s) from CLI. Checker supports one target;
+            # we resolve deterministically and fail-fast on ambiguous strict requests.
+            requested_target: Optional[str] = None
+            requested_targets_raw = self._parse_csv_casefold_set(
+                getattr(ctx, "charge_fix_target_molecules", None)
+            )
+            if requested_targets_raw:
+                available_by_casefold = {
+                    name.casefold(): name for name in sanitized_molecule_itp_paths.keys()
+                }
+                resolved_targets: List[str] = []
+                unknown_targets: List[str] = []
+                for token_cf in sorted(requested_targets_raw):
+                    resolved = available_by_casefold.get(token_cf)
+                    if resolved is None:
+                        unknown_targets.append(token_cf)
+                        continue
+                    resolved_targets.append(resolved)
+                if unknown_targets:
+                    msg = (
+                        "Unknown --charge-fix-target-molecules entries: "
+                        f"{unknown_targets}. Available molecules: "
+                        f"{sorted(sanitized_molecule_itp_paths.keys(), key=str.casefold)}"
+                    )
+                    if ctx.strict_charge_neutrality:
+                        raise SanitizerError(msg)
+                    print(f"  [WARN] {msg}")
+                if len(resolved_targets) > 1:
+                    msg = (
+                        "Multiple explicit charge-fix targets provided; only one target is supported "
+                        f"per correction run: {resolved_targets}"
+                    )
+                    if ctx.strict_charge_neutrality:
+                        raise SanitizerError(msg)
+                    resolved_targets = sorted(set(resolved_targets), key=str.casefold)
+                    requested_target = resolved_targets[0]
+                    print(
+                        f"  [WARN] {msg}. Using deterministic first target: '{requested_target}'."
+                    )
+                elif len(resolved_targets) == 1:
+                    requested_target = resolved_targets[0]
+
+            # Strict safety hardening: when protected species exist, require explicit target allowlist.
+            if ctx.strict_charge_neutrality and protected_detected and target_allowlist is None:
+                raise SanitizerError(
+                    "Strict charge-neutrality mode requires an explicit "
+                    "--charge-fix-target-allowlist when protected ions/solvents/polymers are present."
+                )
             
             # Task C: Coalesce None to safe defaults at point of use
             max_delta_limit = (
@@ -760,6 +873,7 @@ class SanitizerStage(BaseStage):
                     molecule_counts=molecule_counts,
                     output_dir=result.sanitized_current_dir,
                     run_id=ctx.run_id,
+                    target_molecule=requested_target,
                 )
                 
                 charge_summary = {
@@ -798,6 +912,7 @@ class SanitizerStage(BaseStage):
                         "max_total": max_total_limit,
                         "max_dipole_shift_debye": dipole_limit,
                     },
+                    "strict_mode_enforced": bool(ctx.strict_charge_neutrality),
                 }
                 electrolyte_warning = self._warn_electrolyte_fixed_charge_limitations(
                     correction_result=correction_result,
@@ -899,19 +1014,20 @@ class SanitizerStage(BaseStage):
                         )
                 
                 # Hardening v5 - Issue G: Post-correction ion protection check
-                violations = self._verify_ion_protection(
+                protection_audit = self._verify_ion_protection(
                     correction_result, ion_classifications, ctx
                 )
+                violations = protection_audit.get("violations", [])
+                charge_summary["target_policy"] = protection_audit
                 if violations:
                     for v in violations:
                         print(f"  [ERROR] {v}")
-                    # In strict mode, fail on violations
-                    if ctx.strict_charge_neutrality:
-                        raise SanitizerError(
-                            f"Ion protection violations: {violations}. "
-                            "Use --charge-fix-allow-ions/--charge-fix-allow-solvents, or for polymers "
-                            "use --charge-fix-target-allowlist with --charge-fix-polymer-method spread_safe."
-                        )
+                    raise SanitizerError(
+                        f"Charge protection policy violations: {violations}. "
+                        "Use --charge-fix-allow-ions/--charge-fix-allow-solvents, and for polymer "
+                        "targets provide --charge-fix-target-allowlist with "
+                        "--charge-fix-polymer-method spread_safe."
+                    )
                 
                 # Record in manifest
                 if ctx.manifest:
@@ -972,6 +1088,10 @@ class SanitizerStage(BaseStage):
         
         # Check if HTPolyNet-staged system.top already exists
         # If so, preserve its [molecules] section and only update includes
+        self._system_top_update_status = {
+            "mode": "generated_new",
+            "degraded": False,
+        }
         if system_top_path.exists() and htpolynet_molecules_present:
             print(f"  Updating existing system.top (preserving [molecules] section)...")
             top_content = self._update_system_top_includes(
@@ -1011,7 +1131,7 @@ class SanitizerStage(BaseStage):
         if system_top_path.exists():
             previous_top = self.safe_read_text(system_top_path, strict=True)
         if previous_top != top_content:
-            system_top_path.write_text(top_content, encoding="utf-8")
+            self._atomic_write_text(system_top_path, top_content, encoding="utf-8")
             print(f"  Wrote: {system_top_path}")
         else:
             print(f"  system.top unchanged: {system_top_path}")
@@ -1020,6 +1140,30 @@ class SanitizerStage(BaseStage):
         # === Record in manifest ===
         
         if ctx.manifest:
+            include_priority_raw = getattr(
+                ctx,
+                "itp_include_dirs_priority",
+                DEFAULT_INCLUDE_PRIORITY,
+            )
+            include_priority_norm = normalize_include_priority(include_priority_raw)
+            ctx.manifest.set_sanitizer_output(
+                "include_resolution_policy",
+                {
+                    "itp_include_dirs_priority": include_priority_raw,
+                    "normalized_priority": include_priority_norm,
+                    "allow_include_shadowing": bool(getattr(ctx, "allow_include_shadowing", False)),
+                    "allow_unsafe_include_escape": bool(
+                        getattr(ctx, "allow_unsafe_include_escape", DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE)
+                    ),
+                },
+            )
+            ctx.manifest.set_sanitizer_output(
+                "system_top_update",
+                {
+                    "path": str(system_top_path),
+                    "status": getattr(self, "_system_top_update_status", {}),
+                },
+            )
             ctx.manifest.set_sanitizer_output(
                 "combined_atomtypes",
                 {
@@ -1262,7 +1406,7 @@ class SanitizerStage(BaseStage):
                 winner_file = Path(c.winner.source_files[0]).name if c.winner and c.winner.source_files else "?"
                 log_lines.append(f"  - {c.atomtype_name}: {winner_file}")
         
-        log_path.write_text("\n".join(log_lines) + "\n")
+        self._atomic_write_text(log_path, "\n".join(log_lines) + "\n", encoding="utf-8")
         
         print("  [OK] ITP Sanitizer stage complete")
         return True
@@ -1490,6 +1634,7 @@ class SanitizerStage(BaseStage):
                         strict=strict_includes,
                         check_shadowing=True,
                         allow_shadowing=allow_shadowing,
+                        ctx=ctx,
                     )
                     if include_path is not None:
                         inc_names, inc_uncertain = self._get_moleculetype_names_recursive(
@@ -1518,6 +1663,56 @@ class SanitizerStage(BaseStage):
                         current_section = ""
         
         return names, uncertain
+
+    @staticmethod
+    def _path_within_root(path: Path, root: Path) -> bool:
+        """Return True when `path` is inside `root` (or equal)."""
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _include_allowed_roots(
+        self,
+        including_file: Path,
+        include_dirs: List[Path],
+        ctx: Optional["PipelineContext"] = None,
+    ) -> List[Path]:
+        """
+        Build include-resolution boundary roots.
+
+        Allowed roots are:
+        - including file parent
+        - configured include search roots
+        - optional project root (if configured)
+        """
+        roots: List[Path] = []
+        candidates: List[Path] = [including_file.parent] + list(include_dirs)
+
+        project_root = getattr(ctx, "project_root", None) if ctx is not None else None
+        if project_root:
+            candidates.append(Path(project_root))
+
+        seen: Set[Path] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            roots.append(resolved)
+        return roots
+
+    def _include_path_allowed(
+        self,
+        resolved_path: Path,
+        allowed_roots: List[Path],
+    ) -> bool:
+        """Return True if include path is under at least one allowed root."""
+        return any(self._path_within_root(resolved_path, root) for root in allowed_roots)
     
     def _resolve_include_in_dirs(
         self,
@@ -1529,6 +1724,7 @@ class SanitizerStage(BaseStage):
         check_shadowing: bool = False,
         allow_shadowing: bool = False,
         diagnostics: Optional[List[Any]] = None,
+        ctx: Optional["PipelineContext"] = None,
     ) -> Optional[Path]:
         """
         Resolve an include target using GROMACS -I style search order.
@@ -1553,6 +1749,17 @@ class SanitizerStage(BaseStage):
             if d not in search_order and d.exists():
                 search_order.append(d)
 
+        allow_escape = bool(
+            getattr(ctx, "allow_unsafe_include_escape", DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE)
+            if ctx is not None
+            else DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE
+        )
+        allowed_roots = self._include_allowed_roots(
+            including_file=including_file,
+            include_dirs=search_order,
+            ctx=ctx,
+        )
+
         attempted: List[str] = []
         found_paths: List[Path] = []
         chosen_from: Optional[Path] = None
@@ -1562,13 +1769,38 @@ class SanitizerStage(BaseStage):
             attempted.append(str(target_path))
             if target_path.exists():
                 resolved = target_path.resolve()
-                found_paths.append(resolved)
-                chosen_from = resolved.parent
+                if not allow_escape and not self._include_path_allowed(resolved, allowed_roots):
+                    roots_text = ", ".join(str(r) for r in allowed_roots) or "(none)"
+                    msg = (
+                        f"Blocked include target '{include_target}' in {including_file.name}: "
+                        f"resolved path escapes allowed roots.\n"
+                        f"  Resolved: {resolved}\n"
+                        f"  Allowed roots: {roots_text}\n"
+                        "Use --allow-unsafe-include-escape to override."
+                    )
+                    if strict:
+                        raise SanitizerError(msg)
+                    print(f"  [WARN] {msg}")
+                else:
+                    found_paths.append(resolved)
+                    chosen_from = resolved.parent
         else:
             for search_dir in search_order:
                 candidate = (search_dir / include_target).resolve()
                 attempted.append(str(candidate))
                 if candidate.exists():
+                    if not allow_escape and not self._include_path_allowed(candidate, allowed_roots):
+                        roots_text = ", ".join(str(r) for r in allowed_roots) or "(none)"
+                        msg = (
+                            f"Blocked include escape '{include_target}' from {including_file.name}:\n"
+                            f"  Candidate: {candidate}\n"
+                            f"  Allowed roots: {roots_text}\n"
+                            "Use --allow-unsafe-include-escape to override."
+                        )
+                        if strict:
+                            raise SanitizerError(msg)
+                        print(f"  [WARN] {msg}")
+                        continue
                     found_paths.append(candidate)
                     if chosen_from is None:
                         chosen_from = search_dir.resolve()
@@ -1705,6 +1937,7 @@ class SanitizerStage(BaseStage):
                     check_shadowing=True,
                     allow_shadowing=allow_shadowing,
                     diagnostics=self.diagnostics,
+                    ctx=ctx,
                 )
                 if inc_path is None:
                     continue
@@ -1931,19 +2164,11 @@ class SanitizerStage(BaseStage):
         correction_result,
         classifications: Dict[str, str],
         ctx: "PipelineContext",
-    ) -> List[str]:
+    ) -> Dict[str, Any]:
         """
-        Verify that charge correction didn't modify protected species.
-        
-        Hardening v6: Extended to protect solvents and polymers as well as ions.
-        
-        Args:
-            correction_result: Result from ChargeNeutralityChecker
-            classifications: Classifications from _classify_ionic_moleculetypes
-            ctx: PipelineContext for config
-            
-        Returns:
-            List of violation messages (empty if OK)
+        Verify that charge correction obeys protected-species policy.
+
+        Returns structured audit details for logs/manifest, including violations.
         """
         violations: List[str] = []
 
@@ -1952,32 +2177,29 @@ class SanitizerStage(BaseStage):
         allow_solvents = getattr(ctx, "charge_fix_allow_solvents", False)
         max_delta = ctx.charge_fix_max_delta_per_atom if ctx.charge_fix_max_delta_per_atom is not None else 1e-5
         target_allowlist = self._parse_csv_casefold_set(ctx.charge_fix_target_allowlist)
+        strict_mode = bool(getattr(ctx, "strict_charge_neutrality", False))
+        polymer_mode_cfg = str(getattr(ctx, "charge_fix_polymer_method", "skip_if_small"))
         
         target_mol = correction_result.target_molecule
         target_mol_cf = target_mol.casefold() if target_mol else None
         class_by_casefold = {name.casefold(): cls for name, cls in classifications.items()}
+        target_classification = class_by_casefold.get(target_mol_cf or "", "unknown")
+        target_from_allowlist = bool(
+            target_allowlist and target_mol_cf and target_mol_cf in target_allowlist
+        )
 
-        if not correction_result.corrected:
-            if ctx.manifest:
-                ctx.manifest.set_sanitizer_output("charge_protection_audit", {
-                    "target_molecule": target_mol,
-                    "classification": class_by_casefold.get(target_mol_cf or "", "unknown"),
-                    "all_classifications": classifications,
-                    "violations": violations,
-                    "corrected": False,
-                    "polymer_policy": getattr(correction_result, "polymer_policy", None),
-                    "config": {
-                        "allow_ions": allow_ions,
-                        "allow_solvents": allow_solvents,
-                        "max_delta_per_atom": max_delta,
-                        "target_allowlist": list(target_allowlist) if target_allowlist else None,
-                        "polymer_net_charge_tol": getattr(ctx, "polymer_net_charge_tol", 1e-3),
-                        "charge_fix_polymer_method": getattr(ctx, "charge_fix_polymer_method", "skip_if_small"),
-                        "charge_fix_polymer_exclusion_bonds": getattr(ctx, "charge_fix_polymer_exclusion_bonds", 2),
-                    },
-                })
-            return violations
-        
+        protected_molecules = {
+            name: cls
+            for name, cls in classifications.items()
+            if cls in {
+                "protected_ion",
+                "ionic",
+                "monatomic_ion",
+                "protected_solvent",
+                "protected_polymer",
+            }
+        }
+
         # Protected classification categories
         PROTECTED_CATEGORIES = {
             "protected_ion": (allow_ions, "--charge-fix-allow-ions"),
@@ -1989,36 +2211,65 @@ class SanitizerStage(BaseStage):
                 "--charge-fix-target-allowlist + --charge-fix-polymer-method spread_safe",
             ),  # Never auto-allow
         }
-        
+
+        if strict_mode and protected_molecules and target_allowlist is None:
+            violations.append(
+                "Strict mode with protected molecules requires explicit "
+                "--charge-fix-target-allowlist."
+            )
+
         # Check if target is protected
         if target_mol:
-            classification = class_by_casefold.get(target_mol_cf or "", "unknown")
-            
+            classification = target_classification
+            neutrality_status = str(getattr(correction_result, "neutrality_status", "") or "")
+            polymer_skip_status = neutrality_status in {
+                "polymer_acceptable_drift",
+                "polymer_skipped_non_strict",
+            }
+
             # If target is in explicit allowlist, it's OK
-            if target_allowlist and target_mol_cf in target_allowlist:
+            if target_from_allowlist:
                 print(f"  [CHARGE-FIX] Target '{target_mol}' ({classification}) is in explicit allowlist")
             elif classification in PROTECTED_CATEGORIES:
                 is_allowed, flag_hint = PROTECTED_CATEGORIES[classification]
+                if (
+                    classification == "protected_polymer"
+                    and not correction_result.corrected
+                    and polymer_skip_status
+                ):
+                    is_allowed = True
                 if not is_allowed:
                     violations.append(
-                        f"Charge correction modified protected species '{target_mol}' "
+                        f"Charge correction targeted protected species '{target_mol}' "
                         f"(classification={classification}). "
                         f"Use {flag_hint} to allow, or add to --charge-fix-target-allowlist."
                     )
-        
-        # Hardening v6: Strict mode requires explicit allowlist if any protected molecules exist
-        if ctx.strict_charge_neutrality and target_allowlist is None:
-            protected_mols = [
-                mol for mol, cls in classifications.items()
-                if cls in PROTECTED_CATEGORIES
-            ]
-            if protected_mols and not (allow_ions and allow_solvents):
-                print(
-                    f"  [WARN] Strict mode: {len(protected_mols)} protected molecules detected "
-                    f"but no explicit --charge-fix-target-allowlist provided. "
-                    f"Consider adding explicit allowlist for safety."
-                )
-        
+
+        polymer_outcome = "not_applicable"
+        effective_method = str(getattr(correction_result, "effective_method", "") or "")
+        if target_mol and target_classification == "protected_polymer":
+            if correction_result.corrected:
+                polymer_outcome = "allowed"
+                if not target_from_allowlist:
+                    polymer_outcome = "refused"
+                    violations.append(
+                        f"Protected polymer target '{target_mol}' must be explicitly allowlisted."
+                    )
+                if polymer_mode_cfg != "spread_safe":
+                    polymer_outcome = "refused"
+                    violations.append(
+                        f"Protected polymer target '{target_mol}' requires "
+                        "--charge-fix-polymer-method spread_safe."
+                    )
+                if effective_method and effective_method != "spread_safe":
+                    polymer_outcome = "refused"
+                    violations.append(
+                        f"Protected polymer target '{target_mol}' was corrected with "
+                        f"unsafe method '{effective_method}' (expected spread_safe)."
+                    )
+            else:
+                polymer_outcome = "refused" if correction_result.correction_refused else "skipped"
+
         # Check max delta per atom
         if correction_result.max_delta_applied is not None:
             if correction_result.max_delta_applied > max_delta:
@@ -2038,30 +2289,43 @@ class SanitizerStage(BaseStage):
                 print(f"    Max delta: {correction_result.max_delta_applied:.3e}")
             if correction_result.total_delta is not None:
                 print(f"    Total delta: {correction_result.total_delta:.3e}")
-            classification = class_by_casefold.get(target_mol_cf or "", "unknown")
+            classification = target_classification
             if classification in PROTECTED_CATEGORIES:
                 print(f"    [WARN] Target '{target_mol}' classified as {classification}")
-        
+
+        audit: Dict[str, Any] = {
+            "target_molecule": target_mol,
+            "target_classification": target_classification,
+            "all_classifications": classifications,
+            "protected_molecules": protected_molecules,
+            "strict_mode_enforced": strict_mode,
+            "explicit_allowlist_provided": target_allowlist is not None,
+            "target_from_allowlist": target_from_allowlist,
+            "corrected": bool(correction_result.corrected),
+            "correction_refused": bool(getattr(correction_result, "correction_refused", False)),
+            "neutrality_status": getattr(correction_result, "neutrality_status", None),
+            "polymer_correction_outcome": polymer_outcome,
+            "polymer_safe_mode_configured": polymer_mode_cfg == "spread_safe",
+            "polymer_safe_mode_effective": effective_method == "spread_safe",
+            "effective_method": effective_method or None,
+            "violations": violations,
+            "config": {
+                "allow_ions": allow_ions,
+                "allow_solvents": allow_solvents,
+                "max_delta_per_atom": max_delta,
+                "target_allowlist": list(target_allowlist) if target_allowlist else None,
+                "polymer_net_charge_tol": getattr(ctx, "polymer_net_charge_tol", 1e-3),
+                "charge_fix_polymer_method": polymer_mode_cfg,
+                "charge_fix_polymer_exclusion_bonds": getattr(ctx, "charge_fix_polymer_exclusion_bonds", 2),
+            },
+            "polymer_policy": getattr(correction_result, "polymer_policy", None),
+        }
+
         # Record audit to manifest
         if ctx.manifest:
-            ctx.manifest.set_sanitizer_output("charge_protection_audit", {
-                "target_molecule": target_mol,
-                "classification": class_by_casefold.get(target_mol_cf or "", "unknown"),
-                "all_classifications": classifications,
-                "violations": violations,
-                "config": {
-                    "allow_ions": allow_ions,
-                    "allow_solvents": allow_solvents,
-                    "max_delta_per_atom": max_delta,
-                    "target_allowlist": list(target_allowlist) if target_allowlist else None,
-                    "polymer_net_charge_tol": getattr(ctx, "polymer_net_charge_tol", 1e-3),
-                    "charge_fix_polymer_method": getattr(ctx, "charge_fix_polymer_method", "skip_if_small"),
-                    "charge_fix_polymer_exclusion_bonds": getattr(ctx, "charge_fix_polymer_exclusion_bonds", 2),
-                },
-                "polymer_policy": getattr(correction_result, "polymer_policy", None),
-            })
-        
-        return violations
+            ctx.manifest.set_sanitizer_output("charge_protection_audit", audit)
+
+        return audit
     
     def _compute_moleculetype_signature(
         self,
@@ -2072,9 +2336,9 @@ class SanitizerStage(BaseStage):
         """
         Compute a collision-resistant signature for one moleculetype.
 
-        Uses streaming SHA-256 over the full [ atoms ] table canonical form:
-          atomtype|atomname|quantized_charge
-        plus section-presence flags and cheap charge-distribution stats.
+        Uses streaming SHA-256 over canonicalized content for topology-relevant
+        sections (atoms/bonds/angles/dihedrals/...); this catches materially
+        different same-name definitions even when atoms-only signatures match.
         """
         if not itp_path.exists():
             return None
@@ -2090,12 +2354,33 @@ class SanitizerStage(BaseStage):
         
         atom_count = 0
         sections_present: Set[str] = set()
+        section_line_counts: Dict[str, int] = {}
         qmin: Optional[float] = None
         qmax: Optional[float] = None
         sum_abs_q = 0.0
         sum_q2 = 0.0
         hasher = hashlib.sha256()
         quant_step = 1e-4
+        topology_sections = {
+            "atoms",
+            "bonds",
+            "pairs",
+            "angles",
+            "dihedrals",
+            "impropers",
+            "constraints",
+            "settles",
+            "virtual_sites2",
+            "virtual_sites3",
+            "virtual_sites4",
+            "virtual_sitesn",
+            "exclusions",
+            "position_restraints",
+            "distance_restraints",
+            "dihedral_restraints",
+            "angle_restraints",
+            "orientation_restraints",
+        }
         
         for line in content.splitlines():
             stripped = line.strip()
@@ -2107,8 +2392,6 @@ class SanitizerStage(BaseStage):
                 if current_section == "moleculetype":
                     current_mol = None
                     in_target_mol = False
-                elif in_target_mol and current_section in {"bonds", "pairs", "angles", "dihedrals", "impropers"}:
-                    sections_present.add(current_section)
                 continue
             
             # Skip comments/blanks
@@ -2123,9 +2406,25 @@ class SanitizerStage(BaseStage):
                     current_mol = parts[0]
                     in_target_mol = (current_mol == mol_name)
                 continue
+
+            if not in_target_mol:
+                continue
+
+            if data.startswith("#"):
+                preproc_key = f"{current_section}:preproc"
+                sections_present.add(preproc_key)
+                section_line_counts[preproc_key] = section_line_counts.get(preproc_key, 0) + 1
+                hasher.update(f"{preproc_key}|{data}\n".encode("utf-8"))
+                continue
+
+            if current_section in topology_sections:
+                canonical_tokens = " ".join(data.split())
+                sections_present.add(current_section)
+                section_line_counts[current_section] = section_line_counts.get(current_section, 0) + 1
+                hasher.update(f"{current_section}|{canonical_tokens}\n".encode("utf-8"))
             
             # Hash all atom entries in target molecule
-            if current_section == "atoms" and in_target_mol:
+            if current_section == "atoms":
                 parts = data.split()
                 if len(parts) >= 5 and parts[0].isdigit():
                     atom_count += 1
@@ -2159,7 +2458,8 @@ class SanitizerStage(BaseStage):
             f"qmax={qmax_val:+.6f};"
             f"sum_abs_q={sum_abs_q:.6f};"
             f"sum_q2={sum_q2:.6f};"
-            f"sections={','.join(sorted(sections_present))}"
+            f"sections={','.join(sorted(sections_present))};"
+            f"section_counts={','.join(f'{k}:{section_line_counts[k]}' for k in sorted(section_line_counts))}"
         )
 
     def _get_ordered_molecules_from_top(self, top_path: Path) -> List[Tuple[str, int]]:
@@ -2348,6 +2648,7 @@ class SanitizerStage(BaseStage):
                 strict=strict_includes,
                 check_shadowing=True,
                 allow_shadowing=getattr(ctx, "allow_include_shadowing", False) if ctx else False,
+                ctx=ctx,
             )
             if include_path is None or not include_path.exists():
                 if strict_includes:
@@ -2356,6 +2657,59 @@ class SanitizerStage(BaseStage):
                         f"system.top includes missing file: {include_target}\n"
                         f"  Searched: {searched}"
                     )
+
+    def _parse_lj_atomtypes_row(
+        self,
+        data: str,
+        source_name: str,
+        line_no: int,
+    ) -> Tuple[str, str, float, float, Optional[str]]:
+        """
+        Parse one [ atomtypes ] data row for LJ validation.
+
+        Supports 6/7/8-column styles and shifted optional fields by:
+        - taking LJ params from the final two numeric tokens
+        - resolving ptype from the right-most {A,D,V} token before LJ params
+        """
+        parts = data.split()
+        if len(parts) < 5:
+            raise ValueError(f"Too few fields for [ atomtypes ] row: '{data}'")
+
+        atomtype_name = parts[0]
+        try:
+            p1 = float(parts[-2])
+            p2 = float(parts[-1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Non-numeric LJ params in atomtype '{atomtype_name}': "
+                f"'{parts[-2]}', '{parts[-1]}'"
+            ) from exc
+
+        ptype_positions = [
+            idx for idx, token in enumerate(parts[:-2]) if token.upper() in PTYPE_TOKENS
+        ]
+        warning_msg: Optional[str] = None
+        if not ptype_positions:
+            ptype = "A"
+            warning_msg = (
+                f"Ambiguous ptype in [ atomtypes ] row at {source_name}:{line_no}; "
+                f"defaulting to ptype='A'. Raw: {data}"
+            )
+        else:
+            chosen_idx = ptype_positions[-1]  # closest token to LJ params wins
+            ptype = parts[chosen_idx].upper()
+            if len(ptype_positions) > 1:
+                warning_msg = (
+                    f"Multiple ptype tokens in [ atomtypes ] row at {source_name}:{line_no}; "
+                    f"using right-most token '{ptype}'. Raw: {data}"
+                )
+            elif chosen_idx != len(parts) - 3:
+                warning_msg = (
+                    f"Shifted ptype column detected at {source_name}:{line_no}; "
+                    f"interpreting token '{ptype}' as ptype. Raw: {data}"
+                )
+
+        return atomtype_name, ptype, p1, p2, warning_msg
 
     def _warn_atomtype_outliers(
         self, combined_atomtypes_path: Path, ctx: Optional["PipelineContext"] = None,
@@ -2405,7 +2759,7 @@ class SanitizerStage(BaseStage):
         if not content:
             return warnings
 
-        for line in content.splitlines():
+        for line_no, line in enumerate(content.splitlines(), start=1):
             stripped = line.strip()
             section = parse_section_name(line)
             if section is not None:
@@ -2417,21 +2771,25 @@ class SanitizerStage(BaseStage):
             if not data:
                 continue
             parts = data.split()
-            if len(parts) < 6:
+            if len(parts) < 5:
                 continue
-            atomtype_name = parts[0]
-            ptype = parts[3].upper() if len(parts) >= 4 else "A"
             try:
-                p1 = float(parts[-2])
-                p2 = float(parts[-1])
+                atomtype_name, ptype, p1, p2, parse_warning = self._parse_lj_atomtypes_row(
+                    data,
+                    combined_atomtypes_path.name,
+                    line_no,
+                )
             except ValueError:
                 msg = (
-                    f"Non-numeric LJ params in atomtype '{atomtype_name}': "
-                    f"'{parts[-2]}', '{parts[-1]}' at {combined_atomtypes_path.name}"
+                    f"Failed to parse [ atomtypes ] LJ row in {combined_atomtypes_path.name}:{line_no}: "
+                    f"{data}"
                 )
                 print(f"  [WARN] {msg}")
                 warnings.append(msg)
                 continue
+            if parse_warning:
+                print(f"  [WARN] {parse_warning}")
+                warnings.append(parse_warning)
 
             comment = stripped.split(";", 1)[1].strip() if ";" in stripped else ""
             provenance = None
@@ -2791,7 +3149,7 @@ class SanitizerStage(BaseStage):
             if temp_path.exists():
                 temp_path.unlink()
 
-    def _atomic_write_text(self, path: Path, content: str) -> None:
+    def _atomic_write_text(self, path: Path, content: str, encoding: str = "utf-8") -> None:
         """
         Write text content atomically via temp file + replace.
         
@@ -2800,7 +3158,7 @@ class SanitizerStage(BaseStage):
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.parent / f".{path.name}.tmp"
         try:
-            temp_path.write_text(content)
+            temp_path.write_text(content, encoding=encoding)
             temp_path.replace(path)
         finally:
             if temp_path.exists():
@@ -2811,8 +3169,11 @@ class SanitizerStage(BaseStage):
         Build restricted search paths for #include resolution.
         
         Hardening v5 - Issue D: Priority-aware include resolution.
+        Priority values are normalized with deterministic aliases:
+        - sanitized_first (alias: first)
+        - forcefield_first (alias: last)
         
-        Order when itp_include_dirs_priority == "last" (default/legacy):
+        Order when priority == "forcefield_first" (legacy alias: "last"):
         1. Current file's parent directory
         2. system_gromacs_dir/top and /itp
         3. system_htpolynet_dir/itp
@@ -2821,7 +3182,7 @@ class SanitizerStage(BaseStage):
         6. Configured GROMACS share/data dirs from context
         7. User-provided ctx.itp_include_dirs (LAST)
 
-        Order when itp_include_dirs_priority == "first":
+        Order when priority == "sanitized_first" (legacy alias: "first"):
         1. Current file's parent directory
         2. User-provided ctx.itp_include_dirs (FIRST - override position)
         3. system_gromacs_dir/top and /itp
@@ -2878,11 +3239,12 @@ class SanitizerStage(BaseStage):
                 if resolved.exists():
                     gmx_share_paths.append(resolved)
 
-        # Get priority setting
-        priority = getattr(ctx, "itp_include_dirs_priority", "last")
+        # Normalize priority setting and reject invalid values with clear guidance.
+        raw_priority = getattr(ctx, "itp_include_dirs_priority", DEFAULT_INCLUDE_PRIORITY)
+        priority = normalize_include_priority(raw_priority)
 
-        # If priority == "first", add user paths early (position 1, after base_path)
-        if priority == "first" and user_paths:
+        # If priority == "sanitized_first", add user paths early (position 1, after base_path)
+        if priority == "sanitized_first" and user_paths:
             paths.extend(user_paths)
 
         # System paths
@@ -2906,8 +3268,8 @@ class SanitizerStage(BaseStage):
         # Configured GROMACS share/data paths
         paths.extend(gmx_share_paths)
 
-        # If priority == "last" (default/legacy), add user paths at end
-        if priority == "last" and user_paths:
+        # If priority == "forcefield_first" (default), add user paths at end
+        if priority == "forcefield_first" and user_paths:
             paths.extend(user_paths)
 
         deduped: List[Path] = []
@@ -3980,7 +4342,8 @@ class SanitizerStage(BaseStage):
             if mdp_files:
                 return mdp_files[0]
         minimal_mdp = workdir / "minimal.mdp"
-        minimal_mdp.write_text(
+        self._atomic_write_text(
+            minimal_mdp,
             "integrator = md\n"
             "nsteps = 0\n"
             "cutoff-scheme = Verlet\n"
@@ -4087,6 +4450,10 @@ class SanitizerStage(BaseStage):
         """
         content = self.safe_read_text(existing_top, strict=True)
         lines = content.splitlines()
+        self._system_top_update_status = {
+            "mode": "existing_top_update",
+            "degraded": False,
+        }
 
         strict_top_update = (
             getattr(ctx, "strict_top_update", None)
@@ -4128,8 +4495,53 @@ class SanitizerStage(BaseStage):
             if strict_top_update:
                 raise SanitizerError(msg)
             print(f"  [WARN] {msg}")
-            print("  [WARN] Leaving system.top unchanged due to malformed managed block markers.")
-            return content
+            print("  [WARN] Rebuilding sanitizer managed block to avoid stale system.top.")
+
+            cleaned_lines: List[str] = []
+            in_managed = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped == begin_marker:
+                    in_managed = True
+                    continue
+                if stripped == end_marker:
+                    in_managed = False
+                    continue
+                if in_managed:
+                    continue
+                cleaned_lines.append(line)
+
+            has_defaults, has_forcefield_include = self._top_has_defaults_or_forcefield(
+                lines=cleaned_lines,
+                ignore_ranges=None,
+            )
+            emit_defaults = not (has_defaults or has_forcefield_include)
+            managed_lines = self._build_sanitizer_managed_block(
+                combined_atomtypes_path,
+                molecule_itp_files,
+                defaults,
+                top_dir,
+                allow_default_defaults,
+                emit_defaults=emit_defaults,
+                extra_includes=extra_includes,
+            )
+            self._system_top_update_status = {
+                "mode": "degraded_rebuild_from_malformed_markers",
+                "degraded": True,
+                "strict_top_update": bool(strict_top_update),
+                "marker_issues": {
+                    "unmatched_begin": len(unmatched_begin),
+                    "unmatched_end": len(unmatched_end),
+                    "nested_begin": len(nested_begin),
+                },
+            }
+            rebuilt = self._insert_managed_block_at_safe_location(
+                cleaned_lines,
+                managed_lines,
+                begin_marker,
+                end_marker,
+            )
+            return '\n'.join(rebuilt) + '\n'
 
         # Detect pre-existing defaults/forcefield include outside managed block(s).
         # If found, do not inject a duplicate [ defaults ] section.
@@ -4159,11 +4571,19 @@ class SanitizerStage(BaseStage):
                     managed_lines +
                     lines[end_idx:]
                 )
+                self._system_top_update_status = {
+                    "mode": "replaced_single_managed_block",
+                    "degraded": False,
+                }
             else:
                 # Defensive fallback: bad ordering
                 result_lines = self._insert_managed_block_at_safe_location(
                     lines, managed_lines, begin_marker, end_marker
                 )
+                self._system_top_update_status = {
+                    "mode": "fallback_insert_bad_marker_order",
+                    "degraded": True,
+                }
         elif len(pairs) > 1:
             msg = (
                 f"Multiple sanitizer managed blocks detected ({len(pairs)}). "
@@ -4191,11 +4611,20 @@ class SanitizerStage(BaseStage):
                 if idx in skip_indices:
                     continue
                 result_lines.append(line)
+            self._system_top_update_status = {
+                "mode": "collapsed_multiple_managed_blocks",
+                "degraded": False,
+                "blocks_found": len(pairs),
+            }
         else:
             # Markers not found: insert at safe location
             result_lines = self._insert_managed_block_at_safe_location(
                 lines, managed_lines, begin_marker, end_marker
             )
+            self._system_top_update_status = {
+                "mode": "inserted_new_managed_block",
+                "degraded": False,
+            }
         
         return '\n'.join(result_lines) + '\n'
     
@@ -4396,7 +4825,8 @@ class SanitizerStage(BaseStage):
         
         # Empty combined atomtypes
         combined_path = system_gromacs_dir / f"combined_atomtypes_{ctx.run_id}.itp"
-        combined_path.write_text(
+        self._atomic_write_text(
+            combined_path,
             "; Combined atomtypes (empty - no source ITPs found)\n"
             "[ atomtypes ]\n"
         )
@@ -4404,7 +4834,7 @@ class SanitizerStage(BaseStage):
         combined_current = system_gromacs_dir / "combined_atomtypes_current.itp"
         if combined_current.exists() or combined_current.is_symlink():
             combined_current.unlink()
-        shutil.copy2(combined_path, combined_current)
+        self._atomic_replace_file(combined_path, combined_current)
         
         # Empty sanitized directory
         sanitized_dir = system_gromacs_dir / f"itp_sanitized_{ctx.run_id}"
@@ -4423,13 +4853,17 @@ class SanitizerStage(BaseStage):
         top_dir.mkdir(parents=True, exist_ok=True)
         
         system_top = top_dir / "system.top"
-        system_top.write_text(generate_system_top(
-            combined_atomtypes_path=combined_current,
-            sanitized_itp_paths=[],
-            system_name=ctx.system_id,
-            top_dir=top_dir,
-            allow_guess_defaults=True,  # Minimal outputs case permits fallback defaults
-        ))
+        self._atomic_write_text(
+            system_top,
+            generate_system_top(
+                combined_atomtypes_path=combined_current,
+                sanitized_itp_paths=[],
+                system_name=ctx.system_id,
+                top_dir=top_dir,
+                allow_guess_defaults=True,  # Minimal outputs case permits fallback defaults
+            ),
+            encoding="utf-8",
+        )
         
         # Record in manifest
         if ctx.manifest:
