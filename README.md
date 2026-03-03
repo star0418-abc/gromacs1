@@ -1561,7 +1561,7 @@ print(ratio > 0.45)  # Expected: True -> skip dipole before unwrap
 
 ## MDP Dynamic Patching
 
-MDP templates in `IN/systems/<SYSTEM_ID>/gromacs/mdp/` are copied to `OUT_GMX/` and patched with CLI overrides before `grompp`.
+MDP templates in `IN/systems/<SYSTEM_ID>/gromacs/mdp/` are copied to `OUT_GMX/`, patched with CLI overrides, and written atomically (UTF-8 temp file + replace) before `grompp`.
 
 ### Patching Logic
 
@@ -1583,7 +1583,7 @@ MDP templates in `IN/systems/<SYSTEM_ID>/gromacs/mdp/` are copied to `OUT_GMX/` 
 | `--comm-grps-policy` | `comm-grps`, `comm-mode` |
 | `--allow-comm-mode-angular-with-pbc` | Expert opt-in to keep `comm-mode=Angular` under PBC |
 | `--force-gen-vel` | `gen_vel` |
-| `--gen-seed` | `gen_seed` (NVT only, for reproducibility) |
+| `--gen-seed` | `gen_seed` (when `gen_vel=yes`, including `--force-gen-vel` in NPT/MD) |
 | `--npt-barostat` | `pcoupl`, `tau_p`, `compressibility` safety injection/warnings (NPT only) |
 
 ### Deterministic Override Order
@@ -1609,7 +1609,7 @@ This ensures `--temperature 300` plus `--tc-grps-mode split` always yields `ref_
 
 ### tc-grps Modes
 
-- **auto** (default): split into `Polymer NonPolymer` when safe, otherwise fallback to `System`
+- **auto** (default, conservative): split into `Polymer NonPolymer` only when clearly safe, otherwise fallback to `System`
 - **system**: `tc-grps = System` — single thermostat group
 - **split**: `tc-grps = Polymer NonPolymer` — separate groups (explicit/legacy mode; requires matching ndx)
 - **split + custom groups**: `--tc-grps-groups "A B C"` — explicit group list (recommended for non-Polymer/NonPolymer labels)
@@ -1621,7 +1621,14 @@ This ensures `--temperature 300` plus `--tc-grps-mode split` always yields `ref_
 - Each group must satisfy both thresholds:
   - atom count >= `--tc-grps-min-atoms`
   - atom fraction >= `--tc-grps-min-fraction`
+- If auto split is selected, applied groups are exactly `Polymer NonPolymer` from that decision (no fallback to arbitrary first-two ndx groups).
 - If checks fail, patcher falls back to `tc-grps = System` with warning.
+
+**System mode rewrite policy**:
+- `tc-grps-mode=system` actively rewrites final state (not a no-op): `tc-grps=System`, `comm-grps=System`, and compatible `comm-mode`.
+- For split→system fallback, vector collapse is safety-first:
+  - auto-collapse `tau_t`/`ref_t` only when all values are identical,
+  - otherwise fail clearly (unless expert override is explicitly enabled).
 
 ### tc-grps Split Safety (GPE Workflows)
 
@@ -2281,7 +2288,7 @@ Per-pair analysis results include:
 | `--no-resume` | Flag | False | Do not skip any stages (default: resume=True) |
 | `-T`, `--temperature` | Float (K) | None | Temperature override |
 | `-P`, `--pressure` | Float (bar) | None | Pressure override |
-| `--tc-grps-mode` | `auto`, `system`, `split` | `auto` | Thermostat groups mode (`auto` recommended) |
+| `--tc-grps-mode` | `auto`, `system`, `split` | `auto` | Thermostat groups mode (`auto` is conservative/system-first; explicit `system` is safest) |
 | `--tau-t-polymer` | Float (ps) | None | tau_t for Polymer group in legacy Polymer/NonPolymer split mode |
 | `--tau-t-nonpolymer` | Float (ps) | None | tau_t for NonPolymer group in legacy Polymer/NonPolymer split mode |
 | `--tau-t-values` | CSV floats | None | tau_t list for custom split groups (count must match `--tc-grps-groups`) |

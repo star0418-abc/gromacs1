@@ -20,6 +20,8 @@ from pipeline.mdp_patcher import (
     _validate_vector_lengths,
     copy_and_patch_mdp,
     get_mdp_overrides_for_stage,
+    parse_ndx_group_sizes,
+    parse_ndx_groups,
     validate_mdp_consistency,
     MDPPatchError,
 )
@@ -102,6 +104,16 @@ class TestP01StagePolicyLoop:
         assert overrides.get("gen_vel") == "yes"
         # force_gen_vel MUST set continuation=no to avoid contradiction (gen_vel=yes + continuation=yes is invalid)
         assert overrides.get("continuation") == "no"
+
+    def test_force_gen_vel_propagates_gen_seed_for_npt_md(self):
+        """When force_gen_vel is active, gen_seed should be set for NPT/MD as well."""
+        ctx = MockContext(force_gen_vel=True, gen_seed=4242)
+        npt_overrides = get_mdp_overrides_for_stage(ctx, "npt")
+        md_overrides = get_mdp_overrides_for_stage(ctx, "md")
+        assert npt_overrides.get("gen_vel") == "yes"
+        assert md_overrides.get("gen_vel") == "yes"
+        assert npt_overrides.get("gen_seed") == 4242
+        assert md_overrides.get("gen_seed") == 4242
     
     def test_allow_continuation_override_skips_continuation(self):
         """allow_continuation_override=True should not set continuation."""
@@ -615,6 +627,122 @@ class TestTinyTcGrpsGuard:
             assert "allow-small-tc-grps" in str(e)
         else:
             raise AssertionError("Expected strict error for explicit tiny tc-grps")
+
+
+class TestSystemModeRewriteSafety:
+    def test_system_mode_rewrites_split_template_state(self, tmp_path):
+        template = tmp_path / "npt.mdp"
+        template.write_text(
+            "tc-grps = Polymer NonPolymer\n"
+            "tau_t = 0.1 0.1\n"
+            "ref_t = 300 300\n"
+            "comm-grps = Polymer NonPolymer\n"
+            "comm-mode = Linear\n"
+        )
+        output = tmp_path / "out.mdp"
+        ctx = MockContext(tc_grps_mode="system", comm_mode="Linear")
+        copy_and_patch_mdp(
+            template,
+            output,
+            {"tc_grps_mode": "system"},
+            validate=True,
+            ctx=ctx,
+            stage="npt",
+        )
+        content = output.read_text()
+        assert "tc-grps = System" in content
+        assert "tau_t = 0.1" in content
+        assert "ref_t = 300" in content
+        assert "comm-grps = System" in content
+
+    def test_system_fallback_refuses_nonuniform_vector_collapse(self, tmp_path):
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text(
+            "[ Tiny ]\n" + " ".join(str(i) for i in range(1, 11)) + "\n"
+            "[ Bulk ]\n" + " ".join(str(i) for i in range(11, 211)) + "\n"
+            "[ System ]\n" + " ".join(str(i) for i in range(1, 211)) + "\n"
+        )
+        template = tmp_path / "nvt.mdp"
+        template.write_text(
+            "tc-grps = Tiny Bulk\n"
+            "tau_t = 0.5 0.1\n"
+            "ref_t = 300 305\n"
+            "tcoupl = v-rescale\n"
+        )
+        output = tmp_path / "out.mdp"
+        ctx = MockContext(
+            tc_grps_mode="auto",
+            tc_grps_auto_split_groups="Tiny Bulk",
+            tc_grps_ndx_path=str(ndx),
+            tc_grps_min_atoms=50,
+        )
+        try:
+            copy_and_patch_mdp(
+                template,
+                output,
+                {"tc_grps_mode": "split"},
+                validate=True,
+                ctx=ctx,
+                stage="nvt",
+            )
+        except MDPPatchError as e:
+            assert "Cannot safely collapse tau_t" in str(e)
+        else:
+            raise AssertionError("Expected MDPPatchError for non-uniform split->system collapse")
+
+
+class TestAutoSplitSourceOfTruth:
+    def test_auto_decision_groups_are_applied_without_first_two_fallback(self, tmp_path):
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text(
+            "[ GroupA ]\n" + " ".join(str(i) for i in range(1, 81)) + "\n"
+            "[ GroupB ]\n" + " ".join(str(i) for i in range(81, 161)) + "\n"
+            "[ Polymer ]\n" + " ".join(str(i) for i in range(1, 401)) + "\n"
+            "[ NonPolymer ]\n" + " ".join(str(i) for i in range(401, 801)) + "\n"
+            "[ System ]\n" + " ".join(str(i) for i in range(1, 801)) + "\n"
+        )
+        ctx = MockContext(
+            tc_grps_mode="auto",
+            active_ndx_path=str(ndx),
+            tc_grps_min_atoms=50,
+            tc_grps_min_fraction=0.01,
+            comm_grps_policy="system",
+        )
+        overrides = get_mdp_overrides_for_stage(ctx, "nvt")
+        assert overrides.get("tc_grps_mode") == "split"
+        assert getattr(ctx, "tc_grps_auto_split_groups", None) == "Polymer NonPolymer"
+
+        template = tmp_path / "nvt.mdp"
+        template.write_text(
+            "tc-grps = System\n"
+            "tau_t = 0.1 0.1\n"
+            "ref_t = 300 300\n"
+            "comm-grps = System\n"
+            "comm-mode = Linear\n"
+            "tcoupl = v-rescale\n"
+        )
+        output = tmp_path / "out.mdp"
+        copy_and_patch_mdp(template, output, overrides, validate=True, ctx=ctx, stage="nvt")
+        content = output.read_text()
+        assert "tc-grps = Polymer NonPolymer" in content
+        assert "tc-grps = GroupA GroupB" not in content
+
+
+class TestNdxInlineCommentParsing:
+    def test_ndx_parser_ignores_inline_comments_for_groups_and_sizes(self, tmp_path):
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text(
+            "[ Polymer ] ; polymer atoms\n"
+            "1 2 3 ; tail comment\n"
+            "4 5\n"
+            "[ NonPolymer ] ; solvent\n"
+            "6 7 ; ions\n"
+        )
+        groups = parse_ndx_groups(ndx)
+        sizes = parse_ndx_group_sizes(ndx)
+        assert groups == ["Polymer", "NonPolymer"]
+        assert sizes["Polymer"] == 5
+        assert sizes["NonPolymer"] == 2
 
 
 class TestPolicyNoneAndNstepsRobustness:

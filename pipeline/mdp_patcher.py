@@ -16,7 +16,9 @@ Safety features:
 - Comment formatting preserves original structure (Issue E)
 """
 
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -321,6 +323,11 @@ def groups_equal(a: str, b: str) -> bool:
     return normalize_group_list(a).casefold() == normalize_group_list(b).casefold()
 
 
+def _strip_ndx_inline_comment(line: str) -> str:
+    """Strip inline ';' comments from .ndx lines."""
+    return line.split(";", 1)[0].strip()
+
+
 def parse_ndx_groups(ndx_path: Path) -> List[str]:
     """
     Parse group names from a GROMACS index file.
@@ -339,12 +346,15 @@ def parse_ndx_groups(ndx_path: Path) -> List[str]:
     
     groups = []
     try:
-        with open(ndx_path, "r") as f:
+        with open(ndx_path, "r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
+                line = _strip_ndx_inline_comment(line)
+                if not line:
+                    continue
                 # Group headers are [ GroupName ]
-                if line.startswith("[") and line.endswith("]"):
-                    group_name = line[1:-1].strip()
+                m = re.match(r"^\[\s*(.+?)\s*\]$", line)
+                if m:
+                    group_name = m.group(1).strip()
                     if group_name:
                         groups.append(group_name)
     except Exception as e:
@@ -373,21 +383,28 @@ def parse_ndx_group_sizes(ndx_path: Path) -> Dict[str, int]:
     current_group: Optional[str] = None
 
     try:
-        with open(ndx_path, "r") as f:
+        with open(ndx_path, "r", encoding="utf-8") as f:
             for line in f:
-                stripped = line.strip()
+                stripped = _strip_ndx_inline_comment(line)
                 if not stripped:
                     continue
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    current_group = stripped[1:-1].strip()
+                m = re.match(r"^\[\s*(.+?)\s*\]$", stripped)
+                if m:
+                    current_group = m.group(1).strip()
                     if current_group and current_group not in sizes:
                         sizes[current_group] = 0
                     continue
                 if current_group is None:
                     continue
-                if stripped.startswith(";"):
-                    continue
-                sizes[current_group] = sizes.get(current_group, 0) + len(stripped.split())
+                token_count = 0
+                for token in stripped.split():
+                    try:
+                        int(token)
+                        token_count += 1
+                    except ValueError:
+                        # Ignore non-index tokens safely (comments already stripped).
+                        continue
+                sizes[current_group] = sizes.get(current_group, 0) + token_count
     except Exception as e:
         raise MDPParseError(f"Failed to parse index group sizes from {ndx_path}: {e}")
 
@@ -1006,7 +1023,29 @@ def write_mdp(
         content = "\n".join(lines)
     
     mdp_path.parent.mkdir(parents=True, exist_ok=True)
-    mdp_path.write_text(content)
+    _atomic_write_text(mdp_path, content, encoding="utf-8")
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """Write text atomically using temp-file + replace in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+        finally:
+            raise
 
 
 def _validate_vector_lengths(
@@ -1466,6 +1505,119 @@ def _normalize_tc_grps_vectors(
             )
 
 
+def _collapse_vector_to_system_mode(
+    semantic_name: str,
+    patched_params: Dict[str, str],
+    original_values: Dict[str, str],
+    patched_values: Dict[str, str],
+    style_ref: Dict[str, str],
+    ctx: Optional["PipelineContext"],
+    sink: Optional[DiagnosticSink],
+) -> None:
+    """
+    Safely collapse multi-value thermostat vectors when tc-grps becomes System.
+
+    Policy:
+    - Auto-collapse only if all vector entries are identical.
+    - Non-identical vectors are a hard error unless explicit expert override is set.
+    """
+    vec_val = get_semantic_value(patched_params, semantic_name)
+    if not vec_val:
+        return
+    vec_tokens = vec_val.split()
+    if len(vec_tokens) <= 1:
+        return
+
+    allow_nonuniform_collapse = (
+        getattr(ctx, "allow_system_vector_collapse", False) if ctx else False
+    )
+    unique_values = {token for token in vec_tokens}
+    if len(unique_values) == 1:
+        collapsed = vec_tokens[0]
+    elif allow_nonuniform_collapse:
+        collapsed = vec_tokens[0]
+        if sink is not None:
+            sink.warn(
+                f"Non-uniform {semantic_name}='{vec_val}' collapsed to '{collapsed}' because "
+                "allow_system_vector_collapse=True (expert override).",
+                escalate_in_strict=False,
+            )
+    else:
+        raise MDPPatchError(
+            f"Cannot safely collapse {semantic_name}='{vec_val}' to tc-grps=System because values differ. "
+            "Provide an explicit single value, keep split mode, or enable "
+            "allow_system_vector_collapse=True as expert override."
+        )
+
+    existing_vec_key = find_existing_key(patched_params, semantic_name)
+    if existing_vec_key:
+        original_values.setdefault(existing_vec_key, patched_params[existing_vec_key])
+    chosen_vec_key = set_semantic_param(patched_params, style_ref, semantic_name, collapsed)
+    patched_values[normalize_key(chosen_vec_key)] = collapsed
+
+
+def _apply_tc_grps_system(
+    patched_params: Dict[str, str],
+    original_values: Dict[str, str],
+    patched_values: Dict[str, str],
+    ctx: Optional["PipelineContext"],
+    original_params: Optional[Dict[str, str]] = None,
+    sink: Optional[DiagnosticSink] = None,
+    reason: Optional[str] = None,
+) -> OverrideOutcome:
+    """
+    Apply tc-grps=System as a real state rewrite (never a no-op).
+
+    Ensures coherent thermostat/COM settings by:
+    - setting tc-grps to System
+    - safely collapsing ref_t/tau_t vectors per policy
+    - aligning comm-grps policy to system (can be overridden later by explicit policy)
+    """
+    strict = getattr(ctx, "strict_mdp_validation", False) if ctx else False
+    if sink is None:
+        sink = DiagnosticSink(strict=strict)
+    style_ref = original_params if original_params else patched_params
+
+    if reason:
+        sink.warn(reason, escalate_in_strict=False)
+
+    existing_tc_grps = find_existing_key(patched_params, "tc_grps")
+    if existing_tc_grps:
+        original_values.setdefault(existing_tc_grps, patched_params[existing_tc_grps])
+    chosen_tc = set_semantic_param(patched_params, style_ref, "tc_grps", "System")
+    patched_values[normalize_key(chosen_tc)] = "System"
+
+    _collapse_vector_to_system_mode(
+        "tau_t",
+        patched_params,
+        original_values,
+        patched_values,
+        style_ref,
+        ctx,
+        sink,
+    )
+    _collapse_vector_to_system_mode(
+        "ref_t",
+        patched_params,
+        original_values,
+        patched_values,
+        style_ref,
+        ctx,
+        sink,
+    )
+
+    _apply_comm_grps_policy(
+        patched_params,
+        original_values,
+        patched_values,
+        "system",
+        ctx,
+        original_params=style_ref,
+        sink=sink,
+    )
+    return OverrideOutcome(OverrideStatus.APPLIED)
+
+
 def copy_and_patch_mdp(
     template_path: Path,
     output_path: Path,
@@ -1657,13 +1809,27 @@ def copy_and_patch_mdp(
         
         # Handle tc-grps mode (Issue A: safe split)
         if param_norm in {"tc_grps_mode", "tc-grps-mode"}:
-            if str(value).lower() == "split":
+            mode_value = str(value).strip().lower()
+            if mode_value == "split":
                 return _apply_tc_grps_split(
                     patched_params, original_values, patched_values, ctx,
                     original_params=original_params,
                     sink=sink,
                 )
-            return OverrideOutcome(OverrideStatus.APPLIED)
+            if mode_value == "system":
+                return _apply_tc_grps_system(
+                    patched_params,
+                    original_values,
+                    patched_values,
+                    ctx,
+                    original_params=original_params,
+                    sink=sink,
+                    reason="tc-grps-mode=system requested; applying unified thermostat grouping.",
+                )
+            return OverrideOutcome(
+                OverrideStatus.FAILED,
+                f"Unsupported tc-grps-mode '{value}'. Supported values: auto, system, split.",
+            )
         
         # Handle comm-grps policy (Issue B)
         if param_norm in {"comm_grps_policy", "comm-grps-policy"}:
@@ -2031,7 +2197,11 @@ def _apply_tc_grps_split(
     tc_grps_value = None
     split_group_names: List[str] = []
     split_source = "unknown"
-    tc_grps_ndx_path = getattr(ctx, "tc_grps_ndx_path", None) if ctx else None
+    tc_grps_ndx_path = (
+        (getattr(ctx, "active_ndx_path", None) or getattr(ctx, "tc_grps_ndx_path", None))
+        if ctx
+        else None
+    )
     available_groups: Optional[List[str]] = None
     ndx_group_sizes: Optional[Dict[str, int]] = None
 
@@ -2044,12 +2214,32 @@ def _apply_tc_grps_split(
             sink.warn(f"Failed to parse ndx for tc-grps: {e}", escalate_in_strict=False)
 
     tc_grps_groups = getattr(ctx, "tc_grps_groups", None) if ctx else None
+    auto_split_groups = getattr(ctx, "tc_grps_auto_split_groups", None) if ctx else None
+    if auto_mode_requested and auto_split_groups:
+        tc_grps_value = normalize_group_list(str(auto_split_groups))
+        split_group_names = tc_grps_value.split()
+        split_source = "auto_decision"
+
     if tc_grps_groups:
         tc_grps_value = normalize_group_list(tc_grps_groups)
         split_group_names = tc_grps_value.split()
         split_source = "explicit"
 
     if not tc_grps_value and available_groups is not None:
+        if auto_mode_requested:
+            sink.warn(
+                "tc-grps auto split requested but no explicit auto-decision groups were provided. "
+                "Auto mode will not guess arbitrary non-System groups; falling back to System.",
+                escalate_in_strict=False,
+            )
+            return _apply_tc_grps_system(
+                patched_params,
+                original_values,
+                patched_values,
+                ctx,
+                original_params=style_ref,
+                sink=sink,
+            )
         non_system_groups = [g for g in available_groups if not groups_equal(g, "System")]
         if len(non_system_groups) >= 2:
             split_group_names = non_system_groups[:2]
@@ -2068,6 +2258,19 @@ def _apply_tc_grps_split(
             )
 
     if not tc_grps_value:
+        if auto_mode_requested:
+            return _apply_tc_grps_system(
+                patched_params,
+                original_values,
+                patched_values,
+                ctx,
+                original_params=style_ref,
+                sink=sink,
+                reason=(
+                    "tc-grps auto mode did not produce deterministic split groups; "
+                    "falling back to System."
+                ),
+            )
         if strict:
             raise MDPPatchError(
                 f"tc-grps split requires explicit group configuration in strict mode.\n"
@@ -2090,34 +2293,15 @@ def _apply_tc_grps_split(
     n_groups = len(split_group_names)
 
     def _fallback_to_system_due_to_small_groups(reason: str) -> OverrideOutcome:
-        sink.warn(
-            f"{reason} Falling back to tc-grps=System for thermostat safety.",
-            escalate_in_strict=False,
+        return _apply_tc_grps_system(
+            patched_params,
+            original_values,
+            patched_values,
+            ctx,
+            original_params=style_ref,
+            sink=sink,
+            reason=f"{reason} Falling back to tc-grps=System for thermostat safety.",
         )
-        existing_tc_grps = find_existing_key(patched_params, "tc_grps")
-        if existing_tc_grps:
-            original_values.setdefault(existing_tc_grps, patched_params[existing_tc_grps])
-        chosen_tc = set_semantic_param(patched_params, style_ref, "tc_grps", "System")
-        patched_values[normalize_key(chosen_tc)] = "System"
-
-        for semantic_name in ("tau_t", "ref_t"):
-            vec_val = get_semantic_value(patched_params, semantic_name)
-            if not vec_val:
-                continue
-            vec_tokens = vec_val.split()
-            if len(vec_tokens) <= 1:
-                continue
-            existing_vec_key = find_existing_key(patched_params, semantic_name)
-            if existing_vec_key:
-                original_values.setdefault(existing_vec_key, patched_params[existing_vec_key])
-            collapsed = vec_tokens[0]
-            chosen_vec_key = set_semantic_param(patched_params, style_ref, semantic_name, collapsed)
-            patched_values[normalize_key(chosen_vec_key)] = collapsed
-            sink.warn(
-                f"Collapsed {semantic_name} to '{collapsed}' because tc-grps split was disabled.",
-                escalate_in_strict=False,
-            )
-        return OverrideOutcome(OverrideStatus.APPLIED)
 
     min_atoms = getattr(ctx, "tc_grps_min_atoms", 50) if ctx else 50
     min_fraction = getattr(ctx, "tc_grps_min_fraction", 0.01) if ctx else 0.01
@@ -2710,6 +2894,7 @@ def get_mdp_overrides_for_stage(ctx: "PipelineContext", stage: str) -> Dict[str,
     if stage in ["nvt", "npt", "md"]:
         requested_mode = getattr(ctx, "tc_grps_mode", "auto")
         if requested_mode == "split":
+            setattr(ctx, "tc_grps_auto_split_groups", None)
             overrides["tc_grps_mode"] = "split"
             overrides["comm_grps_policy"] = ctx.comm_grps_policy
             setattr(
@@ -2728,12 +2913,15 @@ def get_mdp_overrides_for_stage(ctx: "PipelineContext", stage: str) -> Dict[str,
             for warning in auto_decision.get("warnings", []):
                 print(f"  [MDP WARNING] {warning}")
             if auto_decision.get("applied_mode") == "split":
+                setattr(ctx, "tc_grps_auto_split_groups", auto_decision.get("tc_grps"))
                 overrides["tc_grps_mode"] = "split"
                 overrides["comm_grps_policy"] = ctx.comm_grps_policy
             else:
+                setattr(ctx, "tc_grps_auto_split_groups", None)
                 # Enforce deterministic fallback regardless of template defaults.
                 overrides["tc_grps_mode"] = "system"
         else:
+            setattr(ctx, "tc_grps_auto_split_groups", None)
             setattr(
                 ctx,
                 "tc_grps_auto_decision",
@@ -2744,6 +2932,7 @@ def get_mdp_overrides_for_stage(ctx: "PipelineContext", stage: str) -> Dict[str,
                     "warnings": [],
                 },
             )
+            overrides["tc_grps_mode"] = "system"
     
     # =========================================================================
     # P0.1: Stage policy for continuation AND gen_vel
@@ -2790,7 +2979,7 @@ def get_mdp_overrides_for_stage(ctx: "PipelineContext", stage: str) -> Dict[str,
     
     # gen_seed override for reproducibility (applies to NVT where gen_vel=yes)
     gen_seed = getattr(ctx, "gen_seed", None)
-    if gen_seed is not None and stage == "nvt":
+    if gen_seed is not None and overrides.get("gen_vel") == "yes":
         overrides["gen_seed"] = gen_seed
     
     # npt_barostat override (applies to NPT only, not production MD)
