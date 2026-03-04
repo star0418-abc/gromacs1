@@ -99,6 +99,9 @@ class CorrectionResult:
     hetero_atoms_modified: bool = False
     hetero_atoms_modified_count: int = 0
     hetero_atoms_modified_details: Optional[List[Dict[str, Any]]] = None
+    # Outcome semantics
+    policy_limited: bool = False
+    source_validation_issues: Optional[List[Dict[str, Any]]] = None
 
 
 # === Default allowlists for safe correction targets ===
@@ -910,7 +913,8 @@ class ChargeNeutralityChecker:
             max_delta_per_atom: Maximum |Δq| allowed per atom
             max_total_delta: Maximum |ΔQ| total correction (defaults to threshold)
             max_dipole_shift_debye: Maximum allowed dipole shift in Debye
-            strict_charge_physics: If True, dipole violations are errors; else warnings
+            strict_charge_physics: Deprecated in checker. Dipole enforcement is handled
+                in sanitizer stage via strict_dipole_check.
             correction_method: "safe_subset" (default) or "uniform_all"
             allowed_atomnames: Atom names allowed for adjustment (None = use default)
             disallow_atomtypes: Atom types never adjusted (None = use default)
@@ -937,7 +941,13 @@ class ChargeNeutralityChecker:
         self.max_delta_per_atom = max_delta_per_atom
         self.max_total_delta = max_total_delta if max_total_delta is not None else threshold
         self.max_dipole_shift_debye = max_dipole_shift_debye
-        self.strict_charge_physics = strict_charge_physics
+        self.strict_charge_physics = bool(strict_charge_physics)
+        if self.strict_charge_physics:
+            raise ChargeNeutralityError(
+                "strict_charge_physics is not enforced inside charge_neutrality.py. "
+                "Use sanitizer-stage dipole enforcement (--strict-dipole-check) "
+                "with --charge-fix-max-dipole-shift."
+            )
         
         # Task E: Strict mode flag
         self.strict_mode = strict_mode
@@ -1037,9 +1047,10 @@ class ChargeNeutralityChecker:
             mol_unparsed = self.molecule_charges[name].unparsed_atoms_lines or []
             if mol_unparsed:
                 print(
-                    f"    [WARN] allow_unparsed_atoms_lines=True: "
+                    f"    [WARN][UNSAFE] allow_unparsed_atoms_lines=True: "
                     f"{len(mol_unparsed)} unparseable [ atoms ] data line(s) in "
-                    f"{itp_path} ({self.molecule_charges[name].itp_moleculetype_name})."
+                    f"{itp_path} ({self.molecule_charges[name].itp_moleculetype_name}). "
+                    "Derived charges are unreliable and will be treated as degraded in non-strict mode."
                 )
                 for item in mol_unparsed:
                     self.unparsed_atoms_audit.append(
@@ -1069,8 +1080,73 @@ class ChargeNeutralityChecker:
             "rounding_moleculetype_tol": self.rounding_moleculetype_tol,
             "allow_non_rounding_correction": self.allow_non_rounding_correction,
             "allow_unparsed_atoms_lines": self.allow_unparsed_atoms_lines,
+            "strict_charge_physics_requested": self.strict_charge_physics,
+            "dipole_enforcement_scope": "sanitizer_stage_only",
         }
-    
+
+    def _build_loaded_casefold_index(
+        self,
+        molecule_charges: Optional[Dict[str, MoleculeCharge]] = None,
+    ) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+        """
+        Build casefold lookup map with ambiguity tracking.
+
+        Returns:
+            (lookup, collisions)
+            lookup: casefold name -> alias key
+            collisions: casefold name -> sorted alias keys that collide
+        """
+        registry = molecule_charges if molecule_charges is not None else self.molecule_charges
+        loaded_by_casefold: Dict[str, str] = {}
+        collisions: Dict[str, Set[str]] = {}
+        for alias_name, mol in registry.items():
+            keys = {
+                _normalize_molname(alias_name),
+                _normalize_molname(mol.itp_moleculetype_name),
+            }
+            for key in keys:
+                owner = loaded_by_casefold.get(key)
+                if owner is None:
+                    loaded_by_casefold[key] = alias_name
+                    continue
+                if owner != alias_name:
+                    collisions.setdefault(key, set()).update({owner, alias_name})
+        return loaded_by_casefold, {
+            key: sorted(list(names), key=lambda s: s.casefold())
+            for key, names in collisions.items()
+        }
+
+    def _compute_system_charge_for_registry(
+        self,
+        molecule_counts: Dict[str, int],
+        molecule_charges: Dict[str, MoleculeCharge],
+        strict: bool = True,
+    ) -> float:
+        """Compute total charge against an explicit molecule-charge registry."""
+        contributions: List[float] = []
+        loaded_by_casefold, collisions = self._build_loaded_casefold_index(molecule_charges)
+        for name, count in molecule_counts.items():
+            if count <= 0:
+                continue
+            key = _normalize_molname(name)
+            collision = collisions.get(key)
+            if collision:
+                raise ChargeNeutralityError(
+                    "Ambiguous molecule name resolution for charge computation: "
+                    f"'{name}' maps to multiple loaded aliases {collision}. "
+                    "Use unique alias/ITP moleculetype names (case-insensitive)."
+                )
+            resolved = loaded_by_casefold.get(key)
+            if resolved is not None:
+                mol_q = molecule_charges[resolved].total_charge
+                contributions.append(count * mol_q)
+            elif strict:
+                raise ChargeNeutralityError(
+                    f"Missing charge definition for molecule '{name}' (count={count}).\n"
+                    f"Loaded molecules: {list(molecule_charges.keys())}"
+                )
+        return math.fsum(contributions)
+
     def compute_system_charge(
         self,
         molecule_counts: Dict[str, int],
@@ -1095,26 +1171,11 @@ class ChargeNeutralityChecker:
         Raises:
             ChargeNeutralityError: If strict=True and molecule missing charge definition
         """
-        contributions: List[float] = []
-        loaded_by_casefold: Dict[str, str] = {}
-        for alias_name, mol in self.molecule_charges.items():
-            for key in {
-                _normalize_molname(alias_name),
-                _normalize_molname(mol.itp_moleculetype_name),
-            }:
-                loaded_by_casefold.setdefault(key, alias_name)
-        for name, count in molecule_counts.items():
-            resolved = loaded_by_casefold.get(_normalize_molname(name))
-            if resolved is not None:
-                mol_q = self.molecule_charges[resolved].total_charge
-                contributions.append(count * mol_q)
-            elif count > 0 and strict:
-                raise ChargeNeutralityError(
-                    f"Missing charge definition for molecule '{name}' (count={count}).\n"
-                    f"Loaded molecules: {list(self.molecule_charges.keys())}"
-                )
-        
-        return math.fsum(contributions)
+        return self._compute_system_charge_for_registry(
+            molecule_counts=molecule_counts,
+            molecule_charges=self.molecule_charges,
+            strict=strict,
+        )
     
     @staticmethod
     def is_ion(mol_charge: MoleculeCharge, tol: float = 0.1) -> bool:
@@ -1184,18 +1245,11 @@ class ChargeNeutralityChecker:
         """
         if name in self.molecule_charges:
             return name
+        loaded_by_casefold, collisions = self._build_loaded_casefold_index()
         key = _normalize_molname(name)
-        matches: List[str] = []
-        for alias_name, mol in self.molecule_charges.items():
-            if _normalize_molname(alias_name) == key:
-                matches.append(alias_name)
-                continue
-            if _normalize_molname(mol.itp_moleculetype_name) == key:
-                matches.append(alias_name)
-        unique = sorted(set(matches), key=lambda s: s.casefold())
-        if len(unique) == 1:
-            return unique[0]
-        return None
+        if key in collisions:
+            return None
+        return loaded_by_casefold.get(key)
 
     def _is_allowlisted_target(self, mol_name: str) -> bool:
         keys = {_normalize_molname(mol_name)}
@@ -1254,9 +1308,10 @@ class ChargeNeutralityChecker:
         if not self.protected_polymers:
             return decision
 
-        count_by_casefold = {
-            _normalize_molname(name): count for name, count in molecule_counts.items()
-        }
+        count_by_casefold: Dict[str, int] = {}
+        for name, count in molecule_counts.items():
+            key = _normalize_molname(name)
+            count_by_casefold[key] = count_by_casefold.get(key, 0) + int(count)
 
         chosen_target: Optional[str] = None
         if target_molecule is not None:
@@ -1448,9 +1503,10 @@ class ChargeNeutralityChecker:
         Returns:
             (rows, rounding_only_passed, dominant_contributors)
         """
-        count_by_casefold = {
-            _normalize_molname(name): int(count) for name, count in molecule_counts.items()
-        }
+        count_by_casefold: Dict[str, int] = {}
+        for name, count in molecule_counts.items():
+            key = _normalize_molname(name)
+            count_by_casefold[key] = count_by_casefold.get(key, 0) + int(count)
         rows: List[Dict[str, Any]] = []
         for name in sorted(self.molecule_charges, key=lambda s: s.casefold()):
             mol = self.molecule_charges[name]
@@ -1567,6 +1623,275 @@ class ChargeNeutralityChecker:
             if not _matches_custom_allowlist(atomname, self.allowed_atomnames):
                 not_allowlisted.append(item)
         return len(not_allowlisted) == 0, not_allowlisted
+
+    def _active_charge_source_issues(
+        self,
+        molecule_counts: Dict[str, int],
+    ) -> List[Dict[str, Any]]:
+        """Validate reliability of active molecule charge sources."""
+        issues: List[Dict[str, Any]] = []
+        loaded_by_casefold, collisions = self._build_loaded_casefold_index()
+        seen_resolved: Set[str] = set()
+
+        for input_name, count in sorted(molecule_counts.items(), key=lambda kv: kv[0].casefold()):
+            if int(count) <= 0:
+                continue
+            key = _normalize_molname(input_name)
+            collision = collisions.get(key)
+            if collision:
+                issues.append(
+                    {
+                        "issue": "ambiguous_name_collision",
+                        "input_name": input_name,
+                        "count": int(count),
+                        "aliases": collision,
+                    }
+                )
+                continue
+
+            resolved = loaded_by_casefold.get(key)
+            if resolved is None:
+                issues.append(
+                    {
+                        "issue": "missing_charge_definition",
+                        "input_name": input_name,
+                        "count": int(count),
+                    }
+                )
+                continue
+            if resolved in seen_resolved:
+                continue
+            seen_resolved.add(resolved)
+
+            mol = self.molecule_charges[resolved]
+            issue_base = {
+                "input_name": input_name,
+                "resolved_target": resolved,
+                "itp_moleculetype_name": mol.itp_moleculetype_name,
+                "count": int(count),
+                "itp_path": str(mol.itp_path),
+            }
+            if mol.atom_count <= 0 or not mol.charges:
+                issues.append(
+                    {
+                        **issue_base,
+                        "issue": "empty_atoms_section",
+                        "atom_count": int(mol.atom_count),
+                    }
+                )
+            if mol.has_preprocessor:
+                issues.append(
+                    {
+                        **issue_base,
+                        "issue": "preprocessor_directives",
+                    }
+                )
+            unparsed = mol.unparsed_atoms_lines or []
+            if unparsed:
+                first = unparsed[0]
+                issues.append(
+                    {
+                        **issue_base,
+                        "issue": "unparsed_atoms_lines",
+                        "line_count": len(unparsed),
+                        "line_no": first.get("line_no"),
+                        "excerpt": first.get("excerpt"),
+                        "unsafe_override": bool(self.allow_unparsed_atoms_lines),
+                    }
+                )
+
+        return issues
+
+    @staticmethod
+    def _format_active_source_issue(issue: Dict[str, Any]) -> str:
+        """Compact human-readable active-source issue summary."""
+        code = str(issue.get("issue", "unknown"))
+        label = str(issue.get("input_name", "?"))
+        resolved = str(issue.get("resolved_target") or "")
+        if resolved and resolved.casefold() != label.casefold():
+            label = f"{label}->{resolved}"
+
+        if code == "ambiguous_name_collision":
+            return (
+                f"{label}: ambiguous casefold match across aliases "
+                f"{issue.get('aliases', [])}"
+            )
+        if code == "missing_charge_definition":
+            return f"{label}: missing loaded charge definition"
+        if code == "empty_atoms_section":
+            return (
+                f"{label}: empty/unreadable [ atoms ] section "
+                f"(atom_count={issue.get('atom_count', 0)})"
+            )
+        if code == "preprocessor_directives":
+            return f"{label}: preprocessor directives in/around [ atoms ]"
+        if code == "unparsed_atoms_lines":
+            marker = "unsafe override active" if issue.get("unsafe_override") else "strict parse refusal"
+            return (
+                f"{label}: {issue.get('line_count', 0)} unparsed [ atoms ] line(s) "
+                f"({marker}; first line {issue.get('line_no', '?')})"
+            )
+        return f"{label}: {code}"
+
+    def _estimate_target_adjustability(
+        self,
+        target_alias: str,
+        mol_charge: MoleculeCharge,
+        target_count: int,
+    ) -> Tuple[int, str, Optional[str]]:
+        """
+        Estimate total adjustable atoms for candidate ranking.
+
+        Returns:
+            (total_adjustable_atoms, method_desc, exclusion_reason_or_none)
+        """
+        if target_count <= 0:
+            return 0, "n/a", "count <= 0"
+
+        effective_method = "spread_safe" if self._is_protected_polymer(target_alias) else self.correction_method
+        if effective_method == "safe_subset":
+            safe_indices, method_desc = self._get_safe_atom_indices(mol_charge)
+            adjustable_per_molecule = len(safe_indices)
+        elif effective_method == "spread_safe":
+            safe_indices, method_desc = self._get_spread_safe_atom_indices(mol_charge)
+            adjustable_per_molecule = len(safe_indices)
+        else:
+            method_desc = "uniform_all"
+            adjustable_per_molecule = mol_charge.atom_count
+
+        if adjustable_per_molecule <= 0:
+            return 0, method_desc, f"no adjustable atoms ({method_desc})"
+        total_adjustable_atoms = target_count * adjustable_per_molecule
+        if total_adjustable_atoms <= 0:
+            return 0, method_desc, "computed total_adjustable_atoms <= 0"
+        return total_adjustable_atoms, method_desc, None
+
+    def _auto_select_target_with_diagnostics(
+        self,
+        q: float,
+        molecule_counts: Dict[str, int],
+    ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+        """Select correction target deterministically with exclusion diagnostics."""
+        diagnostics: List[Dict[str, Any]] = []
+        candidates: List[Tuple[float, int, int, str]] = []
+        loaded_by_casefold, collisions = self._build_loaded_casefold_index()
+        seen_resolved: Set[str] = set()
+
+        for input_name, count in sorted(molecule_counts.items(), key=lambda kv: kv[0].casefold()):
+            diag: Dict[str, Any] = {
+                "input_name": input_name,
+                "count": int(count),
+            }
+            if int(count) <= 0:
+                diag["status"] = "excluded"
+                diag["reason"] = "count <= 0"
+                diagnostics.append(diag)
+                continue
+
+            key = _normalize_molname(input_name)
+            collision = collisions.get(key)
+            if collision:
+                diag["status"] = "excluded"
+                diag["reason"] = f"ambiguous casefold resolution: {collision}"
+                diagnostics.append(diag)
+                continue
+
+            resolved = loaded_by_casefold.get(key)
+            if resolved is None:
+                diag["status"] = "excluded"
+                diag["reason"] = "not loaded in molecule_charges"
+                diagnostics.append(diag)
+                continue
+            diag["resolved_target"] = resolved
+
+            if resolved in seen_resolved:
+                diag["status"] = "excluded"
+                diag["reason"] = "duplicate reference to same loaded target"
+                diagnostics.append(diag)
+                continue
+            seen_resolved.add(resolved)
+
+            mol = self.molecule_charges[resolved]
+            if not self._is_allowlisted_target(resolved):
+                diag["status"] = "excluded"
+                diag["reason"] = "not in charge-fix target allowlist"
+                diagnostics.append(diag)
+                continue
+            if self.is_ion(mol) and not self.allow_ions:
+                diag["status"] = "excluded"
+                diag["reason"] = "appears ionic; --charge-fix-allow-ions not set"
+                diagnostics.append(diag)
+                continue
+            if not self.is_neutral(mol):
+                diag["status"] = "excluded"
+                diag["reason"] = f"target not neutral (q={mol.total_charge:+.6f})"
+                diagnostics.append(diag)
+                continue
+
+            total_adjustable_atoms, method_desc, exclusion_reason = self._estimate_target_adjustability(
+                target_alias=resolved,
+                mol_charge=mol,
+                target_count=int(count),
+            )
+            if exclusion_reason:
+                diag["status"] = "excluded"
+                diag["reason"] = exclusion_reason
+                diag["method_desc"] = method_desc
+                diagnostics.append(diag)
+                continue
+
+            estimated_delta_per_atom = abs(q) / total_adjustable_atoms
+            diag["method_desc"] = method_desc
+            diag["total_adjustable_atoms"] = total_adjustable_atoms
+            diag["estimated_delta_per_atom"] = estimated_delta_per_atom
+            if estimated_delta_per_atom > self.max_delta_per_atom:
+                diag["status"] = "excluded"
+                diag["reason"] = (
+                    f"estimated |Δq|={estimated_delta_per_atom:.3e} exceeds "
+                    f"max_delta_per_atom={self.max_delta_per_atom:.3e}"
+                )
+                diagnostics.append(diag)
+                continue
+
+            suspicious_flags = len(self._is_suspicious_target(resolved, mol))
+            diag["status"] = "eligible"
+            diag["suspicious_flags"] = suspicious_flags
+            diagnostics.append(diag)
+            candidates.append(
+                (estimated_delta_per_atom, suspicious_flags, -total_adjustable_atoms, resolved)
+            )
+
+        if not candidates:
+            return None, diagnostics
+        candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3].casefold()))
+        return candidates[0][3], diagnostics
+
+    @staticmethod
+    def _format_candidate_diagnostics(
+        diagnostics: List[Dict[str, Any]],
+        max_items: int = 12,
+    ) -> str:
+        """Format candidate-exclusion diagnostics for refusal messages."""
+        if not diagnostics:
+            return "no candidate diagnostics available"
+        lines: List[str] = []
+        for item in diagnostics:
+            if item.get("status") == "eligible":
+                continue
+            label = str(item.get("input_name", "?"))
+            resolved = item.get("resolved_target")
+            if resolved and str(resolved).casefold() != label.casefold():
+                label = f"{label}->{resolved}"
+            reason = str(item.get("reason", item.get("status", "excluded")))
+            lines.append(f"{label}: {reason}")
+            if len(lines) >= max_items:
+                break
+        if not lines:
+            lines = ["all candidates were technically eligible; no exclusions to report"]
+        remaining = max(0, len(diagnostics) - len(lines))
+        if remaining > 0:
+            lines.append(f"... {remaining} additional candidate entries omitted")
+        return "; ".join(lines)
     
     def check_neutrality(
         self,
@@ -1637,6 +1962,8 @@ class ChargeNeutralityChecker:
             if "neutrality_status" not in kwargs:
                 if kwargs.get("corrected"):
                     kwargs["neutrality_status"] = "corrected"
+                elif kwargs.get("policy_limited"):
+                    kwargs["neutrality_status"] = "policy_limited"
                 elif abs(q) < self.neutrality_tol:
                     kwargs["neutrality_status"] = "neutral"
                 elif kwargs.get("correction_refused"):
@@ -1702,48 +2029,71 @@ class ChargeNeutralityChecker:
             )
         
         if target is not None:
+            loaded_by_casefold, collisions = self._build_loaded_casefold_index()
             resolved_target = self._resolve_target_name(target)
             if resolved_target is None:
+                key = _normalize_molname(target)
+                if key in collisions:
+                    reason = (
+                        f"Specified target '{target}' is ambiguous under case-insensitive matching: "
+                        f"{collisions[key]}"
+                    )
+                else:
+                    reason = f"Specified target '{target}' not found in loaded molecules"
                 return _make_result(
                     corrected=False,
                     correction_refused=True,
-                    refuse_reason=f"Specified target '{target}' not found in loaded molecules",
+                    refuse_reason=reason,
                     correction_method="REFUSED: target not found",
                 )
             target = resolved_target
-        
-        if target is None:
-            # Auto-select from allowlist only (Issue B)
-            candidates = []
-            for name, count in molecule_counts.items():
-                resolved_name = self._resolve_target_name(name)
-                if resolved_name is None:
-                    continue
-                mol = self.molecule_charges[resolved_name]
-                # Skip ions and non-neutral molecules
-                if self.is_ion(mol) or not self.is_neutral(mol):
-                    continue
-                # Must be in allowlist (Issue B)
-                if not self._is_allowlisted_target(resolved_name):
-                    continue
-                candidates.append((resolved_name, count, mol))
-            
-            if not candidates:
+            if not self._is_allowlisted_target(target):
                 return _make_result(
                     corrected=False,
                     correction_refused=True,
                     refuse_reason=(
-                        "No suitable correction target found. "
-                        f"Checked allowlist: {sorted(self.target_allowlist)}. "
-                        "Either specify target_molecule explicitly or add molecules to allowlist."
+                        f"Specified target '{target}' is outside charge-fix target allowlist. "
+                        f"Configured allowlist (case-insensitive): {sorted(self.target_allowlist)}."
+                    ),
+                    correction_method="REFUSED: target not allowlisted",
+                )
+        
+        if target is None:
+            target, candidate_diagnostics = self._auto_select_target_with_diagnostics(
+                q=q,
+                molecule_counts=molecule_counts,
+            )
+            if target is None:
+                excluded = self._format_candidate_diagnostics(candidate_diagnostics)
+                return _make_result(
+                    corrected=False,
+                    correction_refused=True,
+                    refuse_reason=(
+                        "No suitable correction target found under current allowlist/policy and "
+                        "per-atom safety limits. "
+                        f"Allowlist: {sorted(self.target_allowlist)}. "
+                        f"Candidate exclusions: {excluded}"
                     ),
                     correction_method="REFUSED: no allowed target",
                 )
-            
-            # Sort by count (highest first)
-            candidates.sort(key=lambda x: -x[1])
-            target = candidates[0][0]
-            print(f"    Auto-selected correction target: {target} (count={candidates[0][1]})")
+            chosen_diag = next(
+                (
+                    item
+                    for item in candidate_diagnostics
+                    if item.get("status") == "eligible"
+                    and item.get("resolved_target") == target
+                ),
+                None,
+            )
+            if chosen_diag is not None:
+                print(
+                    "    Auto-selected correction target: "
+                    f"{target} (estimated |Δq|/atom={float(chosen_diag.get('estimated_delta_per_atom', 0.0)):.3e}, "
+                    f"total_adjustable_atoms={int(chosen_diag.get('total_adjustable_atoms', 0))}, "
+                    f"method={chosen_diag.get('method_desc')})"
+                )
+            else:
+                print(f"    Auto-selected correction target: {target}")
         
         # Verify selected target
         mol_charge = self.molecule_charges[target]
@@ -1796,12 +2146,14 @@ class ChargeNeutralityChecker:
         for warn in suspicious_warnings:
             print(f"    [WARN] {warn}")
         
-        count_by_casefold = {
-            _normalize_molname(name): count for name, count in molecule_counts.items()
-        }
-        target_count = count_by_casefold.get(
+        target_keys = {
             _normalize_molname(target),
-            count_by_casefold.get(_normalize_molname(target_itp_name), 0),
+            _normalize_molname(target_itp_name),
+        }
+        target_count = sum(
+            int(count)
+            for name, count in molecule_counts.items()
+            if _normalize_molname(name) in target_keys
         )
         
         if target_count == 0 or mol_charge.atom_count == 0:
@@ -1896,7 +2248,11 @@ class ChargeNeutralityChecker:
                 correction_refused=True,
                 refuse_reason=(
                     f"Per-atom correction |Δq|={abs(delta_per_atom):.6e} exceeds "
-                    f"max_delta_per_atom={self.max_delta_per_atom:.6e}"
+                    f"max_delta_per_atom={self.max_delta_per_atom:.6e}. "
+                    f"Computed as |Q|={abs(q):.6e} / "
+                    f"(target_count={target_count} × adjustable_atoms_per_molecule={len(safe_indices)} "
+                    f"= total_adjustable_atoms={total_atoms_to_adjust}). "
+                    "Small systems can fail this guardrail while larger systems pass for the same |Q|."
                 ),
                 correction_method="REFUSED: delta too large per atom",
             )
@@ -1929,71 +2285,110 @@ class ChargeNeutralityChecker:
             patched_atom_details_total - len(patched_atom_details),
         )
         
-        # Write patched ITP (Issue D: only patch target moleculetype)
-        patched_itp_path = self._write_patched_itp(
-            mol_charge.itp_path,
-            delta_per_atom,
-            safe_indices,  # Pass safe indices for selective patching
-            output_dir,
-            run_id,
-            target_itp_name,
-            target_count=target_count,
-            original_system_q=q,
-            effective_method=effective_method,
-            method_desc=method_desc,
-        )
-        
-        # === Verification Phase ===
-        # Re-parse patched ITP and verify molecule charge matches expected value
-        new_mol_charge = ChargeParser.get_molecule_charge(
-            patched_itp_path,
-            target,
-            strict=self.strict_mode,
-            expected_itp_moleculetype_name=target_itp_name,
-            allow_unparsed_atoms_lines=self.allow_unparsed_atoms_lines,
-        )
-        expected_mol_q = mol_charge.total_charge + (delta_per_atom * len(safe_indices))
-        actual_mol_q = new_mol_charge.total_charge
-        
-        mol_verify_tol = 1e-10
-        if abs(actual_mol_q - expected_mol_q) > mol_verify_tol:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        final_patched_itp_path: Optional[Path] = None
+        new_mol_charge: Optional[MoleculeCharge] = None
+        actual_mol_q: Optional[float] = None
+        recomputed_q: Optional[float] = None
+
+        # Write + verify transactionally: no committed output/state mutation before full success.
+        with tempfile.TemporaryDirectory(
+            dir=str(output_dir),
+            prefix=f".chargefix_stage_{run_id}_",
+        ) as staging_dir_raw:
+            staging_dir = Path(staging_dir_raw)
+            staged_patched_itp_path = self._write_patched_itp(
+                mol_charge.itp_path,
+                delta_per_atom,
+                safe_indices,  # Pass safe indices for selective patching
+                staging_dir,
+                run_id,
+                target_itp_name,
+                target_count=target_count,
+                original_system_q=q,
+                effective_method=effective_method,
+                method_desc=method_desc,
+            )
+
+            # === Verification Phase ===
+            # Re-parse staged patched ITP and verify molecule charge matches expected value
+            new_mol_charge = ChargeParser.get_molecule_charge(
+                staged_patched_itp_path,
+                target,
+                strict=self.strict_mode,
+                expected_itp_moleculetype_name=target_itp_name,
+                allow_unparsed_atoms_lines=self.allow_unparsed_atoms_lines,
+            )
+            expected_mol_q = mol_charge.total_charge + (delta_per_atom * len(safe_indices))
+            actual_mol_q = new_mol_charge.total_charge
+
+            mol_verify_tol = 1e-10
+            if abs(actual_mol_q - expected_mol_q) > mol_verify_tol:
+                return _make_result(
+                    corrected=False,
+                    correction_refused=True,
+                    refuse_reason=(
+                        f"Write verification failed for molecule '{target}'. "
+                        f"Expected q={expected_mol_q:.12e}, got q={actual_mol_q:.12e}. "
+                        "Check write precision or ITP format."
+                    ),
+                    correction_method="REFUSED: verification failed",
+                )
+
+            # Verify system neutrality using prospective in-memory state only.
+            prospective_molecule_charges = dict(self.molecule_charges)
+            prospective_molecule_charges[target] = new_mol_charge
+            try:
+                recomputed_q = self._compute_system_charge_for_registry(
+                    molecule_counts=molecule_counts,
+                    molecule_charges=prospective_molecule_charges,
+                    strict=True,
+                )
+            except ChargeNeutralityError as e:
+                return _make_result(
+                    corrected=False,
+                    correction_refused=True,
+                    refuse_reason=f"System charge verification failed: {e}",
+                    correction_method="REFUSED: system verification failed",
+                )
+
+            system_verify_tol = 1e-9
+            if abs(recomputed_q) > system_verify_tol:
+                return _make_result(
+                    corrected=False,
+                    correction_refused=True,
+                    refuse_reason=(
+                        "System still not neutral after correction. "
+                        f"Residual Q={recomputed_q:.12e} (tolerance={system_verify_tol:.0e})"
+                    ),
+                    correction_method="REFUSED: residual charge",
+                )
+
+            final_patched_itp_path = output_dir / staged_patched_itp_path.name
+            try:
+                staged_patched_itp_path.replace(final_patched_itp_path)
+            except OSError as exc:
+                return _make_result(
+                    corrected=False,
+                    correction_refused=True,
+                    refuse_reason=(
+                        "Failed to publish corrected ITP after successful verification: "
+                        f"{exc}"
+                    ),
+                    correction_method="REFUSED: publish failed",
+                )
+
+        if new_mol_charge is None or actual_mol_q is None or recomputed_q is None or final_patched_itp_path is None:
             return _make_result(
                 corrected=False,
                 correction_refused=True,
-                refuse_reason=(
-                    f"Write verification failed for molecule '{target}'. "
-                    f"Expected q={expected_mol_q:.12e}, got q={actual_mol_q:.12e}. "
-                    f"Check write precision or ITP format."
-                ),
-                correction_method="REFUSED: verification failed",
+                refuse_reason="Internal error: correction transaction did not finalize deterministically.",
+                correction_method="REFUSED: internal finalize error",
             )
-        
-        # Update cached molecule charge to reflect patched version
+
+        # Commit in-memory state only after full file+system verification and publish.
         self.molecule_charges[target] = new_mol_charge
-        
-        # Verify system is now neutral
-        try:
-            recomputed_q = self.compute_system_charge(molecule_counts, strict=True)
-        except ChargeNeutralityError as e:
-            return _make_result(
-                corrected=False,
-                correction_refused=True,
-                refuse_reason=f"System charge verification failed: {e}",
-                correction_method="REFUSED: system verification failed",
-            )
-        
-        system_verify_tol = 1e-9
-        if abs(recomputed_q) > system_verify_tol:
-            return _make_result(
-                corrected=False,
-                correction_refused=True,
-                refuse_reason=(
-                    f"System still not neutral after correction. "
-                    f"Residual Q={recomputed_q:.12e} (tolerance={system_verify_tol:.0e})"
-                ),
-                correction_method="REFUSED: residual charge",
-            )
-        
+
         print(f"    [OK] Verification passed: molecule q={actual_mol_q:.12e}, system Q={recomputed_q:.12e}")
         unparsed_audit = self.unparsed_atoms_audit[: self.MAX_UNPARSED_ATOMS_AUDIT]
         unparsed_audit_truncated = max(
@@ -2012,7 +2407,7 @@ class ChargeNeutralityChecker:
             effective_method=effective_method,
             method_desc=method_desc,
             correction_delta=delta_per_atom,
-            patched_itp_path=patched_itp_path,
+            patched_itp_path=final_patched_itp_path,
             patched_atoms=patched_charges,
             max_delta_applied=abs(delta_per_atom),
             total_delta=abs(q),
@@ -2348,13 +2743,78 @@ class ChargeNeutralityChecker:
         # Compute total
         is_neutral, q = self.check_neutrality(molecule_counts)
         print(f"  Total system charge: Q = {q:+.8f}")
-        
+
+        active_source_issues = self._active_charge_source_issues(molecule_counts)
+        if active_source_issues:
+            issue_summary = "; ".join(
+                self._format_active_source_issue(item)
+                for item in active_source_issues[:10]
+            )
+            if len(active_source_issues) > 10:
+                issue_summary += f"; ... {len(active_source_issues) - 10} more issue(s)"
+            msg = (
+                "Unreliable active charge sources detected. "
+                f"Details: {issue_summary}"
+            )
+            if self.strict_mode:
+                raise ChargeNeutralityError(
+                    msg
+                    + " Strict mode requires reliable [ atoms ] interpretation across all active molecules."
+                )
+            print("  [WARN][DEGRADED] " + msg)
+            return _attach_rounding_meta(CorrectionResult(
+                original_q=q,
+                corrected=False,
+                correction_method="DEGRADED: unreliable active charge sources (non-strict)",
+                correction_delta=0.0,
+                total_delta=0.0,
+                atoms_adjusted=0,
+                run_id=run_id,
+                thresholds_used=self._thresholds_used(),
+                neutrality_status="degraded_unreliable_charge_sources",
+                correction_refused=True,
+                refuse_reason=msg,
+                policy_limited=True,
+                source_validation_issues=active_source_issues,
+            ))
+
         if is_neutral:
             if not rounding_only_passed:
-                print(
-                    "  [WARN] System total charge is neutral but per-moleculetype integer drift "
-                    "exceeds rounding tolerance."
+                offenders = [
+                    row for row in per_moleculetype_report
+                    if int(row["count"]) > 0 and not row["rounding_pass"]
+                ]
+                offender_txt = ", ".join(
+                    f"{r['moleculetype']}(d={float(r['distance_to_integer']):.3e})"
+                    for r in offenders[:8]
                 )
+                msg = (
+                    "System total charge is neutral but non-rounding per-moleculetype drift exists. "
+                    f"Offenders: {offender_txt}."
+                )
+                if self.strict_mode:
+                    raise ChargeNeutralityError(
+                        msg
+                        + " Strict mode treats this as unsafe because Q≈0 can hide topology/FF stitching defects."
+                    )
+                print("  [WARN][DEGRADED] " + msg)
+                return _attach_rounding_meta(CorrectionResult(
+                    original_q=q,
+                    corrected=False,
+                    correction_method=(
+                        "DEGRADED: neutral total charge but non-rounding moleculetype drift "
+                        "(non-strict)"
+                    ),
+                    correction_delta=0.0,
+                    total_delta=0.0,
+                    atoms_adjusted=0,
+                    run_id=run_id,
+                    thresholds_used=self._thresholds_used(),
+                    neutrality_status="degraded_rounding_drift_non_strict",
+                    correction_refused=True,
+                    refuse_reason=msg,
+                    policy_limited=True,
+                ))
             print("  [OK] System is charge-neutral")
             return _attach_rounding_meta(CorrectionResult(
                 original_q=q,
@@ -2408,34 +2868,41 @@ class ChargeNeutralityChecker:
             net_q = float(polymer_policy.get("net_q") or 0.0)
             tol = float(polymer_policy.get("tol") or self.polymer_net_charge_tol)
             print(
-                f"  [INFO] Protected polymer drift accepted: target={target}, "
-                f"net_q={net_q:+.6e}, tol={tol:.6e}. No correction applied."
+                f"  [WARN][POLICY] Protected polymer drift accepted without correction: "
+                f"target={target}, net_q={net_q:+.6e}, tol={tol:.6e}. "
+                "This is policy-limited, not a clean neutrality validation pass."
             )
             return _attach_rounding_meta(CorrectionResult(
                 original_q=q,
                 corrected=False,
-                correction_method="SKIPPED: protected polymer acceptable drift",
+                correction_method="POLICY-LIMITED: protected polymer acceptable drift (no correction)",
                 correction_delta=0.0,
                 total_delta=0.0,
                 atoms_adjusted=0,
                 run_id=run_id,
                 thresholds_used=self._thresholds_used(),
                 neutrality_status="polymer_acceptable_drift",
+                refuse_reason=(
+                    f"Protected polymer '{target}' drift accepted by policy "
+                    f"(net_q={net_q:+.6e} <= tol={tol:.6e})."
+                ),
                 target_molecule=target,
                 polymer_policy=polymer_policy,
+                policy_limited=True,
             ))
         if decision == "skip_non_strict":
             target = str(polymer_policy.get("target"))
             net_q = float(polymer_policy.get("net_q") or 0.0)
             print(
-                f"  [WARN] Protected polymer '{target}' has net_q={net_q:+.6e} "
+                f"  [WARN][POLICY] Protected polymer '{target}' has net_q={net_q:+.6e} "
                 f"> tol={self.polymer_net_charge_tol:.6e} and is not in "
-                "--charge-fix-target-allowlist; skipping correction in non-strict mode."
+                "--charge-fix-target-allowlist; skipping correction in non-strict mode. "
+                "This is policy-limited, not validated as clean neutrality."
             )
             return _attach_rounding_meta(CorrectionResult(
                 original_q=q,
                 corrected=False,
-                correction_method="SKIPPED: protected polymer not allowlisted (non-strict)",
+                correction_method="POLICY-LIMITED: protected polymer not allowlisted (non-strict)",
                 correction_delta=0.0,
                 total_delta=0.0,
                 atoms_adjusted=0,
@@ -2449,6 +2916,7 @@ class ChargeNeutralityChecker:
                 ),
                 target_molecule=target,
                 polymer_policy=polymer_policy,
+                policy_limited=True,
             ))
         if decision == "strict_fail":
             target = str(polymer_policy.get("target"))

@@ -1264,6 +1264,8 @@ If preprocessing times out under `--strict-gro-top-check`, an actionable error i
 
 The dipole shift check now runs in **heuristic mode by default**—it warns but never hard-fails unless `--strict-dipole-check` is enabled AND all preconditions pass.
 
+`--strict-charge-physics` is not enforced inside `charge_neutrality.py`; dipole enforcement lives in sanitizer-stage dipole checks (`--strict-dipole-check` with `--charge-fix-max-dipole-shift`).
+
 **Gating conditions** (enforcement skipped if any apply):
 | Condition | Reason |
 |-----------|--------|
@@ -1402,10 +1404,11 @@ The Sanitizer performs charge neutrality preflight checking:
 
 **Fail-Fast Behavior**:
 - Fails if any molecule in `[molecules]` with count > 0 has no corresponding ITP file
-- Fails if the ITP cannot be parsed or has empty `[ atoms ]` section
-- Fails if any non-empty, non-comment, non-preprocessor line inside the target `[ atoms ]` block is unparseable (line number + excerpt are reported)
+- Fails if an active molecule ITP cannot be parsed or has empty `[ atoms ]` section
+- Fails on case-insensitive alias/moleculetype collisions that make active molecule resolution ambiguous
+- In strict mode, fails if any active molecule has preprocessor directives in/around `[ atoms ]`, or unparsed/ambiguous `[ atoms ]` data lines
 - Fails if system charge |Q| exceeds auto-correction threshold (default: 1e-4)
-- Optional unsafe escape hatch exists only as an explicit checker flag (`allow_unparsed_atoms_lines=True`), and skipped lines are recorded in charge-neutrality audit output
+- Optional unsafe escape hatch exists only as an explicit checker flag (`allow_unparsed_atoms_lines=True`), skipped lines are recorded in charge-neutrality audit output, and outcomes are marked degraded in non-strict mode
 
 **Alias vs Real ITP Moleculetype**:
 - Molecule counts remain keyed by pipeline alias for backward compatibility
@@ -1413,8 +1416,8 @@ The Sanitizer performs charge neutrality preflight checking:
 - Target `[ moleculetype ]` matching for patching is case-insensitive to avoid alias/casing drift bugs
 
 **Strict vs Non-Strict Mode** (`--strict-charge-neutrality`):
-- **Strict mode**: Fail-fast on preprocessor directives (`#ifdef`/`#include`) in `[ atoms ]` sections, ambiguous parsing, or molecule count mismatches
-- **Non-strict mode** (default): Warn and skip correction for problematic files
+- **Strict mode**: Enforces reliability at system-validation scope (all active molecules), not only correction target selection. If any active source is unreliable, the stage fails even when total `Q ≈ 0`.
+- **Non-strict mode** (default): Returns explicit degraded outcomes (`degraded_unreliable_charge_sources`, `degraded_rounding_drift_non_strict`) instead of reporting a clean neutral pass.
 
 **Safe-Subset Correction** (default, `--charge-fix-method safe_subset`):
 - **Rounding-only gate (default)**:
@@ -1426,9 +1429,11 @@ The Sanitizer performs charge neutrality preflight checking:
   - Carbons: `C1/C2/...` or common carbon class tokens (CT/CB/CG/...)
   - Explicitly excludes element/ion-like names (CL/BR/F/I/NA/LI/K/MG/CA/Zn/Fe/etc.)
   - Prefer false negatives over false positives; override with `--charge-fix-target-atomnames` if needed
-- Target must be in allowlist (PC, EC, DMC,...) or explicitly specified
+- Target must be in the configured allowlist (explicit target selection does not bypass allowlist safety)
+- Auto target selection is deterministic and ranks by estimated per-atom `|Δq|` safety, with exclusion diagnostics when no candidate is acceptable
 - Uniform smearing available via `--charge-fix-method uniform_all`
 - Enforces max per-atom Δq and max total ΔQ guardrails
+- Per-atom limit diagnostics include `|Q| / total_adjustable_atoms`; small systems may fail this guard while larger systems pass for the same `|Q|`
 - If no safe atoms found, correction is refused with actionable message
 - Correction is refused if selected atoms include hetero atoms unless explicitly allowlisted atom names are provided
 - Disallowed atomtypes are enforced case-insensitively (`Cl`/`cl`/`CL` are equivalent)
@@ -1468,8 +1473,9 @@ Recommended safer automation settings for GPE workflows:
 - Prevents silent charge under-counting by refusing unparseable target `[ atoms ]` data lines unless explicit unsafe override is enabled
 
 **Post-Write Verification**:
-- After patching an ITP, re-parses to verify molecule charge matches expected value
-- Recomputes full system charge to confirm neutrality
+- Writes patched ITP to a staging location first, then re-parses to verify molecule charge matches expected value
+- Recomputes full system charge using prospective in-memory state before publishing patched output
+- Publishes patched ITP and updates in-memory molecule charge cache only after full verification succeeds
 - Only claims "Correction applied" if both verifications pass
 - Uses high precision (12 decimal places) in patched ITP to avoid rounding no-ops
 
@@ -1479,7 +1485,7 @@ Recommended safer automation settings for GPE workflows:
 
 **Run-Scoped Outputs**:
 - Patched ITPs are named `{molecule}_corrected_{run_id}.itp` for reproducibility
-- Patched ITP writes are atomic (temp file + fsync + replace), with UTF-8 I/O and ensured output directory creation
+- Patched ITP writes are transactional (staging write + verification + atomic publish), with UTF-8 I/O and ensured output directory creation
 - Each patched file includes a comprehensive audit header with thresholds, target metadata, and explicit correction semantics:
   - `effective_method` and `method_detail` (actual algorithm used, not requested default)
   - `delta_per_atom`
@@ -1493,7 +1499,7 @@ Recommended safer automation settings for GPE workflows:
 **CLI Options**:
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--strict-charge-neutrality` | false | Fail-fast on preprocessor/ambiguous parsing |
+| `--strict-charge-neutrality` | false | Fail-fast on unreliable active charge sources (preprocessor, ambiguous/unparsed `[ atoms ]`, or name collisions) |
 | `--charge-neutrality-tol` | 1e-6 | Non-negative neutrality pass tolerance; must satisfy `tol <= warn` |
 | `--charge-neutrality-warn` | 1e-4 | Non-negative warning threshold; must satisfy `tol <= warn <= correct` |
 | `--charge-neutrality-correct` | 1e-4 | Non-negative auto-correction limit; must satisfy `warn <= correct` |
@@ -1502,7 +1508,7 @@ Recommended safer automation settings for GPE workflows:
 | `--polymer-net-charge-tol` | 1e-3 | Acceptable per-molecule protected-polymer net charge drift |
 | `--charge-fix-polymer-method` | skip_if_small | Protected-polymer policy (`skip_if_small` or `spread_safe`) |
 | `--charge-fix-polymer-exclusion-bonds` | 2 | Exclude atoms within N bonds of hetero atoms for `spread_safe` |
-| `--charge-fix-target-molecules` | — | Comma-separated target molecules |
+| `--charge-fix-target-molecules` | — | Comma-separated target molecules (must still satisfy allowlist policy) |
 | `--charge-fix-target-atomnames` | — | Comma-separated atom name patterns |
 | `--charge-fix-disallowed-atomtypes` | — | Comma-separated atomtypes to never adjust |
 | `--charge-fix-allow-ions` | false | Allow correction on detected ions |
@@ -2338,7 +2344,7 @@ Per-pair analysis results include:
 | `--charge-fix-max-dipole-shift` | Float | 0.01 | Max |Δμ| dipole shift (Debye) |
 | `--charge-fix-moleculetype-rounding-tol` | Float | 1e-4 | Max `|Q_mol-round(Q_mol)|` treated as rounding drift |
 | `--charge-fix-allow-non-rounding` | Flag | False | Unsafe override to allow correction for non-rounding drift |
-| `--strict-charge-physics` | Flag | False | Fail if charge correction violates guardrails |
+| `--strict-charge-physics` | Flag | False | Deprecated in checker path; use `--strict-dipole-check` for dipole hard-fail enforcement |
 | `--strict-gro-top-check` | Flag | False | Fail when GRO/TOP check is uncertain |
 | `--allow-default-defaults` | Flag | False | Allow fallback [ defaults ] when missing |
 | `--allow-mixed-defaults` | Flag | False | Unsafe override to allow mixed [ defaults ] tuples |
