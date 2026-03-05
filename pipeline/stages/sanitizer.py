@@ -30,7 +30,7 @@ Hardening (v3):
 - Preprocessor-aware moleculetype scanning
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -39,10 +39,14 @@ import hashlib
 import os
 import re
 import shutil
+import shlex
 import subprocess
+import uuid
 
 from .base import BaseStage
 from ..itp_sanitizer import IncludeResolution
+from ..gromacs_cmd import resolve_gmx_command
+from ..manifest import _best_effort_fsync, _best_effort_fsync_dir
 
 if TYPE_CHECKING:
     from ..context import PipelineContext
@@ -64,6 +68,10 @@ GROMPP_TIMEOUT_FLOOR_S = 60  # Minimum timeout for any system
 GROMPP_TIMEOUT_PER_1K_LINES = 10  # +10s per 1000 lines of topology
 GROMPP_TIMEOUT_PER_10_INCLUDES = 30  # +30s per 10 includes resolved
 GROMPP_TIMEOUT_RETRY_MULTIPLIER = 2.0  # Retry with 2x timeout on first failure
+
+# Moleculetype signature quantization (env-overridable)
+DEFAULT_MOLECULE_SIG_QUANT_STEP = 1e-6
+MOLECULE_SIG_QUANT_ENV = "GPE_MOLECULE_SIG_QUANT_STEP"
 
 # LJ outlier bound profiles (comb-rule 2/3; sigma/epsilon interpretation).
 LJ_BOUNDS_PROFILES = {
@@ -305,6 +313,14 @@ class GROParseResult:
     title: str = ""
 
 
+@dataclass
+class TopMoleculesParseResult:
+    """Raw [ molecules ] parse result with uncertainty metadata."""
+    ordered: List[Tuple[str, int]]
+    uncertain: bool = False
+    uncertainty_reasons: List[str] = field(default_factory=list)
+
+
 
 class SanitizerStage(BaseStage):
     """
@@ -389,16 +405,72 @@ class SanitizerStage(BaseStage):
         
         # Determine molecule counts early (ordered if possible)
         top_path = system_gromacs_dir / "top" / "system.top"
-        ordered_molecules = self._get_ordered_molecules_from_top(top_path)
-        if ordered_molecules:
+        top_parse = self._get_ordered_molecules_from_top(top_path)
+        ordered_molecules = top_parse.ordered
+        molecule_count_source: Dict[str, Any] = {
+            "raw_top_path": str(top_path),
+            "raw_top_uncertain": bool(top_parse.uncertain),
+            "raw_top_uncertainty_reasons": list(top_parse.uncertainty_reasons),
+            "source": None,
+            "fallback_used": False,
+        }
+
+        if top_parse.uncertain and top_path.exists():
+            print(
+                "  [WARN] Raw [molecules] parse is uncertain due to conditional directives. "
+                "Preferring grompp -pp preprocessed topology."
+            )
+            gro_for_pp = self._find_coords_gro(system_gromacs_dir)
+            preprocessed_molecules: List[Tuple[str, int]] = []
+            if gro_for_pp is not None:
+                try:
+                    self._expected_atoms_from_grompp(
+                        gmx_exe=resolve_gmx_command(ctx),
+                        system_top_path=top_path,
+                        gro_path=gro_for_pp,
+                        output_dir=self.get_output_dir(ctx),
+                        ctx=ctx,
+                    )
+                except SanitizerError as exc:
+                    print(
+                        "  [WARN] Unable to preprocess topology for uncertain [molecules] parse: "
+                        f"{exc}"
+                    )
+                pp_path = self._grompp_preprocessed_top_path(self.get_output_dir(ctx))
+                preprocessed_molecules = self._parse_preprocessed_molecules(pp_path)
+            if preprocessed_molecules:
+                ordered_molecules = preprocessed_molecules
+                molecule_counts = {name: count for name, count in ordered_molecules}
+                htpolynet_molecules_present = True
+                molecule_count_source["source"] = "grompp_preprocessed_top"
+                molecule_count_source["raw_top_used"] = False
+                print("  Using [molecules] from grompp -pp preprocessed topology")
+            else:
+                molecule_counts = self._get_molecule_counts(ctx)
+                ordered_molecules = list(molecule_counts.items())
+                htpolynet_molecules_present = False
+                molecule_count_source["source"] = "manifest_fallback_after_uncertain_raw_top"
+                molecule_count_source["fallback_used"] = True
+                molecule_count_source["raw_top_used"] = False
+                print(
+                    "  [WARN] Could not obtain trusted preprocessed [molecules]; "
+                    "falling back to manifest counts (marked uncertain)."
+                )
+        elif ordered_molecules:
             molecule_counts = {name: count for name, count in ordered_molecules}
             htpolynet_molecules_present = True
+            molecule_count_source["source"] = "raw_system_top"
+            molecule_count_source["raw_top_used"] = True
             print("  Using [molecules] from HTPolyNet-staged system.top")
         else:
             molecule_counts = self._get_molecule_counts(ctx)
             ordered_molecules = list(molecule_counts.items())
             htpolynet_molecules_present = False
+            molecule_count_source["source"] = "manifest"
+            molecule_count_source["fallback_used"] = True
+            molecule_count_source["raw_top_used"] = False
             print("  Using [molecules] from manifest (pre-reaction counts)")
+        self._molecule_count_source = molecule_count_source
         
         needed_molecule_names = {
             name for name, count in ordered_molecules if count > 0
@@ -585,9 +657,6 @@ class SanitizerStage(BaseStage):
                     f"  - Run `grompp -pp` to see full preprocessed topology"
                 )
         
-        # Enforce case-insensitive uniqueness of ITP basenames (cross-platform reproducibility)
-        self._assert_no_case_insensitive_duplicates(itp_paths, "ITP inputs")
-        
         if not itp_paths:
             print("  [WARN] No ITP files found to sanitize")
             print("  Creating empty combined atomtypes file...")
@@ -734,6 +803,7 @@ class SanitizerStage(BaseStage):
         sanitized_molecule_itp_paths = self._map_sanitized_itps_to_molecules(
             result.sanitized_current_dir,
             needed_molecule_names,
+            ctx=ctx,
         )
         
         if sanitized_molecule_itp_paths:
@@ -966,6 +1036,8 @@ class SanitizerStage(BaseStage):
                             "delta_dipole_debye": dipole_info.delta_dipole_debye,
                             "avg_delta_dipole_debye": dipole_info.delta_dipole_debye,
                             "max_delta_dipole_debye": dipole_info.max_delta_dipole_debye,
+                            "reliable": bool(getattr(dipole_info, "reliable", False)),
+                            "reliability_reasons": list(getattr(dipole_info, "reliability_reasons", [])),
                             "coordinates_file": dipole_info.coordinates_file,
                             "skip_reasons": list(getattr(dipole_info, "skip_reasons", [])),
                         }
@@ -989,19 +1061,21 @@ class SanitizerStage(BaseStage):
                                 )
                                 # Check gating: skip enforcement for giant/percolated molecules
                                 skip_reasons = getattr(dipole_info, 'skip_reasons', [])
-                                can_enforce = not skip_reasons
+                                can_enforce = bool(getattr(dipole_info, "reliable", False)) and not skip_reasons
                                 if ctx.strict_dipole_check and can_enforce:
                                     raise SanitizerError(msg)
                                 else:
                                     reason_str = f"; skip reasons: {skip_reasons}" if skip_reasons else " (heuristic mode)"
                                     print(f"  [WARN] {msg}{reason_str}")
                     
-                    self._sync_corrected_itp(
+                    backup_itp = self._sync_corrected_itp(
                         correction_result=correction_result,
                         molecule_itp_paths=sanitized_molecule_itp_paths,
                         sanitized_dir=result.sanitized_dir,
                         sanitized_current_dir=result.sanitized_current_dir,
                     )
+                    if backup_itp is not None:
+                        charge_summary["pre_patch_backup_itp"] = str(backup_itp)
                 else:
                     # v4: Use ctx.charge_neutrality_tol instead of hard-coded 1e-10
                     allowed_skip_statuses = {"polymer_acceptable_drift", "polymer_skipped_non_strict"}
@@ -1163,6 +1237,10 @@ class SanitizerStage(BaseStage):
                     "path": str(system_top_path),
                     "status": getattr(self, "_system_top_update_status", {}),
                 },
+            )
+            ctx.manifest.set_sanitizer_output(
+                "molecule_count_source",
+                getattr(self, "_molecule_count_source", {}),
             )
             ctx.manifest.set_sanitizer_output(
                 "combined_atomtypes",
@@ -1607,7 +1685,12 @@ class SanitizerStage(BaseStage):
         if include_dirs is None and ctx is not None:
             include_dirs = self._build_include_search_paths(ctx, itp_path)
         elif include_dirs is None:
-            # Fallback: only search relative to current file
+            # Fallback is intentionally narrow: call-sites should pass ctx/include_dirs
+            # when complete include search context exists.
+            print(
+                "  [WARN] Include resolution context unavailable while scanning "
+                f"{itp_path}. Falling back to local directory only."
+            )
             include_dirs = [itp_path.parent]
         
         names: List[str] = []
@@ -1985,8 +2068,110 @@ class SanitizerStage(BaseStage):
         if sig1 is None or sig2 is None:
             # Could not compute signature - assume different to be safe
             return True
-        
-        return sig1 != sig2
+        if sig1 != sig2:
+            return True
+
+        # Secondary guard: signatures can quantize equal; compare per-atom charges.
+        quant_step = self._molecule_sig_quant_step()
+        charge_tol = max(quant_step / 2.0, 0.0)
+        charges1 = self._extract_moleculetype_atom_charges(itp1, mol_name, ctx=ctx)
+        charges2 = self._extract_moleculetype_atom_charges(itp2, mol_name, ctx=ctx)
+        if charges1 is None or charges2 is None:
+            return True
+        if len(charges1) != len(charges2):
+            return True
+        for q1, q2 in zip(charges1, charges2):
+            if abs(q1 - q2) > charge_tol:
+                return True
+        return False
+
+    def _molecule_sig_quant_step(self) -> float:
+        """Resolve moleculetype charge quantization step from env or default."""
+        raw = os.environ.get(MOLECULE_SIG_QUANT_ENV, "").strip()
+        if not raw:
+            return DEFAULT_MOLECULE_SIG_QUANT_STEP
+        try:
+            value = float(raw)
+        except ValueError:
+            print(
+                f"  [WARN] Invalid {MOLECULE_SIG_QUANT_ENV}={raw!r}; "
+                f"using default {DEFAULT_MOLECULE_SIG_QUANT_STEP:g}"
+            )
+            return DEFAULT_MOLECULE_SIG_QUANT_STEP
+        if not math.isfinite(value) or value <= 0:
+            print(
+                f"  [WARN] Non-positive/non-finite {MOLECULE_SIG_QUANT_ENV}={raw!r}; "
+                f"using default {DEFAULT_MOLECULE_SIG_QUANT_STEP:g}"
+            )
+            return DEFAULT_MOLECULE_SIG_QUANT_STEP
+        return value
+
+    def _extract_moleculetype_atom_charges(
+        self,
+        itp_path: Path,
+        mol_name: str,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> Optional[List[float]]:
+        """Extract per-atom charges for one moleculetype; fail closed on uncertainty."""
+        if not itp_path.exists():
+            return None
+        strict_reads = bool(ctx and ctx.strict_include_resolution)
+        content = self.safe_read_text(itp_path, strict=strict_reads)
+        if not content:
+            return None
+
+        current_section = ""
+        current_mol = None
+        in_target_mol = False
+        charges: List[float] = []
+
+        for line in content.splitlines():
+            stripped = line.strip()
+            section = parse_section_name(line)
+            if section is not None:
+                current_section = section
+                if current_section == "moleculetype":
+                    current_mol = None
+                    in_target_mol = False
+                continue
+
+            data = strip_gmx_comment(stripped).strip()
+            if not data:
+                continue
+
+            if current_section == "moleculetype":
+                parts = data.split()
+                if parts:
+                    current_mol = parts[0]
+                    in_target_mol = (current_mol == mol_name)
+                continue
+
+            if not in_target_mol:
+                continue
+
+            if data.startswith("#"):
+                return None
+            if current_section != "atoms":
+                continue
+
+            parts = data.split()
+            if len(parts) < 7 or not parts[0].isdigit():
+                continue
+            charge_value: Optional[float] = None
+            charge_candidates = [6] if len(parts) >= 8 else [6, 5]
+            for idx in charge_candidates:
+                if idx >= len(parts):
+                    continue
+                try:
+                    charge_value = float(parts[idx])
+                    break
+                except (ValueError, TypeError):
+                    continue
+            if charge_value is None:
+                return None
+            charges.append(charge_value)
+
+        return charges if charges else None
     
     def _classify_ionic_moleculetypes(
         self,
@@ -2360,7 +2545,7 @@ class SanitizerStage(BaseStage):
         sum_abs_q = 0.0
         sum_q2 = 0.0
         hasher = hashlib.sha256()
-        quant_step = 1e-4
+        quant_step = self._molecule_sig_quant_step()
         topology_sections = {
             "atoms",
             "bonds",
@@ -2428,20 +2613,29 @@ class SanitizerStage(BaseStage):
                 parts = data.split()
                 if len(parts) >= 5 and parts[0].isdigit():
                     atom_count += 1
-                    charge_idx = 6 if len(parts) >= 8 else (5 if len(parts) >= 7 else None)
-                    if charge_idx is None:
+                    charge_value: Optional[float] = None
+                    if len(parts) >= 7:
+                        charge_candidates = [6] if len(parts) >= 8 else [6, 5]
+                    else:
+                        charge_candidates = [5] if len(parts) >= 6 else []
+                    for idx in charge_candidates:
+                        if idx >= len(parts):
+                            continue
+                        try:
+                            charge_value = float(parts[idx])
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                    if charge_value is None:
                         return None
-                    try:
-                        raw_q = float(parts[charge_idx])
-                    except (ValueError, TypeError):
-                        return None
+                    raw_q = charge_value
 
                     qmin = raw_q if qmin is None else min(qmin, raw_q)
                     qmax = raw_q if qmax is None else max(qmax, raw_q)
                     sum_abs_q += abs(raw_q)
                     sum_q2 += raw_q * raw_q
                     quant_q = round(raw_q / quant_step) * quant_step
-                    canonical = f"{parts[1]}|{parts[4]}|{quant_q:+.4f}\n"
+                    canonical = f"{parts[1]}|{parts[4]}|{quant_q:+.10f}\n"
                     hasher.update(canonical.encode("utf-8"))
         
         if atom_count == 0:
@@ -2458,11 +2652,12 @@ class SanitizerStage(BaseStage):
             f"qmax={qmax_val:+.6f};"
             f"sum_abs_q={sum_abs_q:.6f};"
             f"sum_q2={sum_q2:.6f};"
+            f"charge_quant_step={quant_step:.12g};"
             f"sections={','.join(sorted(sections_present))};"
             f"section_counts={','.join(f'{k}:{section_line_counts[k]}' for k in sorted(section_line_counts))}"
         )
 
-    def _get_ordered_molecules_from_top(self, top_path: Path) -> List[Tuple[str, int]]:
+    def _get_ordered_molecules_from_top(self, top_path: Path) -> TopMoleculesParseResult:
         """
         Parse [molecules] section preserving order, collapsing duplicates.
         
@@ -2471,21 +2666,32 @@ class SanitizerStage(BaseStage):
         the first occurrence to avoid breaking include ordering.
         """
         if not top_path.exists():
-            return []
+            return TopMoleculesParseResult(ordered=[])
         # Use list for order + dict for fast lookup of first occurrence index
         ordered: List[Tuple[str, int]] = []
         seen_indices: Dict[str, int] = {}  # name -> index in ordered list
         in_molecules = False
+        uncertain_reasons: List[str] = []
+        conditional_directives = frozenset(
+            {"#if", "#ifdef", "#ifndef", "#elif", "#else", "#endif"}
+        )
         content = self.safe_read_text(top_path, strict=False)
         if not content:
-            return []
-        for line in content.splitlines():
+            return TopMoleculesParseResult(ordered=[])
+        for line_no, line in enumerate(content.splitlines(), start=1):
             stripped = line.strip()
             section = parse_section_name(line)
             if section is not None:
                 in_molecules = (section == "molecules")
                 continue
             if not in_molecules:
+                continue
+            if stripped.startswith("#"):
+                directive = stripped.split()[0].lower()
+                if directive in conditional_directives:
+                    uncertain_reasons.append(
+                        f"{directive} in [molecules] at {top_path.name}:{line_no}"
+                    )
                 continue
             if not stripped or stripped.startswith(";") or stripped.startswith("#"):
                 continue
@@ -2508,7 +2714,11 @@ class SanitizerStage(BaseStage):
                         ordered.append((name, count))
                 except ValueError:
                     continue
-        return ordered
+        return TopMoleculesParseResult(
+            ordered=ordered,
+            uncertain=bool(uncertain_reasons),
+            uncertainty_reasons=uncertain_reasons,
+        )
     
     def _get_molecules_from_htpolynet_top(self, ctx: "PipelineContext") -> Optional[Dict[str, int]]:
         """
@@ -2566,6 +2776,7 @@ class SanitizerStage(BaseStage):
         self,
         sanitized_current_dir: Path,
         needed_molecule_names: set,
+        ctx: Optional["PipelineContext"] = None,
     ) -> Dict[str, Path]:
         """Map molecule names to sanitized ITPs (by moleculetype name)."""
         if not sanitized_current_dir.exists() or not needed_molecule_names:
@@ -2573,7 +2784,7 @@ class SanitizerStage(BaseStage):
         name_map = {n.casefold(): n for n in needed_molecule_names}
         mapping: Dict[str, Path] = {}
         for itp_path in self._sorted_paths_casefold(sanitized_current_dir.glob("*.itp")):
-            for mol_name in self._get_moleculetype_names(itp_path):
+            for mol_name in self._get_moleculetype_names(itp_path, ctx=ctx):
                 key = mol_name.casefold()
                 if key not in name_map:
                     continue
@@ -2667,12 +2878,13 @@ class SanitizerStage(BaseStage):
         """
         Parse one [ atomtypes ] data row for LJ validation.
 
-        Supports 6/7/8-column styles and shifted optional fields by:
-        - taking LJ params from the final two numeric tokens
-        - resolving ptype from the right-most {A,D,V} token before LJ params
+        Conservative parser:
+        - Requires ptype in the canonical position (third token from tail)
+        - Requires tail shape: ... mass charge ptype sigma epsilon
+        - Rejects ambiguous rows rather than guessing shifted columns
         """
         parts = data.split()
-        if len(parts) < 5:
+        if len(parts) < 6:
             raise ValueError(f"Too few fields for [ atomtypes ] row: '{data}'")
 
         atomtype_name = parts[0]
@@ -2685,31 +2897,32 @@ class SanitizerStage(BaseStage):
                 f"'{parts[-2]}', '{parts[-1]}'"
             ) from exc
 
-        ptype_positions = [
-            idx for idx, token in enumerate(parts[:-2]) if token.upper() in PTYPE_TOKENS
-        ]
-        warning_msg: Optional[str] = None
-        if not ptype_positions:
-            ptype = "A"
-            warning_msg = (
-                f"Ambiguous ptype in [ atomtypes ] row at {source_name}:{line_no}; "
-                f"defaulting to ptype='A'. Raw: {data}"
+        ptype = parts[-3].upper()
+        if ptype not in PTYPE_TOKENS:
+            raise ValueError(
+                f"Ambiguous/missing ptype token at {source_name}:{line_no}. "
+                f"Expected one of {sorted(PTYPE_TOKENS)} in column -3; got '{parts[-3]}'. "
+                f"Raw: {data}"
             )
-        else:
-            chosen_idx = ptype_positions[-1]  # closest token to LJ params wins
-            ptype = parts[chosen_idx].upper()
-            if len(ptype_positions) > 1:
-                warning_msg = (
-                    f"Multiple ptype tokens in [ atomtypes ] row at {source_name}:{line_no}; "
-                    f"using right-most token '{ptype}'. Raw: {data}"
-                )
-            elif chosen_idx != len(parts) - 3:
-                warning_msg = (
-                    f"Shifted ptype column detected at {source_name}:{line_no}; "
-                    f"interpreting token '{ptype}' as ptype. Raw: {data}"
-                )
 
-        return atomtype_name, ptype, p1, p2, warning_msg
+        extra_ptypes = [
+            token for token in parts[:-3] if token.upper() in PTYPE_TOKENS
+        ]
+        if extra_ptypes:
+            raise ValueError(
+                f"Ambiguous row with multiple ptype-like tokens at {source_name}:{line_no}: "
+                f"{extra_ptypes + [ptype]}. Raw: {data}"
+            )
+
+        try:
+            float(parts[-4])  # charge
+            float(parts[-5])  # mass
+        except (ValueError, IndexError) as exc:
+            raise ValueError(
+                f"Malformed mass/charge columns before ptype in {source_name}:{line_no}. Raw: {data}"
+            ) from exc
+
+        return atomtype_name, ptype, p1, p2, None
 
     def _warn_atomtype_outliers(
         self, combined_atomtypes_path: Path, ctx: Optional["PipelineContext"] = None,
@@ -2779,11 +2992,14 @@ class SanitizerStage(BaseStage):
                     combined_atomtypes_path.name,
                     line_no,
                 )
-            except ValueError:
+            except ValueError as exc:
                 msg = (
-                    f"Failed to parse [ atomtypes ] LJ row in {combined_atomtypes_path.name}:{line_no}: "
-                    f"{data}"
+                    f"Ambiguous/malformed [ atomtypes ] LJ row in "
+                    f"{combined_atomtypes_path.name}:{line_no}: {data}\n"
+                    f"  Reason: {exc}"
                 )
+                if policy == "error":
+                    raise SanitizerError(msg)
                 print(f"  [WARN] {msg}")
                 warnings.append(msg)
                 continue
@@ -3112,10 +3328,10 @@ class SanitizerStage(BaseStage):
         molecule_itp_paths: Dict[str, Path],
         sanitized_dir: Path,
         sanitized_current_dir: Path,
-    ) -> None:
+    ) -> Optional[Path]:
         """Ensure corrected ITP matches the include path used by system.top."""
         if not correction_result.corrected or not correction_result.patched_itp_path:
-            return
+            return None
         target = correction_result.target_molecule
         if not target and correction_result.patched_itp_path:
             name = correction_result.patched_itp_path.stem
@@ -3129,22 +3345,30 @@ class SanitizerStage(BaseStage):
                 "cannot be resolved to an included ITP."
             )
         original_path = molecule_itp_paths[resolved_target]
+        run_token = getattr(correction_result, "run_id", None) or "run"
+        backup_path = sanitized_dir / f"{original_path.stem}_pre_patch_{run_token}{original_path.suffix}"
         if correction_result.patched_itp_path.resolve() != original_path.resolve():
+            # Required order for crash-safe semantics:
+            # 1) backup original -> versioned backup path
+            # 2) replace original with patched content
+            self._atomic_replace_file(original_path, backup_path)
             self._atomic_replace_file(correction_result.patched_itp_path, original_path)
-        versioned_path = sanitized_dir / original_path.name
-        if versioned_path.resolve() != original_path.resolve():
-            self._atomic_replace_file(original_path, versioned_path)
         # Remove stray corrected filename to avoid confusion
         if correction_result.patched_itp_path.exists() and correction_result.patched_itp_path.resolve() != original_path.resolve():
             correction_result.patched_itp_path.unlink()
+        return backup_path
 
     def _atomic_replace_file(self, src: Path, dest: Path) -> None:
         """Atomic replace of dest with src content."""
         dest.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = dest.parent / f".{dest.name}.tmp"
+        temp_path = dest.parent / f".{dest.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         try:
-            shutil.copy2(src, temp_path)
-            temp_path.replace(dest)
+            with open(src, "rb") as src_handle, open(temp_path, "wb") as temp_handle:
+                shutil.copyfileobj(src_handle, temp_handle)
+                temp_handle.flush()
+                _best_effort_fsync(temp_handle.fileno())
+            os.replace(temp_path, dest)
+            _best_effort_fsync_dir(dest.parent)
         finally:
             if temp_path.exists():
                 temp_path.unlink()
@@ -3156,10 +3380,14 @@ class SanitizerStage(BaseStage):
         Prevents partial files after crashes.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.parent / f".{path.name}.tmp"
+        temp_path = path.parent / f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         try:
-            temp_path.write_text(content, encoding=encoding)
-            temp_path.replace(path)
+            with open(temp_path, "w", encoding=encoding) as handle:
+                handle.write(content)
+                handle.flush()
+                _best_effort_fsync(handle.fileno())
+            os.replace(temp_path, path)
+            _best_effort_fsync_dir(path.parent)
         finally:
             if temp_path.exists():
                 temp_path.unlink()
@@ -3380,12 +3608,14 @@ class SanitizerStage(BaseStage):
         gro_path: Path,
         strict: bool = False,
         max_atoms: Optional[int] = None,
+        retain_resnames: Optional[Set[str]] = None,
     ) -> Optional[GROParseResult]:
         """
         Parse a GRO file returning atoms with residue info and box vectors.
         
         Hardening v6: Robust parsing with truncation/corruption detection.
         Hardening v7: Streamed parsing (avoid loading huge files into memory).
+        Hardening v8: Optional selective retention by residue name for dipole checks.
         
         GRO format (fixed columns):
         - Line 1: title
@@ -3406,6 +3636,9 @@ class SanitizerStage(BaseStage):
             gro_path: Path to GRO file
             strict: If True, fail on any parsing issue; else return None
             max_atoms: Optional safety cap for declared atoms (non-strict early exit)
+            retain_resnames: Optional uppercase residue names to retain in memory.
+                             When set, all lines are still parsed/validated but only
+                             matching atoms are materialized.
             
         Returns:
             GROParseResult with atoms, box dimensions, and triclinic flag
@@ -3444,7 +3677,9 @@ class SanitizerStage(BaseStage):
                 cap = max_atoms if max_atoms is not None else GRO_ABSURD_ATOMS
                 if cap is not None and natoms_declared > cap:
                     msg = (
-                        f"GRO file {gro_path}: declared atom count {natoms_declared} exceeds safety cap {cap}"
+                        f"GRO file {gro_path}: declared atom count {natoms_declared} exceeds safety cap {cap}. "
+                        "This parser keeps only selected residues for dipole checks; "
+                        "reduce system size for sanitizer dipole checks or raise the cap intentionally."
                     )
                     if strict:
                         raise SanitizerError(msg)
@@ -3454,6 +3689,7 @@ class SanitizerStage(BaseStage):
                 # Parse atom lines (line numbers start at 3 for first atom)
                 atoms: List[GROAtom] = []
                 parse_errors: List[str] = []
+                atoms_parsed_total = 0
                 for i in range(natoms_declared):
                     line = handle.readline()
                     if not line:
@@ -3471,17 +3707,18 @@ class SanitizerStage(BaseStage):
                         x = float(line[20:28])
                         y = float(line[28:36])
                         z = float(line[36:44])
-                        atoms.append(GROAtom(resnr, resname, atomname, x, y, z))
+                        atoms_parsed_total += 1
+                        if retain_resnames is None or resname.upper() in retain_resnames:
+                            atoms.append(GROAtom(resnr, resname, atomname, x, y, z))
                     except (ValueError, IndexError) as e:
                         parse_errors.append(f"Line {i + 3}: {e}")
                         continue
 
                 # Hardening v6: Verify natoms matches parsed atoms
-                atoms_parsed = len(atoms)
-                if atoms_parsed != natoms_declared:
+                if atoms_parsed_total != natoms_declared:
                     msg = (
                         f"GRO file {gro_path}: atom count mismatch!\n"
-                        f"  Declared: {natoms_declared}, Parsed: {atoms_parsed}\n"
+                        f"  Declared: {natoms_declared}, Parsed: {atoms_parsed_total}\n"
                         f"  File may be truncated or corrupted."
                     )
                     if parse_errors:
@@ -3489,7 +3726,7 @@ class SanitizerStage(BaseStage):
                     if strict:
                         raise SanitizerError(msg)
                     print(f"  [WARN] {msg}")
-                    if atoms_parsed == 0:
+                    if atoms_parsed_total == 0:
                         return None
 
                 # Find the box line robustly by scanning remaining lines
@@ -3577,8 +3814,13 @@ class SanitizerStage(BaseStage):
         - Triclinic fallback to diagonal approximation
         """
         from ..charge_neutrality import ChargeParser, DipoleResult
-        
+
         skip_reasons: List[str] = []
+        reliability_reasons: List[str] = []
+
+        def _add_reason(target: List[str], reason: str) -> None:
+            if reason not in target:
+                target.append(reason)
         
         if not correction_result.patched_itp_path:
             return None
@@ -3598,14 +3840,26 @@ class SanitizerStage(BaseStage):
         target_itp_name = (
             getattr(correction_result, "target_itp_moleculetype_name", None) or target
         )
+        # Handle GRO 5-char truncation: try target and target[:5]
+        target_resnames = {target.upper(), target[:5].upper()}
 
         charges_before = self._get_molecule_charges(molecule_itp_paths[target], target_itp_name)
         charges_after = self._get_molecule_charges(correction_result.patched_itp_path, target_itp_name)
         if not charges_before or not charges_after or len(charges_before) != len(charges_after):
-            return DipoleResult(computed=False)
+            return DipoleResult(computed=False, reliable=False)
         bond_source = correction_result.patched_itp_path or molecule_itp_paths[target]
         bond_graph = ChargeParser.parse_molecule_bond_graph(bond_source, target_itp_name)
         has_bond_graph = bool(bond_graph)
+        if not has_bond_graph:
+            _add_reason(reliability_reasons, "bond_graph_missing")
+            _add_reason(reliability_reasons, "fallback_mic_unreliable")
+            msg = (
+                f"Dipole reliability failure for '{target_itp_name}': "
+                "bond graph is unavailable; atom0-based MIC fallback is not reliable."
+            )
+            if ctx and ctx.strict_dipole_check:
+                raise SanitizerError(f"{msg} Disable strict dipole checks or provide bond topology.")
+            print(f"  [WARN] {msg} (non-strict mode marks result unreliable)")
         
         # v4: Giant molecule gating (skip enforcement for large molecules)
         expected_natoms = len(charges_before)
@@ -3614,27 +3868,43 @@ class SanitizerStage(BaseStage):
         if expected_natoms > dipole_max_atoms:
             reason = f"giant_molecule ({expected_natoms} > {dipole_max_atoms} atoms)"
             skip_reasons.append(reason)
+            _add_reason(reliability_reasons, reason)
             print(f"  [INFO] Dipole enforcement gated: {reason}")
             gro_path = self._find_coords_gro(system_gromacs_dir)
             return DipoleResult(
                 computed=False,
+                reliable=False,
+                reliability_reasons=reliability_reasons,
                 skip_reasons=skip_reasons,
                 coordinates_file=str(gro_path) if gro_path else None,
             )
 
         gro_path = self._find_coords_gro(system_gromacs_dir)
         if not gro_path:
-            return DipoleResult(computed=False)
+            _add_reason(reliability_reasons, "coordinates_missing")
+            return DipoleResult(computed=False, reliable=False, reliability_reasons=reliability_reasons)
 
-        # Use richer parser
-        gro_data = self._parse_gro_file(gro_path)
+        # Use selective parser: retain only target residue atoms for dipole checks.
+        gro_data = self._parse_gro_file(gro_path, retain_resnames=target_resnames)
         if gro_data is None or not gro_data.atoms:
-            return DipoleResult(computed=False)
+            _add_reason(reliability_reasons, "target_residue_coordinates_missing")
+            return DipoleResult(
+                computed=False,
+                reliable=False,
+                reliability_reasons=reliability_reasons,
+                coordinates_file=str(gro_path),
+            )
 
         # Skip if box dimensions are zero/invalid
         if gro_data.box_x <= 0 or gro_data.box_y <= 0 or gro_data.box_z <= 0:
             print("  [INFO] Dipole shift check skipped (reason: invalid box dimensions)")
-            return DipoleResult(computed=False, coordinates_file=str(gro_path))
+            _add_reason(reliability_reasons, "invalid_box_dimensions")
+            return DipoleResult(
+                computed=False,
+                reliable=False,
+                reliability_reasons=reliability_reasons,
+                coordinates_file=str(gro_path),
+            )
         
         # v4: Net charge guard (dipole is origin-dependent for charged molecules)
         charge_tol = ctx.charge_neutrality_tol if ctx else 1e-6
@@ -3643,6 +3913,7 @@ class SanitizerStage(BaseStage):
         if abs(net_before) > charge_tol or abs(net_after) > charge_tol:
             reason = f"charged_molecule (net_q={net_before:.4e}/{net_after:.4e})"
             skip_reasons.append(reason)
+            _add_reason(reliability_reasons, "charged_molecule_origin_dependent")
             print(f"  [INFO] Dipole enforcement gated: {reason}")
         
         # Hardening v6 - Issue C: Triclinic box policy
@@ -3687,16 +3958,15 @@ class SanitizerStage(BaseStage):
                 )
             else:  # policy == "skip"
                 skip_reasons.append("triclinic_box (orthorhombic MIC invalid for tilted boxes)")
+                _add_reason(reliability_reasons, "triclinic_box")
                 print("  [INFO] Triclinic box detected; skipping dipole check (policy=skip)")
                 return DipoleResult(
                     computed=False,
+                    reliable=False,
+                    reliability_reasons=reliability_reasons,
                     skip_reasons=skip_reasons,
                     coordinates_file=str(gro_path),
                 )
-        
-        # Task A: Group atoms by (resnr, resname), match target by resname
-        # Handle GRO 5-char truncation: try target and target[:5]
-        target_resnames = {target.upper(), target[:5].upper()}
         
         # Build residue groups: (resnr, resname) -> list of atoms
         residue_groups: Dict[Tuple[int, str], List[GROAtom]] = {}
@@ -3714,7 +3984,13 @@ class SanitizerStage(BaseStage):
         
         if not target_groups:
             # No matching residues found
-            return DipoleResult(computed=False)
+            _add_reason(reliability_reasons, "target_residue_not_found")
+            return DipoleResult(
+                computed=False,
+                reliable=False,
+                reliability_reasons=reliability_reasons,
+                coordinates_file=str(gro_path),
+            )
         
         group_max_atoms = (
             getattr(ctx, "dipole_group_max_atoms", dipole_max_atoms) if ctx else dipole_max_atoms
@@ -3726,6 +4002,7 @@ class SanitizerStage(BaseStage):
                 reason = f"group_too_large ({group_size} > {group_max_atoms} atoms)"
                 if reason not in skip_reasons:
                     skip_reasons.append(reason)
+                    _add_reason(reliability_reasons, reason)
                     print(f"  [INFO] Dipole enforcement gated: {reason}")
                 continue
             if group_size == expected_natoms:
@@ -3733,7 +4010,14 @@ class SanitizerStage(BaseStage):
         
         if not valid_groups:
             # Atom count mismatch in all groups or all groups gated
-            return DipoleResult(computed=False, skip_reasons=skip_reasons, coordinates_file=str(gro_path))
+            _add_reason(reliability_reasons, "no_valid_target_groups")
+            return DipoleResult(
+                computed=False,
+                reliable=False,
+                reliability_reasons=reliability_reasons,
+                skip_reasons=skip_reasons,
+                coordinates_file=str(gro_path),
+            )
         
         # Compute dipole for each valid group with PBC unwrapping.
         # Prefer topology-aware bond graph unwrap; fallback to span-gated MIC unwrap.
@@ -3771,6 +4055,7 @@ class SanitizerStage(BaseStage):
                     reason = "percolated_topology"
                     if reason not in skip_reasons:
                         skip_reasons.append(reason)
+                        _add_reason(reliability_reasons, reason)
                         detail = f" ({topo_msg})" if topo_msg else ""
                         print(f"  [INFO] Dipole enforcement gated: {reason}{detail}")
                     continue
@@ -3792,6 +4077,7 @@ class SanitizerStage(BaseStage):
                     )
                     if reason not in skip_reasons:
                         skip_reasons.append(reason)
+                        _add_reason(reliability_reasons, reason)
                         print(f"  [INFO] Dipole enforcement gated: {reason}")
                     continue
             if not coords_list:
@@ -3817,6 +4103,8 @@ class SanitizerStage(BaseStage):
         if not delta_magnitudes:
             return DipoleResult(
                 computed=False,
+                reliable=False,
+                reliability_reasons=reliability_reasons,
                 skip_reasons=skip_reasons,
                 coordinates_file=str(gro_path),
             )
@@ -3826,6 +4114,7 @@ class SanitizerStage(BaseStage):
         avg_after = sum(mu_after_mags) / len(mu_after_mags)
         avg_delta = sum(delta_magnitudes) / len(delta_magnitudes)
         max_delta = max(delta_magnitudes)
+        reliable = has_bond_graph and not skip_reasons and not reliability_reasons
         
         # Use average delta as the primary metric
         return DipoleResult(
@@ -3835,6 +4124,8 @@ class SanitizerStage(BaseStage):
             max_delta_dipole_debye=max_delta,
             coordinates_file=str(gro_path),
             computed=True,
+            reliable=reliable,
+            reliability_reasons=reliability_reasons,
             skip_reasons=skip_reasons,
         )
 
@@ -4159,6 +4450,24 @@ class SanitizerStage(BaseStage):
         # Convert from e*nm to Debye: 1 e*nm = 48.0321 Debye
         return mu_nm * 48.0321
 
+    def _grompp_preprocess_workdir(self, output_dir: Path) -> Path:
+        """Dedicated debug workdir for sanitizer grompp -pp calls."""
+        return output_dir / "grompp_preprocess"
+
+    def _grompp_preprocessed_top_path(self, output_dir: Path) -> Path:
+        """Path of preprocessed topology emitted by sanitizer grompp -pp helper."""
+        return self._grompp_preprocess_workdir(output_dir) / "system.preprocessed.top"
+
+    def _tail_text_file(self, path: Path, max_lines: int = 50) -> List[str]:
+        """Read a bounded tail from a text file without loading it entirely."""
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                return list(deque(handle, maxlen=max_lines))
+        except OSError:
+            return []
+
     def _expected_atoms_from_grompp(
         self,
         gmx_exe: str,
@@ -4171,14 +4480,18 @@ class SanitizerStage(BaseStage):
         Run grompp -pp to preprocess topology and parse expected atom count.
         
         Hardening v6: Complexity-based timeout estimation with retry logic.
+        Hardening v8: Use streamed log files (no capture_output in memory).
         """
-        workdir = output_dir / "grompp_preprocess"
+        workdir = self._grompp_preprocess_workdir(output_dir)
         workdir.mkdir(parents=True, exist_ok=True)
         mdp_path = self._select_mdp_for_preprocess(ctx, workdir)
-        pp_path = workdir / "system.preprocessed.top"
+        pp_path = self._grompp_preprocessed_top_path(output_dir)
         tpr_path = workdir / "preprocess.tpr"
-        cmd = [
-            gmx_exe,
+        gmx_tokens = shlex.split(str(gmx_exe)) if isinstance(gmx_exe, str) else [str(gmx_exe)]
+        if not gmx_tokens:
+            print("  [WARN] Empty GROMACS command for grompp preprocess")
+            return None
+        cmd = gmx_tokens + [
             "grompp",
             "-f",
             str(mdp_path),
@@ -4229,19 +4542,32 @@ class SanitizerStage(BaseStage):
         retry_count = 0
         max_retries = 1  # Try once, then retry with longer timeout
         current_timeout = timeout_s
+        result: Optional[subprocess.CompletedProcess] = None
+        attempt_logs: List[Dict[str, str]] = []
         
         while retry_count <= max_retries:
+            attempt_idx = retry_count + 1
+            stdout_log = workdir / f"grompp_pp_attempt{attempt_idx}.stdout.log"
+            stderr_log = workdir / f"grompp_pp_attempt{attempt_idx}.stderr.log"
+            attempt_logs.append(
+                {"stdout": str(stdout_log), "stderr": str(stderr_log)}
+            )
             try:
-                result = subprocess.run(
-                    cmd,
-                    cwd=str(workdir),
-                    capture_output=True,
-                    text=True,
-                    timeout=current_timeout,
-                )
+                with open(stdout_log, "w", encoding="utf-8", errors="replace") as out_h, open(
+                    stderr_log, "w", encoding="utf-8", errors="replace"
+                ) as err_h:
+                    result = subprocess.run(
+                        cmd,
+                        cwd=str(workdir),
+                        stdout=out_h,
+                        stderr=err_h,
+                        text=False,
+                        timeout=current_timeout,
+                    )
                 break  # Success
             except subprocess.TimeoutExpired:
                 retry_count += 1
+                stderr_tail = "".join(self._tail_text_file(stderr_log, max_lines=50)).strip()
                 if retry_count <= max_retries:
                     # Retry with longer timeout
                     current_timeout = int(current_timeout * GROMPP_TIMEOUT_RETRY_MULTIPLIER)
@@ -4257,6 +4583,8 @@ class SanitizerStage(BaseStage):
                         f"  Command: {' '.join(cmd)}\n"
                         f"  Complexity metrics: {complexity_metrics}\n"
                         f"  GRO atoms: {gro_atoms}\n"
+                        f"  Stderr log: {stderr_log}\n"
+                        f"  Stderr tail:\n{stderr_tail or '  (no stderr tail)'}\n"
                         f"  To increase timeout:\n"
                         f"    - Set environment variable: GMX_GROMPP_PP_TIMEOUT_S={int(current_timeout * 2)}\n"
                         f"    - Or add grompp_preprocess_timeout_s to context\n"
@@ -4272,15 +4600,38 @@ class SanitizerStage(BaseStage):
                         )
                     return None
             except Exception as e:
-                print(f"  [WARN] grompp preprocess failed: {e}")
+                stderr_tail = "".join(self._tail_text_file(stderr_log, max_lines=50)).strip()
+                print(
+                    f"  [WARN] grompp preprocess failed: {e}\n"
+                    f"         stderr log: {stderr_log}\n"
+                    f"         stderr tail: {stderr_tail or '(no stderr tail)'}"
+                )
                 if ctx.strict_gro_top_check:
                     raise SanitizerError(f"grompp preprocess failed for GRO/TOP validation: {e}")
                 return None
         
+        if result is None:
+            return None
+
         if result.returncode != 0 or not pp_path.exists():
-            print(f"  [WARN] grompp preprocess returned code {result.returncode}")
+            last_logs = attempt_logs[-1] if attempt_logs else {}
+            stderr_path = Path(last_logs.get("stderr", "")) if last_logs.get("stderr") else None
+            stderr_tail = (
+                "".join(self._tail_text_file(stderr_path, max_lines=50)).strip()
+                if stderr_path is not None
+                else ""
+            )
+            print(
+                "  [WARN] grompp preprocess failed "
+                f"(exit={result.returncode}, pp_exists={pp_path.exists()}).\n"
+                f"         stderr log: {stderr_path}\n"
+                f"         stderr tail:\n{stderr_tail or '  (no stderr tail)'}"
+            )
             if ctx.strict_gro_top_check:
-                raise SanitizerError("grompp preprocess failed for GRO/TOP validation.")
+                raise SanitizerError(
+                    "grompp preprocess failed for GRO/TOP validation "
+                    f"(exit={result.returncode})."
+                )
             return None
         
         expected_atoms = self._parse_preprocessed_top(pp_path)
@@ -4295,6 +4646,7 @@ class SanitizerStage(BaseStage):
                 "complexity_metrics": complexity_metrics,
                 "gro_atoms": gro_atoms,
                 "expected_atoms": expected_atoms,
+                "gmx_cmd": gmx_exe,
             })
         
         return expected_atoms
@@ -4411,6 +4763,47 @@ class SanitizerStage(BaseStage):
                 return None
             total += atom_count * count
         return total
+
+    def _parse_preprocessed_molecules(self, top_path: Path) -> List[Tuple[str, int]]:
+        """Parse ordered [molecules] counts from a preprocessed topology."""
+        if not top_path.exists():
+            return []
+        content = self.safe_read_text(top_path, strict=False)
+        if not content:
+            return []
+
+        ordered: List[Tuple[str, int]] = []
+        seen_indices: Dict[str, int] = {}
+        in_molecules = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            section = parse_section_name(line)
+            if section is not None:
+                in_molecules = (section == "molecules")
+                continue
+            if not in_molecules:
+                continue
+            if not stripped or stripped.startswith(";") or stripped.startswith("#"):
+                continue
+            data = strip_gmx_comment(stripped).strip()
+            if not data:
+                continue
+            parts = data.split()
+            if len(parts) < 2:
+                continue
+            try:
+                name = parts[0]
+                count = int(parts[1])
+            except ValueError:
+                continue
+            if name in seen_indices:
+                idx = seen_indices[name]
+                old_name, old_count = ordered[idx]
+                ordered[idx] = (old_name, old_count + count)
+            else:
+                seen_indices[name] = len(ordered)
+                ordered.append((name, count))
+        return ordered
     
     def _update_system_top_includes(
         self,
@@ -4745,57 +5138,32 @@ class SanitizerStage(BaseStage):
         """
         Insert the managed block at a safe location in system.top.
         
-        Insertion priority:
-        1. After forcefield include (#include "forcefield.itp" or *.ff/forcefield.itp)
-        2. After leading comment banner (first non-comment line boundary)
-        3. Never before #define directives
+        Deterministic policy:
+        1. If forcefield include block exists, insert immediately after its last line.
+        2. Otherwise insert after leading comment/blank preamble.
         """
-        # Find insertion point
         insert_idx = 0
         forcefield_include_idx = None
-        first_define_idx = None
-        first_content_idx = None
-        
+
         for i, line in enumerate(lines):
             stripped = line.strip()
-            
-            # Track forcefield include
-            if stripped.startswith("#include"):
-                include_target = parse_include_target(stripped)
-                if include_target:
-                    target_lower = include_target.lower()
-                    if "forcefield.itp" in target_lower or ".ff/" in target_lower:
-                        forcefield_include_idx = i
-            
-            # Track first #define
-            if first_define_idx is None and stripped.startswith("#define"):
-                first_define_idx = i
-            
-            # Track first non-comment content (section or include)
-            if first_content_idx is None and stripped and not stripped.startswith(";"):
-                first_content_idx = i
-        
-        # Determine insertion index
+            include_target = parse_include_target(stripped)
+            if include_target:
+                target_lower = include_target.lower()
+                if "forcefield.itp" in target_lower or ".ff/" in target_lower:
+                    forcefield_include_idx = i
+
         if forcefield_include_idx is not None:
-            # Insert after forcefield include
             insert_idx = forcefield_include_idx + 1
-        elif first_define_idx is not None:
-            # Insert after all leading defines
-            # Find last consecutive define from first_define_idx
-            last_define = first_define_idx
-            for i in range(first_define_idx, len(lines)):
-                stripped = lines[i].strip()
-                if stripped.startswith("#define") or stripped.startswith("#") or not stripped:
-                    last_define = i
-                else:
-                    break
-            insert_idx = last_define + 1
-        elif first_content_idx is not None:
-            # Insert before first content but after comments
-            insert_idx = first_content_idx
         else:
-            # Empty or comment-only file: insert at end
-            insert_idx = len(lines)
+            idx = 0
+            while idx < len(lines):
+                stripped = lines[idx].strip()
+                if not stripped or stripped.startswith(";"):
+                    idx += 1
+                    continue
+                break
+            insert_idx = idx
         
         # Build result with markers
         result_lines = lines[:insert_idx]
@@ -4918,8 +5286,8 @@ class SanitizerStage(BaseStage):
         
         # Option A: use grompp -pp if available to preprocess topology
         expected_atoms = None
-        gmx_exe = shutil.which("gmx")
-        if gmx_exe and system_top_path:
+        gmx_exe = resolve_gmx_command(ctx)
+        if system_top_path:
             expected_atoms = self._expected_atoms_from_grompp(
                 gmx_exe=gmx_exe,
                 system_top_path=system_top_path,

@@ -3220,26 +3220,6 @@ class ItpSanitizer:
             key=lambda p: (p.as_posix().casefold(), p.as_posix()),
         )
 
-        # Detect basename collisions early (case-insensitive) to avoid silent overwrites
-        basename_seen: Dict[str, Path] = {}
-        for itp_path in itp_paths:
-            key = itp_path.name.casefold()
-            existing = basename_seen.get(key)
-            if existing is not None:
-                try:
-                    same = existing.resolve() == itp_path.resolve()
-                except OSError:
-                    same = existing == itp_path
-                if not same:
-                    raise ItpSanitizerError(
-                        "Case-insensitive ITP basename collision detected:\n"
-                        f"  - {existing}\n"
-                        f"  - {itp_path}\n"
-                        "Rename one of the files to avoid output overwrites."
-                    )
-            else:
-                basename_seen[key] = itp_path
-
         # Build include search paths (GROMACS -I style)
         include_dirs = self._build_include_dirs(
             itp_paths=itp_paths,
@@ -3528,6 +3508,39 @@ class ItpSanitizer:
                 output_entries.append((source_path, output_rel))
             sources_with_output.add(source_id)
 
+        # Resolve one deterministic winner per include target path.
+        include_winner_by_rel: Dict[str, Path] = {}
+        include_rel_path_by_key: Dict[str, Path] = {}
+        for diag in include_diagnostics:
+            if not diag.resolved_path:
+                continue
+            output_rel = _safe_output_rel(diag.include_target)
+            if output_rel is None:
+                resolved = Path(diag.resolved_path)
+                if sanitize_include_closure and _path_identity(resolved) in sanitize_sources:
+                    raise ItpSanitizerError(
+                        "Include target cannot be mapped into sanitized output dir:\n"
+                        f"  Include: {diag.include_target}\n"
+                        f"  Resolved: {resolved}\n"
+                        "Only relative include paths without '..' are supported for sanitization."
+                    )
+                continue
+            key = output_rel.as_posix().casefold()
+            resolved = Path(diag.resolved_path)
+            existing = include_winner_by_rel.get(key)
+            if existing is None:
+                include_winner_by_rel[key] = resolved
+                include_rel_path_by_key[key] = output_rel
+                continue
+            if _path_identity(existing) != _path_identity(resolved):
+                raise ItpSanitizerError(
+                    "Include target resolves to multiple sources (ambiguous winner-only mapping):\n"
+                    f"  Include target: {output_rel.as_posix()}\n"
+                    f"  - {existing}\n"
+                    f"  - {resolved}\n"
+                    "Disambiguate include search paths so one winner is selected."
+                )
+
         # Register entry ITPs by basename (system.top includes these)
         entry_output_paths: Dict[Path, Path] = {}
         for itp_path in itp_paths:
@@ -3535,38 +3548,29 @@ class ItpSanitizer:
                 continue
             source_id = _path_identity(itp_path)
             output_rel = Path(itp_path.name)
+            include_winner = include_winner_by_rel.get(output_rel.as_posix().casefold())
+            if include_winner is not None and _path_identity(include_winner) != source_id:
+                # Winner-only policy: shadowed same-basename candidates are not materialized.
+                continue
             _register_output(itp_path, output_rel)
             entry_output_paths[source_id] = sanitized_dir / output_rel
 
         # Register include-target outputs for include-closure sanitization
         if sanitize_include_closure:
-            for diag in include_diagnostics:
-                if not diag.resolved_path:
-                    continue
-                resolved = Path(diag.resolved_path)
+            for rel_key, resolved in include_winner_by_rel.items():
                 source_id = _path_identity(resolved)
                 if source_id not in sanitize_sources:
                     continue
-                output_rel = _safe_output_rel(diag.include_target)
-                if output_rel is None:
-                    raise ItpSanitizerError(
-                        "Include target cannot be mapped into sanitized output dir:\n"
-                        f"  Include: {diag.include_target}\n"
-                        f"  Resolved: {resolved}\n"
-                        "Only relative include paths without '..' are supported for sanitization."
-                    )
+                output_rel = include_rel_path_by_key[rel_key]
                 _register_output(resolved, output_rel)
-
-        # Ensure all sanitize sources have at least one output mapping
-        missing_outputs = [
+        omitted_sources = [
             str(source) for key, source in sanitize_sources.items()
             if key not in sources_with_output
         ]
-        if missing_outputs:
-            raise ItpSanitizerError(
-                "Sanitization targets missing output mapping:\n  - "
-                + "\n  - ".join(missing_outputs[:10])
-                + ("\n  - ... (truncated)" if len(missing_outputs) > 10 else "")
+        if omitted_sources:
+            print(
+                "  [INFO] Winner-only sanitization omitted "
+                f"{len(omitted_sources)} shadowed/non-selected source file(s)."
             )
 
         # Sanitize and write files deterministically

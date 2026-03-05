@@ -634,6 +634,10 @@ The sanitization stage enforces correctness, safety, and auditability for ITP fi
 - **Shadowing Detection**: If an included file (e.g., `posre.itp`) exists in multiple search paths, the pipeline detects it.
   - Default: Warnings printed to console and audit log.
   - Strict mode (`--strict-include-resolution`): Hard error unless `--allow-include-shadowing` is present.
+- **Same-basename policy (winner-only)**:
+  - Raw ITP collection no longer hard-fails just because two files share a basename (for example, custom `PC.itp` shadowing forcefield `PC.itp`).
+  - Ambiguity is handled at actual include resolution time using configured search order.
+  - Sanitized output materializes only the resolved include winner for a given include target; shadowed losers are not written.
 - **Coverage**: The same resolver/shadowing policy is applied to forcefield and non-forcefield include-closure expansion (not just top-level forcefield files).
 - **Priority**: Search order is configurable via `--itp-include-dirs-priority`.
   - `forcefield_first` (default; legacy alias: `last`): Local > System > FF > User.
@@ -1024,7 +1028,7 @@ The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, d
 5. **Sanitized ITPs**: Removes `[ atomtypes ]` and `[ defaults ]` from individual ITPs
 6. **system.top Generation**: Creates topology with correct include order (defaults → atomtypes → extra includes → molecules), while avoiding duplicate `[ defaults ]` injection when existing `system.top` already has defaults/forcefield include
 7. **Molecule Scope**: `system.top` includes only molecule ITPs for species present in `[molecules]` (include-aware moleculetype detection)
-8. **Include Integrity**: Resolves `#include` targets like GROMACS `-I`, detects shadowing in strict mode, sanitizes include-closure files with `[ defaults ]`/`[ atomtypes ]`, and validates paths on disk
+8. **Include Integrity**: Resolves `#include` targets like GROMACS `-I`, detects shadowing in strict mode, sanitizes include-closure files with `[ defaults ]`/`[ atomtypes ]`, validates paths on disk, and writes winner-only sanitized files for include-target collisions
 
 ### Include Resolution (GROMACS -I)
 
@@ -1044,6 +1048,7 @@ If an include cannot be resolved, the sanitizer reports attempted paths (or fail
 `system.top` validation uses the same resolver and parses both `"file.itp"` and `<file.itp>` includes.
 
 **Shadowing**: If multiple include candidates exist, shadowing is reported. In strict mode this is a hard error unless `--allow-include-shadowing` is enabled.
+For same-basename shadows, sanitizer output is winner-only per include target (no deterministic renaming of losers).
 **Escape guard**: includes that resolve outside configured include roots are blocked by default; use `--allow-unsafe-include-escape` only as an explicit unsafe override.
 
 **Include-closure sanitization**: Any reachable file containing `[ defaults ]` or `[ atomtypes ]` is sanitized and written into `itp_sanitized_current/` at its include path (relative includes only; `..` is not allowed for sanitization).
@@ -1234,7 +1239,13 @@ This ensures `grompp` receives a consistent `.gro/.itp/.top` set.
 
 ### GRO/TOP Consistency Validation
 
-The Sanitizer validates that the coordinate file (`.gro`) matches the topology's `[molecules]` section by comparing atom counts. If GROMACS is available, it preprocesses the topology via `gmx grompp -pp` and parses the fully expanded output (preferred, preprocessor-aware). Otherwise it falls back to a strict ITP parser that ignores preprocessor lines and skips the check if ambiguity is detected (unless `--strict-gro-top-check` is set).
+The Sanitizer validates that the coordinate file (`.gro`) matches the topology's `[molecules]` section by comparing atom counts.
+
+- If raw `system.top` `[molecules]` parsing encounters conditional-control directives (`#if/#ifdef/#ifndef/#elif/#else/#endif`) in that region, the raw parse is marked **uncertain**.
+- In that case, sanitizer prefers `grompp -pp` preprocessed topology as the source of truth for molecule counts.
+- If preprocessing is unavailable, sanitizer falls back to weaker sources (manifest/ITP fallback) and keeps uncertainty metadata in sanitizer report/manifest fields.
+
+For atom-count validation, if GROMACS is available, sanitizer preprocesses topology via `gmx grompp -pp` and parses the fully expanded output. Otherwise it falls back to a strict ITP parser that ignores preprocessor lines and skips the check if ambiguity is detected (unless `--strict-gro-top-check` is set).
 
 If a mismatch is detected, the pipeline fails fast with a clear error message:
 
@@ -1260,6 +1271,10 @@ python run_pipeline.py ... --stage sanitizer
 
 If preprocessing times out under `--strict-gro-top-check`, an actionable error is provided with instructions to increase the timeout.
 
+Executable resolution follows project-standard precedence: context override → `GMX_CMD` → default `gmx`.
+
+`grompp -pp` stdout/stderr are streamed to debug log files under `OUT_GMX/<RUN_ID>/02_5_sanitizer/grompp_preprocess/` (no large in-memory capture). These debug logs are troubleshooting artifacts only and are excluded from reproducibility-critical fingerprinting.
+
 ### v4 Hardening: Dipole Check and Gating
 
 The dipole shift check now runs in **heuristic mode by default**—it warns but never hard-fails unless `--strict-dipole-check` is enabled AND all preconditions pass.
@@ -1277,6 +1292,16 @@ The dipole shift check now runs in **heuristic mode by default**—it warns but 
 | Triclinic box | Dipole check skipped or failed per triclinic policy |
 
 Wrapped span ratio is now a **suspicion metric**, not the decision-maker, when bond topology is available.
+
+Dipole output now carries explicit reliability metadata in existing sanitizer charge-neutrality report fields:
+- `dipole.reliable` (bool)
+- `dipole.reliability_reasons` (list)
+- `dipole.skip_reasons` (list)
+
+Reliability rules:
+- Missing bond graph means dipole fallback is marked unreliable in non-strict mode.
+- In strict dipole mode, missing bond graph fails with a clear reliability error (no silent downgrade).
+- Atom0-based MIC fallback is never treated as equal-confidence to bond-graph unwrapping.
 
 **CLI Options:**
 | Flag | Default | Description |
@@ -1358,7 +1383,9 @@ The Sanitizer now uses **sentinel-block based updates** to preserve custom conte
 **Preservation guarantees:**
 - Content **outside** sentinel markers is never modified
 - `#define`, `#ifdef`, extra includes, and custom sections are preserved
-- If markers don't exist, block is inserted after forcefield include (never before `#define`)
+- If markers already exist, sanitizer always uses that managed block location (preferred placeholder mechanism)
+- If markers don't exist, insertion is deterministic: immediately after the forcefield include block; if forcefield include is absent, after leading comment/blank preamble
+- Sanitizer does not attempt broad macro-block parsing to find a "smart" insertion point
 - If **multiple blocks** are found, the sanitizer replaces all managed blocks with one clean block (strict mode via `--strict-top-update` or `--strict-include-resolution` fails fast)
 - If markers are **malformed** (unmatched or misordered), strict mode (`--strict-top-update` or `--strict-include-resolution`) fails fast; non-strict mode warns and rebuilds one clean managed block (no stale managed content left active)
 - When existing `system.top` already defines `[ defaults ]` or includes `forcefield.itp`, the managed block omits a new `[ defaults ]` section to avoid duplicates
@@ -1375,7 +1402,9 @@ Moleculetype names are now tracked with **exact case**:
 - If same-name signatures differ:
   - strict mode (`--strict-forcefield-consistency`, `--strict-include-resolution`, or strict sanitizer flow) fails fast
   - non-strict mode logs a clear warning and picks by the priority rule above
-- **Signature-based detection**: streaming `sha256` over full canonical `[ atoms ]` rows (`atomtype|atomname|charge_quantized@1e-4`) plus section flags
+- **Signature-based detection**: streaming `sha256` over full canonical `[ atoms ]` rows (`atomtype|atomname|charge_quantized`) plus section flags
+  - Quantization step is configurable by environment variable `GPE_MOLECULE_SIG_QUANT_STEP` (default `1e-6`)
+  - Secondary per-atom charge check runs before accepting "same signature", with tolerance `quant_step / 2`
 - Debug stats attached to signature: `qmin`, `qmax`, `sum_abs_q`, `sum_q2`
 - Identical definitions from different sources are silently de-duplicated
 
@@ -1546,6 +1575,7 @@ Post-correction verification ensures ionic species weren't modified unless `--ch
 
 - Moleculetype signatures now hash canonicalized topology-relevant sections (`[ atoms ]`, connectivity, restraints, virtual-site blocks) to catch materially different same-name definitions
 - Distinguishes same-topology neutral molecules across charge models (e.g., RESP vs CM5)
+- Default charge quantization in signatures is `1e-6` (`GPE_MOLECULE_SIG_QUANT_STEP`) with secondary per-atom compare tolerance `quant_step/2`
 - Conflict reporting includes deterministic winner and strict/non-strict behavior
 - LJ negative values get loud warnings; zero values (virtual sites) skipped silently
 

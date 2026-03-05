@@ -55,6 +55,8 @@ class DipoleResult:
     max_delta_dipole_debye: Optional[float] = None  # max |Δμ_i|
     coordinates_file: Optional[str] = None       # GRO file used
     computed: bool = False                       # Whether computation succeeded
+    reliable: bool = False                       # Whether result is physically reliable
+    reliability_reasons: List[str] = field(default_factory=list)
     # v4: Gating reasons for heuristic dipole check
     skip_reasons: List[str] = field(default_factory=list)  # e.g., ["giant_molecule", "percolated"]
 
