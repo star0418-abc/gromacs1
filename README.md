@@ -1287,6 +1287,8 @@ Executable resolution follows project-standard precedence: context override 鈫?
 
 `grompp -pp` stdout/stderr are streamed to debug log files under `OUT_GMX/<RUN_ID>/02_5_sanitizer/grompp_preprocess/` (no large in-memory capture). These debug logs are troubleshooting artifacts only and are excluded from reproducibility-critical fingerprinting.
 
+`_read_gro_coords()` is safe by default: when called without `retain_resnames`, it does not materialize atom coordinates. Full-coordinate parsing requires `allow_full_parse=True` and is hard-capped by `GRO_ABSURD_ATOMS` with an actionable error on oversized GRO files.
+
 ### v4 Hardening: Dipole Check and Gating
 
 The dipole shift check now runs in **heuristic mode by default**鈥攊t warns but never hard-fails unless `--strict-dipole-check` is enabled AND all preconditions pass.

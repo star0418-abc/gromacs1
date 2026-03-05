@@ -77,9 +77,24 @@ class SpatialCheckerMixin:
         allow_full_parse: bool = False,
     ) -> Optional[List[Tuple[float, float, float]]]:
         """Read GRO coordinates with safe-by-default selective retention."""
+        if retain_resnames is None and not allow_full_parse:
+            # Compatibility mode: no residue filter means "do not materialize atoms".
+            # Keep this path O(1) memory by only validating the GRO header count line.
+            return [] if self._count_atoms_in_gro(gro_path) is not None else None
+
         retain_filter: Optional[Set[str]]
         if retain_resnames is None:
-            retain_filter = None if allow_full_parse else set()
+            declared_atoms = self._count_atoms_in_gro(gro_path)
+            if declared_atoms is None:
+                return None
+            if declared_atoms > GRO_ABSURD_ATOMS:
+                raise SanitizerError(
+                    f"_read_gro_coords() refused full GRO parse for '{gro_path}' "
+                    f"(declared atoms={declared_atoms}, cap={GRO_ABSURD_ATOMS}). "
+                    "Use retain_resnames for selective reads, or call "
+                    "_parse_gro_file(..., retain_resnames=...) with a targeted filter."
+                )
+            retain_filter = None
         else:
             retain_filter = {name.upper() for name in retain_resnames}
         result = self._parse_gro_file(gro_path, retain_resnames=retain_filter)
