@@ -1,29 +1,29 @@
-# MD Simulation Pipeline
+﻿# MD Simulation Pipeline
 
-**PACKMOL → HTPOLYNET → SANITIZER → GROMACS → RDF/CN**
+**PACKMOL 鈫?HTPOLYNET 鈫?SANITIZER 鈫?GROMACS 鈫?RDF/CN**
 
 Automated pipeline for molecular dynamics simulations of gel polymer electrolytes.
 
 ## Features
 
-- 🔒 **Strict path isolation**: Inputs from `IN/` only, outputs to `OUT_GMX/` only
-- 📦 **Manifest tracking**: Full reproducibility with SHA256 hashes and command logs
-- ⏸️ **Resume support**: Sentinel-based stage completion tracking with checkpoint resume
-- 🔧 **Modular stages**: Easy to extend and customize
-- 🧪 **Composition model**: wt% → integer molecule count conversion with auto-scaling
-- 📐 **Box sizing**: Density-based cubic box calculation with retry on overlap
-- 🔗 **HTPolyNet sandboxing**: All intermediates confined to workdir
-- 📤 **Atomic publishing**: Versioned outputs with current symlinks
-- 🧬 **ITP Sanitizer**: Atomtype extraction, conflict detection, defaults/comb-rule validation, charge neutrality
-- 🌡️ **MDP Patching**: Dynamic temperature/pressure/nsteps overrides from CLI
-- ⚙️ **Resource Pinning**: Control CPU threads, GPU, and OMP_NUM_THREADS
-- 💥 **Crash Context**: Detailed failure reports with log excerpts
-- 📝 **mdrun Log Streaming**: stdout/stderr streamed to stage logs with signal forwarding for graceful checkpoints
-- 🧾 **Stage Fingerprints**: `stage_state.json` captures inputs, hashes, commands, and exact git/GROMACS executable provenance
-- ✅ **Strict Resume/Force**: Resume only on exact fingerprint match; `--force` archives old artifacts
-- 🧪 **Quality Gates (Dispatcher)**: pipeline success can include thermodynamic sanity checks (temperature/pressure/density) with `off|warn|error` policy
-- 🧬 **Extended Provenance**: raw tool probes with parsed GROMACS build features, runtime/platform details, git code state, and resolved executable/token metadata
-- 🧪 **Audit Artifacts**: per-stage `repro.json`, dispatcher `run_report.json`, standalone `provenance.txt`, and SI-ready `computational_details.md`
+- 馃敀 **Strict path isolation**: Inputs from `IN/` only, outputs to `OUT_GMX/` only
+- 馃摝 **Manifest tracking**: Full reproducibility with SHA256 hashes and command logs
+- 鈴革笍 **Resume support**: Sentinel-based stage completion tracking with checkpoint resume
+- 馃敡 **Modular stages**: Easy to extend and customize
+- 馃И **Composition model**: wt% 鈫?integer molecule count conversion with auto-scaling
+- 馃搻 **Box sizing**: Density-based cubic box calculation with retry on overlap
+- 馃敆 **HTPolyNet sandboxing**: All intermediates confined to workdir
+- 馃摛 **Atomic publishing**: Versioned outputs with current symlinks
+- 馃К **ITP Sanitizer**: Atomtype extraction, conflict detection, defaults/comb-rule validation, charge neutrality
+- 馃尅锔?**MDP Patching**: Dynamic temperature/pressure/nsteps overrides from CLI
+- 鈿欙笍 **Resource Pinning**: Control CPU threads, GPU, and OMP_NUM_THREADS
+- 馃挜 **Crash Context**: Detailed failure reports with log excerpts
+- 馃摑 **mdrun Log Streaming**: stdout/stderr streamed to stage logs with signal forwarding for graceful checkpoints
+- 馃Ь **Stage Fingerprints**: `stage_state.json` captures inputs, hashes, commands, and exact git/GROMACS executable provenance
+- 鉁?**Strict Resume/Force**: Resume only on exact fingerprint match; `--force` archives old artifacts
+- 馃И **Quality Gates (Dispatcher)**: pipeline success can include thermodynamic sanity checks (temperature/pressure/density) with `off|warn|error` policy
+- 馃К **Extended Provenance**: raw tool probes with parsed GROMACS build features, runtime/platform details, git code state, and resolved executable/token metadata
+- 馃И **Audit Artifacts**: per-stage `repro.json`, dispatcher `run_report.json`, standalone `provenance.txt`, and SI-ready `computational_details.md`
 
 ## Quick Start
 
@@ -72,88 +72,91 @@ python tools/export_computational_details.py --run-root OUT_GMX/<RUN_ID> \
 
 ```
 project/
-├── IN/                              # ALL INPUTS (read-only for pipeline)
-│   ├── molecules/<NAME>/            # Molecular structure files
-│   │   ├── pdb/                     # PDB templates (PACKMOL)
-│   │   ├── gro/, itp/, top/, mol2/  # Other formats
-│   ├── systems/<SYSTEM_ID>/
-│   │   ├── packmol/{pdb,gro}/       # PACKMOL published outputs
-│   │   ├── htpolynet/               # HTPolyNet inputs/outputs
-│   │   │   ├── gro/, itp/, top/     # Published crosslinked system
-│   │   │   └── rules/{GAFF2,OPLSAA}/ # Reaction rules
-│   │   └── gromacs/                 # GROMACS staged inputs
-│   │       ├── gro/, itp/, top/     # Staged from HTPolyNet
-│   │       ├── mdp/                 # MDP templates (em, nvt, npt, md)
-│   │       ├── ndx/                 # Index files
-│   │       ├── combined_atomtypes_*.itp   # Sanitizer output
-│   │       ├── itp_sanitized_*/           # Sanitized ITPs
-│   │       └── analysis_pairs.yaml
-│   └── forcefield/{oplsaa,gaff2}/
-│   └── htpolynet/rules/{GAFF2,OPLSAA}/  # Shared HTPolyNet rules (optional)
-│
-├── OUT_GMX/<RUN_ID>/                # ALL OUTPUTS (write-only)
-│   ├── 01_packmol/                  # PACKMOL output
-│   │   ├── packmol.inp, initial.pdb
-│   │   └── done.ok
-│   ├── 02_htpolynet/                # HTPolyNet output
-│   │   ├── system_config.yaml       # Generated config
-│   │   ├── workdir/                 # Sandbox (all intermediates here)
-│   │   ├── system.{gro,itp,top}     # Final outputs
-│   │   └── done.ok
-│   ├── 02_5_sanitizer/              # ITP Sanitizer logs
-│   ├── 03_gromacs/
-│   │   ├── em/                      # Energy minimization
-│   │   │   ├── em.mdp, em.tpr, em.gro, em.log
-│   │   │   ├── stage_state.json
-│   │   │   ├── repro.json
-│   │   │   └── done.ok
-│   │   ├── nvt/                     # NVT equilibration
-│   │   │   ├── nvt.mdp, nvt.tpr, nvt.gro, nvt.cpt
-│   │   │   ├── stage_state.json
-│   │   │   ├── repro.json
-│   │   │   └── done.ok
-│   │   ├── npt/                     # NPT equilibration
-│   │   │   ├── npt.mdp, npt.tpr, npt.gro, npt.cpt
-│   │   │   ├── stage_state.json
-│   │   │   ├── repro.json
-│   │   │   └── done.ok
-│   │   └── md/                      # Production MD
-│   │       ├── md.mdp, md.tpr, md.xtc, md.cpt
-│   │       ├── logs/mdrun.stdout.log, logs/mdrun.stderr.log
-│   │       ├── stage_state.json
-│   │       ├── repro.json
-│   │       └── done.ok
-│   ├── analysis/{rdf,cn}/           # RDF and coordination numbers
-│   ├── logs/
-│   └── manifest.json
-│   └── run_report.json
-│   └── computational_details.md
-│
-├── pipeline/                        # Python package
-│   ├── mdp_patcher.py               # MDP template patching
-│   ├── resource_scheduler.py        # CPU/GPU pinning
-│   ├── crash_context.py             # Failure diagnostics
-│   └── stages/
-│       ├── packmol.py               # ✅ Implemented
-│       ├── htpolynet.py             # ✅ Implemented
-│       ├── sanitizer.py             # ✅ Implemented (single-module stage)
-│       ├── gromacs.py               # ✅ Implemented
-│       └── analysis.py              # ✅ Implemented
-│
-├── run_pipeline.py
-└── README.md
+鈹溾攢鈹€ IN/                              # ALL INPUTS (read-only for pipeline)
+鈹?  鈹溾攢鈹€ molecules/<NAME>/            # Molecular structure files
+鈹?  鈹?  鈹溾攢鈹€ pdb/                     # PDB templates (PACKMOL)
+鈹?  鈹?  鈹溾攢鈹€ gro/, itp/, top/, mol2/  # Other formats
+鈹?  鈹溾攢鈹€ systems/<SYSTEM_ID>/
+鈹?  鈹?  鈹溾攢鈹€ packmol/{pdb,gro}/       # PACKMOL published outputs
+鈹?  鈹?  鈹溾攢鈹€ htpolynet/               # HTPolyNet inputs/outputs
+鈹?  鈹?  鈹?  鈹溾攢鈹€ gro/, itp/, top/     # Published crosslinked system
+鈹?  鈹?  鈹?  鈹斺攢鈹€ rules/{GAFF2,OPLSAA}/ # Reaction rules
+鈹?  鈹?  鈹斺攢鈹€ gromacs/                 # GROMACS staged inputs
+鈹?  鈹?      鈹溾攢鈹€ gro/, itp/, top/     # Staged from HTPolyNet
+鈹?  鈹?      鈹溾攢鈹€ mdp/                 # MDP templates (em, nvt, npt, md)
+鈹?  鈹?      鈹溾攢鈹€ ndx/                 # Index files
+鈹?  鈹?      鈹溾攢鈹€ combined_atomtypes_*.itp   # Sanitizer output
+鈹?  鈹?      鈹溾攢鈹€ itp_sanitized_*/           # Sanitized ITPs
+鈹?  鈹?      鈹斺攢鈹€ analysis_pairs.yaml
+鈹?  鈹斺攢鈹€ forcefield/{oplsaa,gaff2}/
+鈹?  鈹斺攢鈹€ htpolynet/rules/{GAFF2,OPLSAA}/  # Shared HTPolyNet rules (optional)
+鈹?
+鈹溾攢鈹€ OUT_GMX/<RUN_ID>/                # ALL OUTPUTS (write-only)
+鈹?  鈹溾攢鈹€ 01_packmol/                  # PACKMOL output
+鈹?  鈹?  鈹溾攢鈹€ packmol.inp, initial.pdb
+鈹?  鈹?  鈹斺攢鈹€ done.ok
+鈹?  鈹溾攢鈹€ 02_htpolynet/                # HTPolyNet output
+鈹?  鈹?  鈹溾攢鈹€ system_config.yaml       # Generated config
+鈹?  鈹?  鈹溾攢鈹€ workdir/                 # Sandbox (all intermediates here)
+鈹?  鈹?  鈹溾攢鈹€ system.{gro,itp,top}     # Final outputs
+鈹?  鈹?  鈹斺攢鈹€ done.ok
+鈹?  鈹溾攢鈹€ 02_5_sanitizer/              # ITP Sanitizer logs
+鈹?  鈹溾攢鈹€ 03_gromacs/
+鈹?  鈹?  鈹溾攢鈹€ em/                      # Energy minimization
+鈹?  鈹?  鈹?  鈹溾攢鈹€ em.mdp, em.tpr, em.gro, em.log
+鈹?  鈹?  鈹?  鈹溾攢鈹€ stage_state.json
+鈹?  鈹?  鈹?  鈹溾攢鈹€ repro.json
+鈹?  鈹?  鈹?  鈹斺攢鈹€ done.ok
+鈹?  鈹?  鈹溾攢鈹€ nvt/                     # NVT equilibration
+鈹?  鈹?  鈹?  鈹溾攢鈹€ nvt.mdp, nvt.tpr, nvt.gro, nvt.cpt
+鈹?  鈹?  鈹?  鈹溾攢鈹€ stage_state.json
+鈹?  鈹?  鈹?  鈹溾攢鈹€ repro.json
+鈹?  鈹?  鈹?  鈹斺攢鈹€ done.ok
+鈹?  鈹?  鈹溾攢鈹€ npt/                     # NPT equilibration
+鈹?  鈹?  鈹?  鈹溾攢鈹€ npt.mdp, npt.tpr, npt.gro, npt.cpt
+鈹?  鈹?  鈹?  鈹溾攢鈹€ stage_state.json
+鈹?  鈹?  鈹?  鈹溾攢鈹€ repro.json
+鈹?  鈹?  鈹?  鈹斺攢鈹€ done.ok
+鈹?  鈹?  鈹斺攢鈹€ md/                      # Production MD
+鈹?  鈹?      鈹溾攢鈹€ md.mdp, md.tpr, md.xtc, md.cpt
+鈹?  鈹?      鈹溾攢鈹€ logs/mdrun.stdout.log, logs/mdrun.stderr.log
+鈹?  鈹?      鈹溾攢鈹€ stage_state.json
+鈹?  鈹?      鈹溾攢鈹€ repro.json
+鈹?  鈹?      鈹斺攢鈹€ done.ok
+鈹?  鈹溾攢鈹€ analysis/{rdf,cn}/           # RDF and coordination numbers
+鈹?  鈹溾攢鈹€ logs/
+鈹?  鈹斺攢鈹€ manifest.json
+鈹?  鈹斺攢鈹€ run_report.json
+鈹?  鈹斺攢鈹€ computational_details.md
+鈹?
+鈹溾攢鈹€ pipeline/                        # Python package
+鈹?  鈹溾攢鈹€ mdp_patcher.py               # MDP template patching
+鈹?  鈹溾攢鈹€ resource_scheduler.py        # CPU/GPU pinning
+鈹?  鈹溾攢鈹€ crash_context.py             # Failure diagnostics
+鈹?  鈹斺攢鈹€ stages/
+鈹?      鈹溾攢鈹€ packmol.py               # 鉁?Implemented
+鈹?      鈹溾攢鈹€ htpolynet.py             # 鉁?Implemented
+鈹?      鈹溾攢鈹€ sanitizer_stage.py       # Sanitizer stage orchestrator (run/wiring)
+鈹?      鈹溾攢鈹€ topology_sanitizer.py    # Topology/ITP/include sanitization helpers
+鈹?      鈹溾攢鈹€ spatial_checker.py       # GRO/PBC/dipole/grompp consistency helpers
+鈹?      鈹溾攢鈹€ sanitizer.py             # Backward-compatible facade (re-exports)
+鈹?      鈹溾攢鈹€ gromacs.py               # 鉁?Implemented
+鈹?      鈹斺攢鈹€ analysis.py              # 鉁?Implemented
+鈹?
+鈹溾攢鈹€ run_pipeline.py
+鈹斺攢鈹€ README.md
 ```
 
 ## Stage Execution Order
 
 ```
-1. packmol     → Generate initial packed system      ✅ IMPLEMENTED
-2. htpolynet   → Crosslink polymer network           ✅ IMPLEMENTED
-3. sanitizer   → ITP atomtype sanitization           ✅ IMPLEMENTED
-4. gmx_em      → Energy minimization                 ✅ IMPLEMENTED
-5. gmx_eq      → NVT + NPT equilibration             ✅ IMPLEMENTED
-6. gmx_prod    → Production MD                       ✅ IMPLEMENTED
-7. analysis    → RDF/CN post-processing              ✅ IMPLEMENTED
+1. packmol     鈫?Generate initial packed system      鉁?IMPLEMENTED
+2. htpolynet   鈫?Crosslink polymer network           鉁?IMPLEMENTED
+3. sanitizer   鈫?ITP atomtype sanitization           鉁?IMPLEMENTED
+4. gmx_em      鈫?Energy minimization                 鉁?IMPLEMENTED
+5. gmx_eq      鈫?NVT + NPT equilibration             鉁?IMPLEMENTED
+6. gmx_prod    鈫?Production MD                       鉁?IMPLEMENTED
+7. analysis    鈫?RDF/CN post-processing              鉁?IMPLEMENTED
 ```
 
 ## Forcefield/Charge Compatibility
@@ -196,10 +199,10 @@ Missing or ambiguous rules trigger a hard error with actionable guidance.
 
 ### Optional Multi-Step Curing
 If `ctx.htpolynet_curing_steps` is provided (list of dicts with `temperature_K`, `duration_ps`, optional `ramp_ps`),
-the steps are injected into `system_config.yaml` and recorded in the manifest. Absent → no behavior change.
+the steps are injected into `system_config.yaml` and recorded in the manifest. Absent 鈫?no behavior change.
 
 ### Output Selection and Staging
-- Final output directory priority: `systems/final-results` → `systems/final` → `output/final` → other (only if completion marker exists).
+- Final output directory priority: `systems/final-results` 鈫?`systems/final` 鈫?`output/final` 鈫?other (only if completion marker exists).
 - Outputs are accepted only if `system.gro + system.itp + system.top` exist together.
 - `index.ndx` is staged to `IN/systems/<SYSTEM_ID>/gromacs/ndx/` if present alongside outputs.
 
@@ -216,14 +219,14 @@ The PACKMOL stage enforces strict reproducibility with explicit unit handling, d
 | Context | Unit | Rationale |
 |---------|------|-----------|
 | Internal (pipeline) | **nm** | GROMACS native unit |
-| PACKMOL input | **Å** | PACKMOL native unit (auto-converted: nm × 10) |
-| PDB output (from PACKMOL) | **Å** | PACKMOL writes Å |
+| PACKMOL input | **脜** | PACKMOL native unit (auto-converted: nm 脳 10) |
+| PDB output (from PACKMOL) | **脜** | PACKMOL writes 脜 |
 | GRO output | **nm** | PDB coordinates are scaled to nm in Python; `editconf` runs without `-scale` |
 
 **Fail-fast**: After PACKMOL generates `initial.pdb`, the pipeline validates and infers units using multiple signals (winsorized extent + local nearest-neighbor distance sampling). This reduces false positives from long polymer chains that appear to span PBC in unwrapped templates.
 
 **Template units**:
-- `.pdb` templates: unit inference is applied (Å vs nm) and may require explicit `--packmol-pdb-scale` if signals are ambiguous or conflicting.
+- `.pdb` templates: unit inference is applied (脜 vs nm) and may require explicit `--packmol-pdb-scale` if signals are ambiguous or conflicting.
 - `.gro` templates: treated as **nm** inputs; unit inference is bypassed and `--packmol-pdb-scale` must be `1.0`.
 
 ### Retry and Density Floor (Hardened)
@@ -231,7 +234,7 @@ The PACKMOL stage enforces strict reproducibility with explicit unit handling, d
 Default behavior is fail-fast on PACKMOL failure.
 No density reduction is applied unless `--allow-density-reduction` is explicitly set.
 
-**Single source of truth for box**: the intended PACKMOL box is authoritative for density. PDB→GRO conversion preserves the intended box by default; if a minimal expansion is required to fit the structure, the delta is recorded and a warning is emitted.
+**Single source of truth for box**: the intended PACKMOL box is authoritative for density. PDB鈫扜RO conversion preserves the intended box by default; if a minimal expansion is required to fit the structure, the delta is recorded and a warning is emitted.
 
 **Density floor policy (always enforced):**
 - `rho0` = initial target density from recipe.
@@ -259,7 +262,7 @@ No density reduction is applied unless `--allow-density-reduction` is explicitly
 - The same table is recorded in manifest under `composition.retry_policy.template_fit`.
 - If polymer-like template span is the limiting factor, the stage fails fast with remediation:
   - provide a compact/coiled pre-relaxed polymer conformer, or intentionally increase box via density settings.
-- If PDB→GRO conversion requires box expansion above the configured cap, the stage hard-fails (no silent density collapse acceptance).
+- If PDB鈫扜RO conversion requires box expansion above the configured cap, the stage hard-fails (no silent density collapse acceptance).
 
 Manifest records:
 - `target_density_g_cm3`, `achieved_density_g_cm3`, `achieved_over_target_ratio`
@@ -436,7 +439,7 @@ For materials like OEGMA/PEGDMA, fixed MW is an approximation unless you explici
 ### Dry-Run Semantics
 
 `--dry-run` generates PACKMOL input but **does not execute PACKMOL**:
-- Missing templates → returns **False** with actionable message (fail-fast)
+- Missing templates 鈫?returns **False** with actionable message (fail-fast)
 - Manifest marked `preview_only: true`
 - No `done.ok` written
 
@@ -458,13 +461,13 @@ All failures record context in the manifest for debugging.
 For polymer/gel electrolyte (GPE) systems, insufficient molecule counts can prevent HTPolyNet from achieving network percolation and the resulting structure will be non-physical.
 
 **Default behavior (strict mode):**
-- Missing `composition.yaml` → **HARD FAILURE** with message to create one or use `--allow-default-recipe`
-- `target_total_molecules=500` (default) with polymer-like species → **WARNING** (too low for percolation)
-- `total_molecules < min_total_molecules_polymer` (5000) → **HARD FAILURE**
-- `polymer_chains < min_polymer_chains` (100) → **HARD FAILURE**
+- Missing `composition.yaml` 鈫?**HARD FAILURE** with message to create one or use `--allow-default-recipe`
+- `target_total_molecules=500` (default) with polymer-like species 鈫?**WARNING** (too low for percolation)
+- `total_molecules < min_total_molecules_polymer` (5000) 鈫?**HARD FAILURE**
+- `polymer_chains < min_polymer_chains` (100) 鈫?**HARD FAILURE**
 
 **Polymer-likeness detection:**
-- MW >= 1000 g/mol → polymer-like
+- MW >= 1000 g/mol 鈫?polymer-like
 - Name contains: PEO, PEG, PVDF, PAM, PEGDMA, OEGMA, PMMA, PVA, POLYMER, etc.
 
 **Override flags:**
@@ -487,10 +490,10 @@ In addition to the polymer-chain checks above, composition conversion supports r
 
 Warning/error messages include crosslinker name and expected count and explicitly note the non-percolating microgel risk under PBC.
 
-### Unit Handling (Å vs nm) — Hardened
+### Unit Handling (脜 vs nm) 鈥?Hardened
 
-PACKMOL outputs coordinates in Ångströms (Å) but GROMACS expects nanometers (nm). The pipeline now combines:
-- **winsorized extent signal** (0.5–99.5% per-axis span) to reduce false positives from chain/PBC spanning outliers
+PACKMOL outputs coordinates in 脜ngstr枚ms (脜) but GROMACS expects nanometers (nm). The pipeline now combines:
+- **winsorized extent signal** (0.5鈥?9.5% per-axis span) to reduce false positives from chain/PBC spanning outliers
 - **residue-local nearest-neighbor signal**: atoms are grouped by `(chain_id, resname, resid)` and nearest-neighbor distances are sampled within residues (bounded, deterministic)
 
 Decision policy:
@@ -501,8 +504,8 @@ Decision policy:
   - `strict_packmol_units=False` does **not** allow ambiguous scale fallback; it only relaxes non-scale checks.
 
 Override for ambiguous cases:
-- `--packmol-pdb-scale 0.1`: Force Å→nm conversion
-- `--packmol-pdb-scale 1.0`: Force nm→nm (no scaling)
+- `--packmol-pdb-scale 0.1`: Force 脜鈫抧m conversion
+- `--packmol-pdb-scale 1.0`: Force nm鈫抧m (no scaling)
 
 Extent guard thresholds are configurable via `tolerance_factor`:
 - Upper bound multiplier: `1.0 + 0.2 * tolerance_factor`
@@ -541,7 +544,7 @@ Manifest keys (recorded for reproducibility):
 }
 ```
 
-### Boundary Margin and Centering — Hardened
+### Boundary Margin and Centering 鈥?Hardened
 
 Atoms placed exactly at box edges can cause PBC wrap clashes during GROMACS preprocessing.
 
@@ -630,6 +633,13 @@ packmol_preassembly:
 
 The sanitization stage enforces correctness, safety, and auditability for ITP files.
 
+Module layout:
+- `pipeline/stages/sanitizer_stage.py`: `SanitizerStage` orchestration entrypoint (`run()` and stage wiring).
+- `pipeline/stages/topology_sanitizer.py`: topology/ITP/include/defaults handling, sanitizer-managed `system.top` updates, and final output writing helpers.
+- `pipeline/stages/spatial_checker.py`: GRO parsing, PBC unwrapping, dipole checks, and grompp-based GRO/TOP consistency helpers.
+- `pipeline/stages/sanitizer.py`: compatibility facade that re-exports the stage and legacy symbols for existing imports.
+
+
 ### Include Resolution
 - **Shadowing Detection**: If an included file (e.g., `posre.itp`) exists in multiple search paths, the pipeline detects it.
   - Default: Warnings printed to console and audit log.
@@ -701,7 +711,7 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
 - **Resume fingerprint uses recorded inputs first**: MD resume comparison resolves `fingerprint_payload` recorded paths from prior `stage_state.json`; if unresolved, it falls back to current inputs with warnings.
 - **Repairable partial state**: if `md.cpt` exists but `md.tpr` is missing, pipeline fails fast by default and tells you to use `--allow-resume-repair` (or restore `md.tpr`). With `--allow-resume-repair`, compatibility is validated first, then `md.tpr` is rebuilt via `grompp`, then continuation runs with `mdrun -cpi md.cpt -append`.
 - **Non-repairable partial state**: if `md.tpr` exists but `md.cpt` is missing, continuation is blocked with actionable guidance (restore `md.cpt` or start fresh with `--force`).
-- **No destructive “repair”**: resume-repair never archives/deletes prior outputs.
+- **No destructive 鈥渞epair鈥?*: resume-repair never archives/deletes prior outputs.
 - **Resume state refresh**: after successful production resume, `stage_state.json` is rewritten so subsequent resumes stay consistent with latest checkpoint/audit state.
 - **`done.ok` is a final marker**: GROMACS stage sentinels are only written after required outputs and metadata are persisted.
 - **No unsafe implicit restart**: missing `nvt.cpt` or `npt.cpt` is a hard error unless an explicit recovery path is selected, or non-strict auto-fallback can validate `.gro` velocities.
@@ -838,11 +848,11 @@ python run_pipeline.py --ff GAFF2 --charge CM5 --stage htpolynet
 
 # For demos/testing only, use --allow-placeholder:
 python run_pipeline.py --ff GAFF2 --charge CM5 --stage htpolynet --allow-placeholder
-# ⚠️ Placeholders stay in OUT_GMX only (never published to IN/)
-# ⚠️ Outputs are marked placeholder=true and cannot proceed to GROMACS by default
-# ⚠️ Demo publish requires --allow-placeholder-propagate
-# ⚠️ Demo staging to IN/.../gromacs requires --allow-placeholder-stage-to-gromacs
-# ⚠️ grompp remains blocked by poison pill unless --allow-placeholder-gromacs-compile is set
+# 鈿狅笍 Placeholders stay in OUT_GMX only (never published to IN/)
+# 鈿狅笍 Outputs are marked placeholder=true and cannot proceed to GROMACS by default
+# 鈿狅笍 Demo publish requires --allow-placeholder-propagate
+# 鈿狅笍 Demo staging to IN/.../gromacs requires --allow-placeholder-stage-to-gromacs
+# 鈿狅笍 grompp remains blocked by poison pill unless --allow-placeholder-gromacs-compile is set
 ```
 
 ### Input Provenance (Strict Mode)
@@ -865,8 +875,8 @@ python run_pipeline.py ... --unsafe-allow-out-fallback
 - `cure_temp_safety_margin_K = 10.0`
 
 The config generator detects common volatile co-solvents from `molecule_counts` names (case-insensitive substring match):
-- `DMC` / `DIMETHYL CARBONATE` (`bp ≈ 363.15 K`)
-- `DME` / `DIMETHOXYETHANE` / `1,2-DIMETHOXYETHANE` (`bp ≈ 358.15 K`)
+- `DMC` / `DIMETHYL CARBONATE` (`bp 鈮?363.15 K`)
+- `DME` / `DIMETHOXYETHANE` / `1,2-DIMETHOXYETHANE` (`bp 鈮?358.15 K`)
 
 If requested `cure_temperature_K > (min_bp - margin)`:
 - `cure_temp_policy="warn"`: keep requested value, emit prominent YAML warnings
@@ -942,7 +952,7 @@ Use `gmx editconf` to re-box to orthorhombic/cubic, then rerun.
 - Emits loud warnings
 - Records:
   - `htpolynet.box_scalar_policy = "UNSAFE_DIAGONAL_APPROX"`
-  - `box.original_box_matrix_nm` (full 3×3 for audit)
+  - `box.original_box_matrix_nm` (full 3脳3 for audit)
   - approximated diagonal vector used for config
 
 ### Configurable Timeout
@@ -960,8 +970,8 @@ python run_pipeline.py ... --htpolynet-timeout 0  # None = no limit
 ### Gelation Feasibility Precheck
 
 Before launching HTPolyNet, the stage computes conservative degree moments over reactive species (`reactive_site_count > 0`), weighted by molecule counts:
-- `mean_f = Σ(N_i f_i)/Σ(N_i)`
-- `mean_f2 = Σ(N_i f_i^2)/Σ(N_i)`
+- `mean_f = 危(N_i f_i)/危(N_i)`
+- `mean_f2 = 危(N_i f_i^2)/危(N_i)`
 - `p_c_est = mean_f / (mean_f2 - mean_f)`
 
 Default failure conditions:
@@ -1026,7 +1036,7 @@ The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, d
 3. **Defaults Validation**: Ensures all `[ defaults ]` tuples are consistent across all reachable sources (`nbfunc/comb-rule/gen-pairs/fudgeLJ/fudgeQQ`)
 4. **Combined Atomtypes**: Generates a single `combined_atomtypes_current.itp` with all unique atomtypes
 5. **Sanitized ITPs**: Removes `[ atomtypes ]` and `[ defaults ]` from individual ITPs
-6. **system.top Generation**: Creates topology with correct include order (defaults → atomtypes → extra includes → molecules), while avoiding duplicate `[ defaults ]` injection when existing `system.top` already has defaults/forcefield include
+6. **system.top Generation**: Creates topology with correct include order (defaults 鈫?atomtypes 鈫?extra includes 鈫?molecules), while avoiding duplicate `[ defaults ]` injection when existing `system.top` already has defaults/forcefield include
 7. **Molecule Scope**: `system.top` includes only molecule ITPs for species present in `[molecules]` (include-aware moleculetype detection)
 8. **Include Integrity**: Resolves `#include` targets like GROMACS `-I`, detects shadowing in strict mode, sanitizes include-closure files with `[ defaults ]`/`[ atomtypes ]`, validates paths on disk, and writes winner-only sanitized files for include-target collisions
 
@@ -1058,7 +1068,7 @@ Collection no longer enforces global basename uniqueness across all scanned ITP 
 
 Section headers with trailing comments are now correctly parsed:
 ```
-[ atomtypes ] ; Define my atoms here  →  parsed as "atomtypes"
+[ atomtypes ] ; Define my atoms here  鈫? parsed as "atomtypes"
 ```
 
 ### Conflict Signature and Mass Tolerance
@@ -1112,7 +1122,7 @@ This pipeline therefore fails by default on mixed defaults, and only allows cont
 ### Virtual Sites / Dummy Atoms
 
 TIP4P-like water models and other systems with virtual sites (ptype D or V) are handled correctly:
-- **No LJ warnings** for dummy/virtual atoms with σ=0 and ε=0 (this is expected)
+- **No LJ warnings** for dummy/virtual atoms with 蟽=0 and 蔚=0 (this is expected)
 - Warnings still issued if ptype=D/V but LJ params are nonzero
 
 ### Robust Atomtype Parsing
@@ -1183,7 +1193,7 @@ The sanitizer resets all internal state at the start of `run()`. This prevents s
 
 ### Output Locations
 
-**Note**: The sanitizer writes to `IN/systems/<SYSTEM_ID>/gromacs/` because these are "published inputs" for GROMACS—reusable assets that future runs can reference. Runtime outputs (logs, stage metadata) go to `OUT_GMX/<RUN_ID>/02_5_sanitizer/`.
+**Note**: The sanitizer writes to `IN/systems/<SYSTEM_ID>/gromacs/` because these are "published inputs" for GROMACS鈥攔eusable assets that future runs can reference. Runtime outputs (logs, stage metadata) go to `OUT_GMX/<RUN_ID>/02_5_sanitizer/`.
 
 GROMACS stages require the sanitizer outputs:
 - `IN/systems/<SYSTEM_ID>/gromacs/combined_atomtypes_current.itp`
@@ -1273,13 +1283,13 @@ python run_pipeline.py ... --stage sanitizer
 
 If preprocessing times out under `--strict-gro-top-check`, an actionable error is provided with instructions to increase the timeout.
 
-Executable resolution follows project-standard precedence: context override → `GMX_CMD` → default `gmx`.
+Executable resolution follows project-standard precedence: context override 鈫?`GMX_CMD` 鈫?default `gmx`.
 
 `grompp -pp` stdout/stderr are streamed to debug log files under `OUT_GMX/<RUN_ID>/02_5_sanitizer/grompp_preprocess/` (no large in-memory capture). These debug logs are troubleshooting artifacts only and are excluded from reproducibility-critical fingerprinting.
 
 ### v4 Hardening: Dipole Check and Gating
 
-The dipole shift check now runs in **heuristic mode by default**—it warns but never hard-fails unless `--strict-dipole-check` is enabled AND all preconditions pass.
+The dipole shift check now runs in **heuristic mode by default**鈥攊t warns but never hard-fails unless `--strict-dipole-check` is enabled AND all preconditions pass.
 
 `--strict-charge-physics` is not enforced inside `charge_neutrality.py`; dipole enforcement lives in sanitizer-stage dipole checks (`--strict-dipole-check` with `--charge-fix-max-dipole-shift`).
 
@@ -1288,7 +1298,7 @@ The dipole shift check now runs in **heuristic mode by default**—it warns but 
 |-----------|--------|
 | Giant molecule | Atom count > `dipole_unwrap_max_atoms` (default 512) |
 | Giant residue group | Residue group atom count > `dipole_group_max_atoms` (default 2048) |
-| Charged molecule | Net charge ≠ 0 (dipole is origin-dependent) |
+| Charged molecule | Net charge 鈮?0 (dipole is origin-dependent) |
 | Percolated topology (bond-graph) | Alternate bond paths imply non-zero image/lattice shift (`percolated_topology`) |
 | Missing bond graph | Dipole check is skipped as unreliable (`bond_graph_missing`) |
 | Triclinic box | Dipole check skipped or failed per triclinic policy |
@@ -1319,7 +1329,7 @@ Loop-consistency tolerance in bond-graph unwrapping is precision-aware:
 
 **Example output (heuristic mode):**
 ```
-[WARN] Dipole shift |Δμ|=0.0234 D exceeds limit 0.0100 D (heuristic mode)
+[WARN] Dipole shift |螖渭|=0.0234 D exceeds limit 0.0100 D (heuristic mode)
 [INFO] Dipole enforcement gated: giant_molecule (1024 > 512 atoms)
 ```
 
@@ -1344,7 +1354,7 @@ Include resolution now uses a restricted search path list:
 
 Pattern matching for protected solvents/ions now uses boundary-aware matching:
 - Normalization removes **all non-alphanumerics** (e.g., `+`, `-`, whitespace, parentheses) so `Li+` matches `LI`
-- Short patterns (≤3 chars like "PC", "EC") require **exact match** after normalization
+- Short patterns (鈮? chars like "PC", "EC") require **exact match** after normalization
 - Longer patterns can match as substrings but require word boundaries on the **raw name**
 - Prevents false positives like "PC" matching "POLYMER_CHAIN"
 
@@ -1418,8 +1428,8 @@ Moleculetype names are now tracked with **exact case**:
 
 The dipole shift calculation now computes the correct **per-group vector delta**:
 
-- For each molecule group: `Δμ_i = ||μ_after_vec - μ_before_vec||`
-- Reports and persists both `avg(Δμ_i)` and `max(Δμ_i)` in sanitizer manifest output
+- For each molecule group: `螖渭_i = ||渭_after_vec - 渭_before_vec||`
+- Reports and persists both `avg(螖渭_i)` and `max(螖渭_i)` in sanitizer manifest output
 - Avoids direction-cancellation artifacts from averaging vector directions
 - **Wrapped-span pre-gate**: skips obvious spanning groups before any unwrap allocation
 - **Streaming unwrap span check**: can early-exit when unwrapped span ratio crosses threshold
@@ -1451,7 +1461,7 @@ The Sanitizer performs charge neutrality preflight checking:
 - Target `[ moleculetype ]` matching for patching is case-insensitive to avoid alias/casing drift bugs
 
 **Strict vs Non-Strict Mode** (`--strict-charge-neutrality`):
-- **Strict mode**: Enforces reliability at system-validation scope (all active molecules), not only correction target selection. If any active source is unreliable, the stage fails even when total `Q ≈ 0`.
+- **Strict mode**: Enforces reliability at system-validation scope (all active molecules), not only correction target selection. If any active source is unreliable, the stage fails even when total `Q 鈮?0`.
 - **Non-strict mode** (default): Returns explicit degraded outcomes (`degraded_unreliable_charge_sources`, `degraded_rounding_drift_non_strict`) instead of reporting a clean neutral pass.
 
 **Safe-Subset Correction** (default, `--charge-fix-method safe_subset`):
@@ -1465,9 +1475,9 @@ The Sanitizer performs charge neutrality preflight checking:
   - Explicitly excludes element/ion-like names (CL/BR/F/I/NA/LI/K/MG/CA/Zn/Fe/etc.)
   - Prefer false negatives over false positives; override with `--charge-fix-target-atomnames` if needed
 - Target must be in the configured allowlist (explicit target selection does not bypass allowlist safety)
-- Auto target selection is deterministic and ranks by estimated per-atom `|Δq|` safety, with exclusion diagnostics when no candidate is acceptable
+- Auto target selection is deterministic and ranks by estimated per-atom `|螖q|` safety, with exclusion diagnostics when no candidate is acceptable
 - Uniform smearing available via `--charge-fix-method uniform_all`
-- Enforces max per-atom Δq and max total ΔQ guardrails
+- Enforces max per-atom 螖q and max total 螖Q guardrails
 - Per-atom limit diagnostics include `|Q| / total_adjustable_atoms`; small systems may fail this guard while larger systems pass for the same `|Q|`
 - If no safe atoms found, correction is refused with actionable message
 - Correction is refused if selected atoms include hetero atoms unless explicitly allowlisted atom names are provided
@@ -1480,13 +1490,13 @@ The Sanitizer performs charge neutrality preflight checking:
   - non-strict mode: warn + skip correction
   - strict mode: hard fail
 - If allowlisted, polymer correction uses `spread_safe`:
-  - distributes `ΔQ` uniformly across many atoms (minimizes max `|Δq_i|`)
+  - distributes `螖Q` uniformly across many atoms (minimizes max `|螖q_i|`)
   - excludes hetero atoms (`O/N/S/B/F/P`)
   - excludes atoms within `--charge-fix-polymer-exclusion-bonds` (default `2`) of hetero atoms
   - fails with actionable guidance if too few eligible atoms remain
 
 **Ion Detection** (Advisory):
-- Molecules detected as ions (integer/half-integer charge, ≤3 atoms) are skipped by default
+- Molecules detected as ions (integer/half-integer charge, 鈮? atoms) are skipped by default
 - Use `--charge-fix-allow-ions` to override this advisory and allow correction on ions
 
 ### Limitations: Fixed-Charge FF in Concentrated Electrolytes
@@ -1543,9 +1553,9 @@ Recommended safer automation settings for GPE workflows:
 | `--polymer-net-charge-tol` | 1e-3 | Acceptable per-molecule protected-polymer net charge drift |
 | `--charge-fix-polymer-method` | skip_if_small | Protected-polymer policy (`skip_if_small` or `spread_safe`) |
 | `--charge-fix-polymer-exclusion-bonds` | 2 | Exclude atoms within N bonds of hetero atoms for `spread_safe` |
-| `--charge-fix-target-molecules` | — | Comma-separated target molecules (must still satisfy allowlist policy) |
-| `--charge-fix-target-atomnames` | — | Comma-separated atom name patterns |
-| `--charge-fix-disallowed-atomtypes` | — | Comma-separated atomtypes to never adjust |
+| `--charge-fix-target-molecules` | 鈥?| Comma-separated target molecules (must still satisfy allowlist policy) |
+| `--charge-fix-target-atomnames` | 鈥?| Comma-separated atom name patterns |
+| `--charge-fix-disallowed-atomtypes` | 鈥?| Comma-separated atomtypes to never adjust |
 | `--charge-fix-allow-ions` | false | Allow correction on detected ions |
 | `--charge-fix-source-counts` | auto | Source for molecule counts: auto/manifest/system_top |
 
@@ -1651,18 +1661,18 @@ This guarantees that tc-grps split/unified happens before ref_t/tau_t are expand
 
 After all overrides, the patcher normalizes tc-grps-coupled vectors:
 
-- If `tc-grps` has **N** groups and `ref_t` has 1 value → replicate to **N**
-- If `tc-grps` has **N** groups and `tau_t` has 1 value → replicate to **N** only with `--allow-tau-t-autofill`
-- Any other length mismatch (`ref_t` or `tau_t`) → **ERROR** (grompp would fail)
+- If `tc-grps` has **N** groups and `ref_t` has 1 value 鈫?replicate to **N**
+- If `tc-grps` has **N** groups and `tau_t` has 1 value 鈫?replicate to **N** only with `--allow-tau-t-autofill`
+- Any other length mismatch (`ref_t` or `tau_t`) 鈫?**ERROR** (grompp would fail)
 
 This ensures `--temperature 300` plus `--tc-grps-mode split` always yields `ref_t = 300 300` (and matching `tau_t` length).
 
 ### tc-grps Modes
 
 - **auto** (default, conservative): split into `Polymer NonPolymer` only when clearly safe, otherwise fallback to `System`
-- **system**: `tc-grps = System` — single thermostat group
-- **split**: `tc-grps = Polymer NonPolymer` — separate groups (explicit/legacy mode; requires matching ndx)
-- **split + custom groups**: `--tc-grps-groups "A B C"` — explicit group list (recommended for non-Polymer/NonPolymer labels)
+- **system**: `tc-grps = System` 鈥?single thermostat group
+- **split**: `tc-grps = Polymer NonPolymer` 鈥?separate groups (explicit/legacy mode; requires matching ndx)
+- **split + custom groups**: `--tc-grps-groups "A B C"` 鈥?explicit group list (recommended for non-Polymer/NonPolymer labels)
 
 **Note**: `--tc-grps-groups` is whitespace-delimited; group names cannot contain spaces.
 
@@ -1676,7 +1686,7 @@ This ensures `--temperature 300` plus `--tc-grps-mode split` always yields `ref_
 
 **System mode rewrite policy**:
 - `tc-grps-mode=system` actively rewrites final state (not a no-op): `tc-grps=System`, `comm-grps=System`, and compatible `comm-mode`.
-- For split→system fallback, vector collapse is safety-first:
+- For split鈫抯ystem fallback, vector collapse is safety-first:
   - auto-collapse `tau_t`/`ref_t` only when all values are identical,
   - otherwise fail clearly (unless expert override is explicitly enabled).
 
@@ -1755,9 +1765,9 @@ The MDP patcher enforces consistent stage policies for `continuation` and `gen_v
 
 When `--allow-gro-velocity-restart` is set for NPT/MD, stage defaults prefer `continuation=no` (expert restart intent). If a checkpoint is actually present, checkpoint policy still explicitly overrides to continuation mode.
 
-**Override precedence** (highest → lowest):
-1. `--force-gen-vel` → sets gen_vel=yes
-2. `--allow-continuation-override` → skips auto-setting continuation
+**Override precedence** (highest 鈫?lowest):
+1. `--force-gen-vel` 鈫?sets gen_vel=yes
+2. `--allow-continuation-override` 鈫?skips auto-setting continuation
 3. Stage defaults
 
 > [!CAUTION]
@@ -1791,7 +1801,7 @@ If `.gro` velocity status is known missing, this is a hard error even in non-str
 
 | Checkpoint | allow_velocity_reset | allow_gro_velocity_restart | Result |
 |------------|---------------------|---------------------------|--------|
-| Exists | — | — | Use checkpoint (normal continuation) |
+| Exists | 鈥?| 鈥?| Use checkpoint (normal continuation) |
 | Missing | True | False | Regenerate velocities (thermal shock risk) |
 | Missing | False | True | Use .gro velocities (validated) |
 | Missing | True | True | **CLI error** (`parser.error`, mutually exclusive) |
@@ -1830,8 +1840,8 @@ The patcher validates after patching:
 | Override status is true failure/missing template key | **FAIL** with explicit diagnostics |
 | Override status is skipped with warning (non-strict safety downgrade) | **WARN + continue** |
 | Vector length mismatch (tc-grps vs tau_t/ref_t) | **FAIL** |
-| gen_vel=yes but gen_temp ≠ ref_t | **FAIL** |
-| nsteps ≤ 0 for production stage | **FAIL** |
+| gen_vel=yes but gen_temp 鈮?ref_t | **FAIL** |
+| nsteps 鈮?0 for production stage | **FAIL** |
 | Post-write value mismatch | **FAIL** |
 
 ### GPE Default Time Scales
@@ -1901,7 +1911,7 @@ GROMACS treats underscore and hyphen variants equivalently (e.g., `ref_t` = `ref
 1. **Detects existing key style** in the template before patching
 2. **Preserves the template's style** to avoid appending duplicates
 3. **Deduplicates semantic keys** before writing if both variants exist
-4. **Override respects template style**: If template has `gen-temp=0` and you override with `gen_temp=300`, the patcher updates `gen-temp` (the existing key) to 300—override is never lost
+4. **Override respects template style**: If template has `gen-temp=0` and you override with `gen_temp=300`, the patcher updates `gen-temp` (the existing key) to 300鈥攐verride is never lost
 
 **Semantic key groups**: `gen_vel/gen-vel`, `gen_seed/gen-seed`, `gen_temp/gen-temp`, `tc_grps/tc-grps`, `tau_t/tau-t`, `ref_t/ref-t`, `ref_p/ref-p`, `tau_p/tau-p`, `comm_grps/comm-grps`, `comm_mode/comm-mode`
 
@@ -1997,7 +2007,7 @@ python run_pipeline.py ... --stage gmx_prod --force-gen-vel
 # continuation would remain 'yes' from defaults
 
 # NEW behavior (deterministic):
-# --force-gen-vel → gen_vel=yes + continuation=no + gen_temp set
+# --force-gen-vel 鈫?gen_vel=yes + continuation=no + gen_temp set
 ```
 
 ### Hardening v2: tc-grps tau_t Existence Check
@@ -2021,7 +2031,7 @@ Crosslinked polymer networks can stress bond constraints. Templates use gel-safe
 |-----------|---------|-------|
 | `lincs_iter` | 2 | Increased from 1 for stressed crosslinks |
 | `lincs_order` | 6 | Higher accuracy for gel systems |
-| `lincs_warnangle` | 30° | Early warning for problematic geometries |
+| `lincs_warnangle` | 30掳 | Early warning for problematic geometries |
 
 **If LINCS warnings occur frequently:**
 1. Reduce `dt` to 1 fs (`--nsteps-xxx` values should double)
@@ -2065,7 +2075,7 @@ python run_pipeline.py ... --omp-num-threads 4
 - If a context override exists, it is used.
 - Else if `GMX_CMD` is set (e.g., `GMX_CMD=gmx_mpi`), it is used.
 - Otherwise defaults to `gmx`.
-This resolution order is used consistently across GROMACS stages and PACKMOL PDB→GRO conversion.
+This resolution order is used consistently across GROMACS stages and PACKMOL PDB鈫扜RO conversion.
 
 **GPU rule:**
 - Normal command path uses `-gpu_id`.
@@ -2094,7 +2104,7 @@ With `--resume` (default), completed stages are skipped only when `done.ok` and 
   - On successful resume, `stage_state.json` is refreshed for deterministic repeated resume
   - Optional: `--resume-ignore-runtime` can ignore runtime-only command-base changes
 
-- **Cross-stage transition** (NPT → Production):
+- **Cross-stage transition** (NPT 鈫?Production):
   - Uses `grompp -c npt.gro -t npt.cpt`
   - Preserves velocities from equilibration
 
@@ -2224,13 +2234,13 @@ When index exists, `gmx rdf` always runs with `-n <index.ndx>`.
 ### Selection Rules (Group vs Expression)
 
 Canonical form uses explicit mode:
-- `mode: group` → exact index group name, resolved to `group "<name>"`
-- `mode: expr` → raw GROMACS selection expression (passed as-is)
+- `mode: group` 鈫?exact index group name, resolved to `group "<name>"`
+- `mode: expr` 鈫?raw GROMACS selection expression (passed as-is)
 
 Backward compatibility: string `group1/group2` values are still accepted. Resolution is deterministic:
-- If index exists and the string exactly matches a group name → treated as GROUP
-- Else if the string clearly looks like an expression → treated as EXPR
-- Else → **hard error** (ambiguous; use explicit mode or add group to index)
+- If index exists and the string exactly matches a group name 鈫?treated as GROUP
+- Else if the string clearly looks like an expression 鈫?treated as EXPR
+- Else 鈫?**hard error** (ambiguous; use explicit mode or add group to index)
 
 Examples:
 ```yaml
@@ -2249,12 +2259,12 @@ pairs:
 ### Strict Analysis Mode
 
 `analysis_settings.strict` (default true) enforces fail-fast behavior to avoid misleading outputs:
-- Missing trajectory or TPR → hard error
-- Missing index for `mode: group` → hard error
-- Ambiguous selection strings → hard error
-- Unknown box size **and** no explicit `max_r` → hard error
-- `cn_cutoff: first_minimum_smoothed` fails to detect a reliable minimum (including truncation) → hard error
-- Any pair ending with `status: failed` or `status: skipped` → stage fails
+- Missing trajectory or TPR 鈫?hard error
+- Missing index for `mode: group` 鈫?hard error
+- Ambiguous selection strings 鈫?hard error
+- Unknown box size **and** no explicit `max_r` 鈫?hard error
+- `cn_cutoff: first_minimum_smoothed` fails to detect a reliable minimum (including truncation) 鈫?hard error
+- Any pair ending with `status: failed` or `status: skipped` 鈫?stage fails
 
 If `strict: false`, analysis will:
 - allow uncapped rmax **only** if `max_r` is explicitly provided
@@ -2267,7 +2277,7 @@ If `strict: false`, analysis will:
 ### CN Computation Method
 
 Coordination numbers are computed via **GROMACS native** `gmx rdf -cn`:
-- No hardcoded density assumptions (previous code used 33 atoms/nm³ ≈ water)
+- No hardcoded density assumptions (previous code used 33 atoms/nm鲁 鈮?water)
 - Produces physically meaningful CN for gel polymer electrolytes
 - Both raw CN(r) curve (`cn_<safe_prefix>__<hash8>.xvg`) and scalar summary (`cn_<safe_prefix>__<hash8>.dat`) are saved
 - In `--dry-run`, commands are logged but RDF/CN files are intentionally not generated
@@ -2276,8 +2286,8 @@ Coordination numbers are computed via **GROMACS native** `gmx rdf -cn`:
 
 To prevent periodic artifacts / double counting, `rmax` is automatically capped:
 - Triclinic-safe basis: **minimum box altitude** (minimum opposite-face distance), not `min(|a|,|b|,|c|)`
-- `safe_rmax_tpr = 0.5 × min_box_height_tpr - 0.02`
-- `safe_rmax_traj = 0.5 × min_box_height_traj - 0.02` (from `gmx traj -ob`)
+- `safe_rmax_tpr = 0.5 脳 min_box_height_tpr - 0.02`
+- `safe_rmax_traj = 0.5 脳 min_box_height_traj - 0.02` (from `gmx traj -ob`)
 - `safe_rmax_used = min(safe_rmax_tpr, safe_rmax_traj)` when both are available
 - `effective_rmax = min(requested_max_r, safe_rmax_used)`
 - If capped, a warning is printed and both requested/effective values are recorded with `safe_rmax_basis: min_altitude`
@@ -2303,8 +2313,8 @@ When `cn_cutoff: first_minimum_smoothed` (or legacy alias `first_minimum`), the 
 9. If no local minimum exists after the first peak (shoulder/plateau), return `no_first_minimum` with `shoulder_no_minimum`
 10. Detect truncation: if the post-peak curve is still descending at the RDF tail, report `truncated_before_first_minimum`
 11. If still unreliable:
-   - strict=true → hard error
-   - strict=false → fall back to `cn_settings.cutoff_nm` and record `cutoff_unreliable: true`
+   - strict=true 鈫?hard error
+   - strict=false 鈫?fall back to `cn_settings.cutoff_nm` and record `cutoff_unreliable: true`
 
 If `truncated_before_first_minimum` is reported:
 - if `rmax` is **not** box-capped, increase `rdf.max_r`/`search_rmax` to capture the first-shell valley.
@@ -2375,9 +2385,9 @@ Per-pair analysis results include:
 | `--polymer-net-charge-tol` | Float | 1e-3 | Acceptable protected-polymer per-molecule drift before correction is required |
 | `--charge-fix-polymer-method` | `skip_if_small`, `spread_safe` | `skip_if_small` | Protected-polymer policy and correction method |
 | `--charge-fix-polymer-exclusion-bonds` | Integer | 2 | Bond-distance exclusion from hetero atoms for polymer spread-safe correction |
-| `--charge-fix-max-delta-per-atom` | Float | 1e-5 | Max |Δq| per atom for charge correction |
-| `--charge-fix-max-total` | Float | 1e-4 | Max |ΔQ| total correction for neutrality |
-| `--charge-fix-max-dipole-shift` | Float | 0.01 | Max |Δμ| dipole shift (Debye) |
+| `--charge-fix-max-delta-per-atom` | Float | 1e-5 | Max |螖q| per atom for charge correction |
+| `--charge-fix-max-total` | Float | 1e-4 | Max |螖Q| total correction for neutrality |
+| `--charge-fix-max-dipole-shift` | Float | 0.01 | Max |螖渭| dipole shift (Debye) |
 | `--charge-fix-moleculetype-rounding-tol` | Float | 1e-4 | Max `|Q_mol-round(Q_mol)|` treated as rounding drift |
 | `--charge-fix-allow-non-rounding` | Flag | False | Unsafe override to allow correction for non-rounding drift |
 | `--strict-charge-physics` | Flag | False | Deprecated in checker path; use `--strict-dipole-check` for dipole hard-fail enforcement |
@@ -2413,7 +2423,7 @@ Per-pair analysis results include:
 | `--unsafe-allow-out-fallback` | Flag | False | Allow reading initial structure from `OUT_GMX` when IN/published asset is missing |
 | `--allow-partial-publish` | Flag | False | Downgrade immediate strict publish raise, but stage is still non-complete when both PDB+GRO are not updated |
 | `--allow-density-reduction` | Flag | False | Explicitly allow density-backoff retries (still floor/cap constrained and audited) |
-| `--packmol-pdb-scale` | `0.1`, `1.0` | None | Explicit PACKMOL PDB scale override (Å→nm or nm→nm) |
+| `--packmol-pdb-scale` | `0.1`, `1.0` | None | Explicit PACKMOL PDB scale override (脜鈫抧m or nm鈫抧m) |
 | `--no-strict-packmol-units` | Flag | False | Relax non-scale checks; ambiguous unit scale still requires explicit `--packmol-pdb-scale` |
 | `--strict-gro-conversion` / `--no-strict-gro-conversion` | Flag pair | False | Fail-fast on missing/failed `editconf` conversion command (strict) or allow non-strict conversion warnings |
 | `--packmol-edge-margin` | Float (nm) | 0.2 | Placement edge margin for PACKMOL inside-box constraints |
@@ -2450,7 +2460,7 @@ Per-pair analysis results include:
 - **Composition**: immutable `initial_counts`, explicit `post_counts`, history/conflicts, MW, wt%, box vectors, density, unit diagnostics, optional preassembly metrics
 - **HTPolyNet**: config, rules file, published files, staged files
 - **Sanitizer**: combined_atomtypes, sanitized ITPs, conflicts, defaults used, charge warnings
-- **Charge neutrality**: computed Q, correction applied, patched ITP path, `effective_method` + `method_desc`, alias target + real ITP moleculetype target, Δq/ΔQ guardrails, optional atom-level correction audit (`line_no`, `charge_col_idx`, `line_excerpt`, capped records, truncation counters), and optional unparsed `[ atoms ]` line audit when explicit unsafe override is used
+- **Charge neutrality**: computed Q, correction applied, patched ITP path, `effective_method` + `method_desc`, alias target + real ITP moleculetype target, 螖q/螖Q guardrails, optional atom-level correction audit (`line_no`, `charge_col_idx`, `line_excerpt`, capped records, truncation counters), and optional unparsed `[ atoms ]` line audit when explicit unsafe override is used
 - **MDP patches**: original and patched values per stage
 - **Resources**: gmx-nt, gmx-gpu-id, omp-num-threads
 - **Checkpoints**: paths and methods used
