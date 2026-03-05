@@ -1049,6 +1049,7 @@ If an include cannot be resolved, the sanitizer reports attempted paths (or fail
 
 **Shadowing**: If multiple include candidates exist, shadowing is reported. In strict mode this is a hard error unless `--allow-include-shadowing` is enabled.
 For same-basename shadows, sanitizer output is winner-only per include target (no deterministic renaming of losers).
+Collection no longer enforces global basename uniqueness across all scanned ITP inputs; ambiguity is handled at include-resolution time using the configured search order.
 **Escape guard**: includes that resolve outside configured include roots are blocked by default; use `--allow-unsafe-include-escape` only as an explicit unsafe override.
 
 **Include-closure sanitization**: Any reachable file containing `[ defaults ]` or `[ atomtypes ]` is sanitized and written into `itp_sanitized_current/` at its include path (relative includes only; `..` is not allowed for sanitization).
@@ -1244,6 +1245,7 @@ The Sanitizer validates that the coordinate file (`.gro`) matches the topology's
 - If raw `system.top` `[molecules]` parsing encounters conditional-control directives (`#if/#ifdef/#ifndef/#elif/#else/#endif`) in that region, the raw parse is marked **uncertain**.
 - In that case, sanitizer prefers `grompp -pp` preprocessed topology as the source of truth for molecule counts.
 - If preprocessing is unavailable, sanitizer falls back to weaker sources (manifest/ITP fallback) and keeps uncertainty metadata in sanitizer report/manifest fields.
+- Manifest QC/report fields include the uncertainty status and source choice (`raw_top_uncertain`, `raw_top_uncertainty_reasons`, `source`, `fallback_used`).
 
 For atom-count validation, if GROMACS is available, sanitizer preprocesses topology via `gmx grompp -pp` and parses the fully expanded output. Otherwise it falls back to a strict ITP parser that ignores preprocessor lines and skips the check if ambiguity is detected (unless `--strict-gro-top-check` is set).
 
@@ -1288,7 +1290,7 @@ The dipole shift check now runs in **heuristic mode by default**—it warns but 
 | Giant residue group | Residue group atom count > `dipole_group_max_atoms` (default 2048) |
 | Charged molecule | Net charge ≠ 0 (dipole is origin-dependent) |
 | Percolated topology (bond-graph) | Alternate bond paths imply non-zero image/lattice shift (`percolated_topology`) |
-| Percolated/spanning (fallback unwrap) | Unwrapped span ratio exceeds threshold when bond graph is unavailable |
+| Missing bond graph | Dipole check is skipped as unreliable (`bond_graph_missing`) |
 | Triclinic box | Dipole check skipped or failed per triclinic policy |
 
 Wrapped span ratio is now a **suspicion metric**, not the decision-maker, when bond topology is available.
@@ -1299,9 +1301,13 @@ Dipole output now carries explicit reliability metadata in existing sanitizer ch
 - `dipole.skip_reasons` (list)
 
 Reliability rules:
-- Missing bond graph means dipole fallback is marked unreliable in non-strict mode.
+- Missing bond graph skips dipole computation in non-strict mode and records explicit reliability/skip reasons.
 - In strict dipole mode, missing bond graph fails with a clear reliability error (no silent downgrade).
-- Atom0-based MIC fallback is never treated as equal-confidence to bond-graph unwrapping.
+- Span ratio alone never marks percolation.
+
+Loop-consistency tolerance in bond-graph unwrapping is precision-aware:
+- Default: `max(base_resolution_nm * 10, 1e-6)` where `base_resolution_nm` is inferred from GRO coordinate decimal precision.
+- Override env knob: `GPE_UNWRAP_LOOP_TOL_NM`.
 
 **CLI Options:**
 | Flag | Default | Description |
@@ -1496,7 +1502,7 @@ Recommended safer automation settings for GPE workflows:
 **Robust ITP Parsing** (Format Variants):
 - Handles both 8-token format (`nr type resnr residue atom cgnr charge mass`) and 7-token format (missing `cgnr`)
 - Tolerates trailing comments on section headers (`[ atoms ] ; comment`)
-- Recovers glued numeric fields before format detection (e.g., `1.000-0.001`)
+- Recovers glued numeric fields in `[ atoms ]` charge extraction and `[ atomtypes ]` LJ tail parsing (e.g., `1.000-0.001`, `1.234-5.678`)
 - Supports scientific notation in charge/mass tokens (e.g., `1.2e-5`)
 - Uses token-based patching for reliable charge replacement
 - Prevents silent charge under-counting by refusing unparseable target `[ atoms ]` data lines unless explicit unsafe override is enabled
@@ -1599,7 +1605,7 @@ group = [GROAtom(1, "POL", "C1", 0.01, 0.01, 0.01), GROAtom(1, "POL", "C2", 9.95
 span = stage._wrapped_span(group)
 box = (10.0, 10.0, 10.0)
 ratio = max(span[0] / box[0], span[1] / box[1], span[2] / box[2])
-print(ratio > 0.45)  # Expected: True -> skip dipole before unwrap
+print(ratio > 0.45)  # Expected: True -> suspicion log only; final decision uses bond-graph unwrap
 ```
 
 

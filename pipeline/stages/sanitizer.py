@@ -62,6 +62,7 @@ DEFAULT_GROMPP_PP_TIMEOUT_S = 300
 
 # Hardening v7: Safety cap for absurdly large GRO files (non-strict parse)
 GRO_ABSURD_ATOMS = 5_000_000
+DEFAULT_GRO_COORD_RESOLUTION_NM = 1e-3
 
 # Hardening v6: Grompp timeout complexity estimation parameters
 GROMPP_TIMEOUT_FLOOR_S = 60  # Minimum timeout for any system
@@ -72,6 +73,12 @@ GROMPP_TIMEOUT_RETRY_MULTIPLIER = 2.0  # Retry with 2x timeout on first failure
 # Moleculetype signature quantization (env-overridable)
 DEFAULT_MOLECULE_SIG_QUANT_STEP = 1e-6
 MOLECULE_SIG_QUANT_ENV = "GPE_MOLECULE_SIG_QUANT_STEP"
+GPE_UNWRAP_LOOP_TOL_NM_ENV = "GPE_UNWRAP_LOOP_TOL_NM"
+UNWRAP_LOOP_TOL_FACTOR = 10.0
+
+FLOAT_FINDER_RE = re.compile(
+    r"[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[eE][+-]?\d+)?"
+)
 
 # LJ outlier bound profiles (comb-rule 2/3; sigma/epsilon interpretation).
 LJ_BOUNDS_PROFILES = {
@@ -246,6 +253,28 @@ def normalize_include_priority(raw_value: Optional[str]) -> str:
     )
 
 
+def _extract_floats_from_text(text: str) -> List[float]:
+    """Extract floats from text, including glued tokens like '1.234-5.678'."""
+    values: List[float] = []
+    for match in FLOAT_FINDER_RE.finditer(text):
+        token = match.group(0)
+        try:
+            values.append(float(token))
+        except ValueError:
+            continue
+    return values
+
+
+def _decimal_places_from_numeric_token(token: str) -> Optional[int]:
+    """Infer decimal places from a numeric token; returns None when unavailable."""
+    cleaned = token.strip()
+    match = re.fullmatch(r"[+-]?\d+(?:\.(\d+))?(?:[eE][+-]?\d+)?", cleaned)
+    if not match:
+        return None
+    frac = match.group(1)
+    return len(frac) if frac is not None else 0
+
+
 def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
     """
     Check if name matches any protected pattern using boundary-aware matching.
@@ -310,6 +339,7 @@ class GROParseResult:
     box_y: float
     box_z: float
     is_triclinic: bool
+    coord_resolution_nm: float = DEFAULT_GRO_COORD_RESOLUTION_NM
     title: str = ""
 
 
@@ -2074,8 +2104,14 @@ class SanitizerStage(BaseStage):
         # Secondary guard: signatures can quantize equal; compare per-atom charges.
         quant_step = self._molecule_sig_quant_step()
         charge_tol = max(quant_step / 2.0, 0.0)
-        charges1 = self._extract_moleculetype_atom_charges(itp1, mol_name, ctx=ctx)
-        charges2 = self._extract_moleculetype_atom_charges(itp2, mol_name, ctx=ctx)
+        charges1, uncertain1 = self._extract_moleculetype_atom_charges(
+            itp1, mol_name, ctx=ctx
+        )
+        charges2, uncertain2 = self._extract_moleculetype_atom_charges(
+            itp2, mol_name, ctx=ctx
+        )
+        if uncertain1 or uncertain2:
+            return False
         if charges1 is None or charges2 is None:
             return True
         if len(charges1) != len(charges2):
@@ -2106,24 +2142,82 @@ class SanitizerStage(BaseStage):
             return DEFAULT_MOLECULE_SIG_QUANT_STEP
         return value
 
+    @staticmethod
+    def _is_int_like(value: float, tol: float = 1e-9) -> bool:
+        """Return True when value is numerically close to an integer."""
+        return abs(value - round(value)) <= tol
+
+    def _extract_atoms_row_charge_value(self, data: str) -> Tuple[Optional[float], bool]:
+        """
+        Extract charge from an [ atoms ] row.
+
+        Supports glued numeric tokens (e.g., '1.234-5.678') and marks uncertain
+        parses instead of failing closed immediately.
+        """
+        parts = data.split()
+        if len(parts) < 6 or not parts[0].isdigit():
+            return None, False
+
+        uncertain = False
+        tail_floats = _extract_floats_from_text(" ".join(parts[5:]))
+        if len(tail_floats) < 1:
+            return None, True
+        if len(tail_floats) > 3:
+            uncertain = True
+
+        token5_floats = _extract_floats_from_text(parts[5]) if len(parts) > 5 else []
+        canonical_charge = tail_floats[1] if len(tail_floats) >= 2 else None
+        charge_value: Optional[float] = None
+
+        # Glued cgnr+charge token (common pathological export).
+        if len(token5_floats) >= 2:
+            charge_value = token5_floats[-1]
+            if canonical_charge is not None and abs(canonical_charge - charge_value) > 1e-12:
+                uncertain = True
+            return charge_value, True
+
+        if len(parts) >= 8:
+            if canonical_charge is None:
+                return None, True
+            return canonical_charge, uncertain
+
+        if len(parts) == 7:
+            if len(token5_floats) == 1 and self._is_int_like(token5_floats[0]):
+                if canonical_charge is None:
+                    return None, True
+                return canonical_charge, uncertain
+            if len(token5_floats) == 1:
+                return token5_floats[0], True
+            if canonical_charge is not None:
+                return canonical_charge, True
+            return None, True
+
+        # 6-token rows are interpreted as no-cgnr forms.
+        if len(token5_floats) == 1:
+            return token5_floats[0], uncertain
+        if canonical_charge is not None:
+            return canonical_charge, True
+        return None, True
+
     def _extract_moleculetype_atom_charges(
         self,
         itp_path: Path,
         mol_name: str,
         ctx: Optional["PipelineContext"] = None,
-    ) -> Optional[List[float]]:
-        """Extract per-atom charges for one moleculetype; fail closed on uncertainty."""
+    ) -> Tuple[Optional[List[float]], bool]:
+        """Extract per-atom charges for one moleculetype with uncertainty signaling."""
         if not itp_path.exists():
-            return None
+            return None, False
         strict_reads = bool(ctx and ctx.strict_include_resolution)
         content = self.safe_read_text(itp_path, strict=strict_reads)
         if not content:
-            return None
+            return None, False
 
         current_section = ""
         current_mol = None
         in_target_mol = False
         charges: List[float] = []
+        charges_uncertain = False
 
         for line in content.splitlines():
             stripped = line.strip()
@@ -2150,28 +2244,18 @@ class SanitizerStage(BaseStage):
                 continue
 
             if data.startswith("#"):
-                return None
+                charges_uncertain = True
+                continue
             if current_section != "atoms":
                 continue
 
-            parts = data.split()
-            if len(parts) < 7 or not parts[0].isdigit():
-                continue
-            charge_value: Optional[float] = None
-            charge_candidates = [6] if len(parts) >= 8 else [6, 5]
-            for idx in charge_candidates:
-                if idx >= len(parts):
-                    continue
-                try:
-                    charge_value = float(parts[idx])
-                    break
-                except (ValueError, TypeError):
-                    continue
+            charge_value, row_uncertain = self._extract_atoms_row_charge_value(data)
+            charges_uncertain = charges_uncertain or row_uncertain
             if charge_value is None:
-                return None
+                continue
             charges.append(charge_value)
 
-        return charges if charges else None
+        return (charges if charges else None), charges_uncertain
     
     def _classify_ionic_moleculetypes(
         self,
@@ -2613,21 +2697,17 @@ class SanitizerStage(BaseStage):
                 parts = data.split()
                 if len(parts) >= 5 and parts[0].isdigit():
                     atom_count += 1
-                    charge_value: Optional[float] = None
-                    if len(parts) >= 7:
-                        charge_candidates = [6] if len(parts) >= 8 else [6, 5]
-                    else:
-                        charge_candidates = [5] if len(parts) >= 6 else []
-                    for idx in charge_candidates:
-                        if idx >= len(parts):
-                            continue
-                        try:
-                            charge_value = float(parts[idx])
-                            break
-                        except (ValueError, TypeError):
-                            continue
+                    charge_value, charge_uncertain = self._extract_atoms_row_charge_value(data)
                     if charge_value is None:
-                        return None
+                        unknown_key = "atoms:charge_unknown"
+                        sections_present.add(unknown_key)
+                        section_line_counts[unknown_key] = section_line_counts.get(unknown_key, 0) + 1
+                        hasher.update(f"{unknown_key}|{' '.join(parts[:5])}\n".encode("utf-8"))
+                        continue
+                    if charge_uncertain:
+                        uncertain_key = "atoms:charge_uncertain"
+                        sections_present.add(uncertain_key)
+                        section_line_counts[uncertain_key] = section_line_counts.get(uncertain_key, 0) + 1
                     raw_q = charge_value
 
                     qmin = raw_q if qmin is None else min(qmin, raw_q)
@@ -2830,9 +2910,6 @@ class SanitizerStage(BaseStage):
             if resolved not in seen_paths:
                 ordered_paths.append(itp_path)
                 seen_paths.add(resolved)
-        # Relaxed assertion: only check for case-insensitive basename collisions
-        # among distinct paths (not duplicates of the same path)
-        self._assert_no_case_insensitive_duplicates(ordered_paths, "sanitized molecule ITPs")
         return ordered_paths
 
     def _validate_system_top_includes(
@@ -2888,14 +2965,14 @@ class SanitizerStage(BaseStage):
             raise ValueError(f"Too few fields for [ atomtypes ] row: '{data}'")
 
         atomtype_name = parts[0]
-        try:
-            p1 = float(parts[-2])
-            p2 = float(parts[-1])
-        except ValueError as exc:
+        lj_tail_floats = _extract_floats_from_text(" ".join(parts[-2:]))
+        if len(lj_tail_floats) != 2:
             raise ValueError(
-                f"Non-numeric LJ params in atomtype '{atomtype_name}': "
-                f"'{parts[-2]}', '{parts[-1]}'"
-            ) from exc
+                f"Ambiguous LJ params in atomtype '{atomtype_name}' at "
+                f"{source_name}:{line_no}. Expected exactly two float values in LJ tail, "
+                f"got {len(lj_tail_floats)}. Raw: {data}"
+            )
+        p1, p2 = lj_tail_floats
 
         ptype = parts[-3].upper()
         if ptype not in PTYPE_TOKENS:
@@ -2914,13 +2991,12 @@ class SanitizerStage(BaseStage):
                 f"{extra_ptypes + [ptype]}. Raw: {data}"
             )
 
-        try:
-            float(parts[-4])  # charge
-            float(parts[-5])  # mass
-        except (ValueError, IndexError) as exc:
+        charge_fields = _extract_floats_from_text(parts[-4]) if len(parts) >= 4 else []
+        mass_fields = _extract_floats_from_text(parts[-5]) if len(parts) >= 5 else []
+        if len(charge_fields) != 1 or len(mass_fields) != 1:
             raise ValueError(
                 f"Malformed mass/charge columns before ptype in {source_name}:{line_no}. Raw: {data}"
-            ) from exc
+            )
 
         return atomtype_name, ptype, p1, p2, None
 
@@ -3596,9 +3672,19 @@ class SanitizerStage(BaseStage):
             return gro_path
         return None
 
-    def _read_gro_coords(self, gro_path: Path) -> Optional[List[Tuple[float, float, float]]]:
-        """Read coordinates from a GRO file (nm). Legacy wrapper."""
-        result = self._parse_gro_file(gro_path)
+    def _read_gro_coords(
+        self,
+        gro_path: Path,
+        retain_resnames: Optional[Set[str]] = None,
+        allow_full_parse: bool = False,
+    ) -> Optional[List[Tuple[float, float, float]]]:
+        """Read GRO coordinates with safe-by-default selective retention."""
+        retain_filter: Optional[Set[str]]
+        if retain_resnames is None:
+            retain_filter = None if allow_full_parse else set()
+        else:
+            retain_filter = {name.upper() for name in retain_resnames}
+        result = self._parse_gro_file(gro_path, retain_resnames=retain_filter)
         if result is None:
             return None
         return [(a.x, a.y, a.z) for a in result.atoms]
@@ -3690,6 +3776,7 @@ class SanitizerStage(BaseStage):
                 atoms: List[GROAtom] = []
                 parse_errors: List[str] = []
                 atoms_parsed_total = 0
+                max_coord_decimals = 0
                 for i in range(natoms_declared):
                     line = handle.readline()
                     if not line:
@@ -3704,9 +3791,16 @@ class SanitizerStage(BaseStage):
                         resnr = int(line[0:5].strip())
                         resname = line[5:10].strip()
                         atomname = line[10:15].strip()
-                        x = float(line[20:28])
-                        y = float(line[28:36])
-                        z = float(line[36:44])
+                        x_token = line[20:28].strip()
+                        y_token = line[28:36].strip()
+                        z_token = line[36:44].strip()
+                        x = float(x_token)
+                        y = float(y_token)
+                        z = float(z_token)
+                        for token in (x_token, y_token, z_token):
+                            decimals = _decimal_places_from_numeric_token(token)
+                            if decimals is not None:
+                                max_coord_decimals = max(max_coord_decimals, decimals)
                         atoms_parsed_total += 1
                         if retain_resnames is None or resname.upper() in retain_resnames:
                             atoms.append(GROAtom(resnr, resname, atomname, x, y, z))
@@ -3770,6 +3864,11 @@ class SanitizerStage(BaseStage):
         box_x = box_floats[0] if len(box_floats) >= 1 else 0.0
         box_y = box_floats[1] if len(box_floats) >= 2 else 0.0
         box_z = box_floats[2] if len(box_floats) >= 3 else 0.0
+        coord_resolution_nm = (
+            10.0 ** (-max_coord_decimals)
+            if max_coord_decimals > 0
+            else DEFAULT_GRO_COORD_RESOLUTION_NM
+        )
         
         return GROParseResult(
             atoms=atoms,
@@ -3777,6 +3876,7 @@ class SanitizerStage(BaseStage):
             box_y=box_y,
             box_z=box_z,
             is_triclinic=is_triclinic,
+            coord_resolution_nm=coord_resolution_nm,
             title=title,
         )
 
@@ -3852,14 +3952,23 @@ class SanitizerStage(BaseStage):
         has_bond_graph = bool(bond_graph)
         if not has_bond_graph:
             _add_reason(reliability_reasons, "bond_graph_missing")
-            _add_reason(reliability_reasons, "fallback_mic_unreliable")
+            _add_reason(reliability_reasons, "dipole_unwrap_requires_bond_graph")
+            _add_reason(skip_reasons, "bond_graph_missing")
             msg = (
                 f"Dipole reliability failure for '{target_itp_name}': "
-                "bond graph is unavailable; atom0-based MIC fallback is not reliable."
+                "bond graph is unavailable; skipping dipole check."
             )
             if ctx and ctx.strict_dipole_check:
                 raise SanitizerError(f"{msg} Disable strict dipole checks or provide bond topology.")
             print(f"  [WARN] {msg} (non-strict mode marks result unreliable)")
+            gro_path = self._find_coords_gro(system_gromacs_dir)
+            return DipoleResult(
+                computed=False,
+                reliable=False,
+                reliability_reasons=reliability_reasons,
+                skip_reasons=skip_reasons,
+                coordinates_file=str(gro_path) if gro_path else None,
+            )
         
         # v4: Giant molecule gating (skip enforcement for large molecules)
         expected_natoms = len(charges_before)
@@ -4029,6 +4138,7 @@ class SanitizerStage(BaseStage):
         percolation_threshold = (
             ctx.dipole_percolation_threshold if ctx else 0.45
         )
+        loop_tol_nm = self._resolve_unwrap_loop_tol_nm(gro_data.coord_resolution_nm)
         
         for group in valid_groups:
             # Fast wrapped-span pre-gate: conservative early skip for obvious spanning groups.
@@ -4045,41 +4155,20 @@ class SanitizerStage(BaseStage):
                     "Continuing with unwrap/percolation checks."
                 )
 
-            if has_bond_graph:
-                coords_list, topo_percolated, topo_msg = self._unwrap_molecule_bond_graph(
-                    group,
-                    box,
-                    bond_graph,
-                )
-                if topo_percolated:
-                    reason = "percolated_topology"
-                    if reason not in skip_reasons:
-                        skip_reasons.append(reason)
-                        _add_reason(reliability_reasons, reason)
-                        detail = f" ({topo_msg})" if topo_msg else ""
-                        print(f"  [INFO] Dipole enforcement gated: {reason}{detail}")
-                    continue
-            else:
-                coords_list, span, percolated = self._unwrap_molecule_pbc_with_span(
-                    group,
-                    box,
-                    early_exit_ratio=percolation_threshold,
-                )
-                if percolated:
-                    max_span_ratio = max(
-                        span[0] / box[0] if box[0] > 0 else 0,
-                        span[1] / box[1] if box[1] > 0 else 0,
-                        span[2] / box[2] if box[2] > 0 else 0,
-                    )
-                    reason = (
-                        f"percolated_unwrapped_span (ratio={max_span_ratio:.2f} > "
-                        f"{percolation_threshold})"
-                    )
-                    if reason not in skip_reasons:
-                        skip_reasons.append(reason)
-                        _add_reason(reliability_reasons, reason)
-                        print(f"  [INFO] Dipole enforcement gated: {reason}")
-                    continue
+            coords_list, topo_percolated, topo_msg = self._unwrap_molecule_bond_graph(
+                group,
+                box,
+                bond_graph,
+                tol_nm=loop_tol_nm,
+            )
+            if topo_percolated:
+                reason = "percolated_topology"
+                if reason not in skip_reasons:
+                    skip_reasons.append(reason)
+                    _add_reason(reliability_reasons, reason)
+                    detail = f" ({topo_msg})" if topo_msg else ""
+                    print(f"  [INFO] Dipole enforcement gated: {reason}{detail}")
+                continue
             if not coords_list:
                 continue
             
@@ -4114,7 +4203,7 @@ class SanitizerStage(BaseStage):
         avg_after = sum(mu_after_mags) / len(mu_after_mags)
         avg_delta = sum(delta_magnitudes) / len(delta_magnitudes)
         max_delta = max(delta_magnitudes)
-        reliable = has_bond_graph and not skip_reasons and not reliability_reasons
+        reliable = not skip_reasons and not reliability_reasons
         
         # Use average delta as the primary metric
         return DipoleResult(
@@ -4232,11 +4321,40 @@ class SanitizerStage(BaseStage):
         span = (max_x - min_x, max_y - min_y, max_z - min_z)
         return coords, span, False
 
+    def _resolve_unwrap_loop_tol_nm(self, base_resolution_nm: Optional[float]) -> float:
+        """
+        Resolve unwrap loop-consistency tolerance in nm.
+
+        Precedence:
+        1) Env override: GPE_UNWRAP_LOOP_TOL_NM
+        2) Derived default: max(base_resolution_nm * UNWRAP_LOOP_TOL_FACTOR, 1e-6)
+        """
+        raw = os.environ.get(GPE_UNWRAP_LOOP_TOL_NM_ENV, "").strip()
+        if raw:
+            try:
+                value = float(raw)
+                if math.isfinite(value) and value > 0:
+                    return value
+            except ValueError:
+                pass
+            print(
+                f"  [WARN] Invalid {GPE_UNWRAP_LOOP_TOL_NM_ENV}={raw!r}; "
+                "falling back to derived tolerance."
+            )
+
+        resolution = (
+            base_resolution_nm
+            if base_resolution_nm is not None and base_resolution_nm > 0
+            else DEFAULT_GRO_COORD_RESOLUTION_NM
+        )
+        return max(resolution * UNWRAP_LOOP_TOL_FACTOR, 1e-6)
+
     def _unwrap_molecule_bond_graph(
         self,
         atoms: List[GROAtom],
         box: Tuple[float, float, float],
         bond_graph: Dict[int, Set[int]],
+        tol_nm: Optional[float] = None,
     ) -> Tuple[Optional[List[Tuple[float, float, float]]], bool, Optional[str]]:
         """
         Unwrap coordinates via bond-graph traversal and detect topology percolation.
@@ -4265,7 +4383,7 @@ class SanitizerStage(BaseStage):
 
         unwrapped: Dict[int, Tuple[float, float, float]] = {}
         images: Dict[int, Tuple[int, int, int]] = {}
-        tol = 1e-6
+        tol = tol_nm if tol_nm is not None and tol_nm > 0 else 1e-6
 
         for root in range(1, natoms + 1):
             if root in unwrapped:
@@ -4487,7 +4605,10 @@ class SanitizerStage(BaseStage):
         mdp_path = self._select_mdp_for_preprocess(ctx, workdir)
         pp_path = self._grompp_preprocessed_top_path(output_dir)
         tpr_path = workdir / "preprocess.tpr"
-        gmx_tokens = shlex.split(str(gmx_exe)) if isinstance(gmx_exe, str) else [str(gmx_exe)]
+        resolved_gmx_cmd = str(gmx_exe).strip() if gmx_exe is not None else ""
+        if not resolved_gmx_cmd:
+            resolved_gmx_cmd = resolve_gmx_command(ctx)
+        gmx_tokens = shlex.split(resolved_gmx_cmd) if resolved_gmx_cmd else []
         if not gmx_tokens:
             print("  [WARN] Empty GROMACS command for grompp preprocess")
             return None
@@ -4646,9 +4767,11 @@ class SanitizerStage(BaseStage):
                 "complexity_metrics": complexity_metrics,
                 "gro_atoms": gro_atoms,
                 "expected_atoms": expected_atoms,
-                "gmx_cmd": gmx_exe,
+                "gmx_cmd": resolved_gmx_cmd,
+                "debug_logs": attempt_logs,
+                "debug_logs_excluded_from_fingerprints": True,
             })
-        
+
         return expected_atoms
     
     def _estimate_topology_complexity(
