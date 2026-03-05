@@ -2,9 +2,9 @@
 Sanitizer stage orchestrator extracted from sanitizer.py.
 """
 
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 import os
 
 from .base import BaseStage
@@ -48,6 +48,52 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
     @property
     def output_subdir(self) -> str:
         return "02_5_sanitizer"
+
+    @staticmethod
+    def _path_identity(path: Path) -> str:
+        """Stable path identity for dedup/map keys."""
+        try:
+            return str(path.resolve(strict=False))
+        except OSError:
+            return str(path.absolute())
+
+    @classmethod
+    def _manifest_safe_value(cls, value: Any) -> Any:
+        """Convert values to manifest-safe JSON-like structures."""
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {
+                str(k): cls._manifest_safe_value(v)
+                for k, v in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [cls._manifest_safe_value(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    @classmethod
+    def _serialize_manifest_entry(cls, obj: Any) -> Dict[str, Any]:
+        """Safely serialize include-resolution/diagnostic entries."""
+        if is_dataclass(obj):
+            raw = asdict(obj)
+        elif isinstance(obj, dict):
+            raw = obj
+        elif hasattr(obj, "__dict__"):
+            raw = {
+                key: value
+                for key, value in vars(obj).items()
+                if not key.startswith("_")
+            }
+        else:
+            return {"value": cls._manifest_safe_value(obj)}
+        if not isinstance(raw, dict):
+            return {"value": cls._manifest_safe_value(raw)}
+        return {
+            str(key): cls._manifest_safe_value(value)
+            for key, value in raw.items()
+        }
     
     def run(self, ctx: "PipelineContext") -> bool:
         """
@@ -59,7 +105,6 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
         from ..itp_sanitizer import (
             ItpSanitizer,
             ItpSanitizerError,
-            ItpParser,
             generate_system_top,
         )
         from ..charge_neutrality import (
@@ -108,68 +153,79 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
         top_path = system_gromacs_dir / "top" / "system.top"
         top_parse = self._get_ordered_molecules_from_top(top_path)
         ordered_molecules = top_parse.ordered
+        top_exists = top_path.exists()
+        output_dir = self.get_output_dir(ctx)
         molecule_count_source: Dict[str, Any] = {
             "raw_top_path": str(top_path),
+            "raw_top_exists": bool(top_exists),
             "raw_top_uncertain": bool(top_parse.uncertain),
             "raw_top_uncertainty_reasons": list(top_parse.uncertainty_reasons),
             "source": None,
             "fallback_used": False,
+            "trusted": False,
         }
 
-        if top_parse.uncertain and top_path.exists():
-            print(
-                "  [WARN] Raw [molecules] parse is uncertain due to conditional directives. "
-                "Preferring grompp -pp preprocessed topology."
-            )
+        if top_exists and (top_parse.uncertain or not ordered_molecules):
+            if top_parse.uncertain:
+                print(
+                    "  [WARN] Raw [molecules] parse is uncertain due to conditional directives. "
+                    "Requiring grompp -pp preprocessed topology for trusted counts."
+                )
+            else:
+                print(
+                    "  [WARN] system.top exists but [molecules] could not be parsed. "
+                    "Requiring grompp -pp preprocessed topology for trusted counts."
+                )
             gro_for_pp = self._find_coords_gro(system_gromacs_dir)
-            preprocessed_molecules: List[Tuple[str, int]] = []
-            if gro_for_pp is not None:
-                try:
-                    self._expected_atoms_from_grompp(
-                        gmx_exe=resolve_gmx_command(ctx),
-                        system_top_path=top_path,
-                        gro_path=gro_for_pp,
-                        output_dir=self.get_output_dir(ctx),
-                        ctx=ctx,
-                    )
-                except SanitizerError as exc:
-                    print(
-                        "  [WARN] Unable to preprocess topology for uncertain [molecules] parse: "
-                        f"{exc}"
-                    )
-                pp_path = self._grompp_preprocessed_top_path(self.get_output_dir(ctx))
-                preprocessed_molecules = self._parse_preprocessed_molecules(pp_path)
+            if gro_for_pp is None:
+                raise SanitizerError(
+                    "Cannot derive trusted [molecules] counts: system.top is present but raw parsing "
+                    "is not trustworthy and no coordinate GRO is available for grompp -pp preprocessing."
+                )
+            try:
+                self._expected_atoms_from_grompp(
+                    gmx_exe=resolve_gmx_command(ctx),
+                    system_top_path=top_path,
+                    gro_path=gro_for_pp,
+                    output_dir=output_dir,
+                    ctx=ctx,
+                )
+            except SanitizerError as exc:
+                print(
+                    "  [WARN] Unable to preprocess topology for trusted [molecules] extraction: "
+                    f"{exc}"
+                )
+            pp_path = self._grompp_preprocessed_top_path(output_dir)
+            preprocessed_molecules = self._parse_preprocessed_molecules(pp_path)
+            molecule_count_source["preprocessed_top_path"] = str(pp_path)
             if preprocessed_molecules:
                 ordered_molecules = preprocessed_molecules
                 molecule_counts = {name: count for name, count in ordered_molecules}
-                htpolynet_molecules_present = True
                 molecule_count_source["source"] = "grompp_preprocessed_top"
                 molecule_count_source["raw_top_used"] = False
+                molecule_count_source["trusted"] = True
                 print("  Using [molecules] from grompp -pp preprocessed topology")
             else:
-                molecule_counts = self._get_molecule_counts(ctx)
-                ordered_molecules = list(molecule_counts.items())
-                htpolynet_molecules_present = False
-                molecule_count_source["source"] = "manifest_fallback_after_uncertain_raw_top"
-                molecule_count_source["fallback_used"] = True
-                molecule_count_source["raw_top_used"] = False
-                print(
-                    "  [WARN] Could not obtain trusted preprocessed [molecules]; "
-                    "falling back to manifest counts (marked uncertain)."
+                raise SanitizerError(
+                    "Cannot derive trusted [molecules] counts for staged topology.\n"
+                    f"  system.top: {top_path}\n"
+                    f"  preprocessed_top: {pp_path}\n"
+                    "Raw [molecules] parsing is uncertain or empty, and grompp -pp did not yield "
+                    "trusted counts. Refusing fallback to manifest pre-reaction counts."
                 )
         elif ordered_molecules:
             molecule_counts = {name: count for name, count in ordered_molecules}
-            htpolynet_molecules_present = True
             molecule_count_source["source"] = "raw_system_top"
             molecule_count_source["raw_top_used"] = True
+            molecule_count_source["trusted"] = True
             print("  Using [molecules] from HTPolyNet-staged system.top")
         else:
             molecule_counts = self._get_molecule_counts(ctx)
             ordered_molecules = list(molecule_counts.items())
-            htpolynet_molecules_present = False
             molecule_count_source["source"] = "manifest"
             molecule_count_source["fallback_used"] = True
             molecule_count_source["raw_top_used"] = False
+            molecule_count_source["trusted"] = bool(ordered_molecules)
             print("  Using [molecules] from manifest (pre-reaction counts)")
         self._molecule_count_source = molecule_count_source
         
@@ -187,57 +243,24 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
         if ff_gromacs_dir.exists():
             ff_itps = self._sorted_paths_casefold(ff_gromacs_dir.glob("*.itp"))
             for itp in ff_itps:
+                itp_key = self._path_identity(itp)
+                if itp_key in ff_map:
+                    continue
                 itp_paths.append(itp)
-                ff_map[str(itp)] = ctx.ff  # Only FF files get ctx.ff
-                class_map[str(itp)] = "forcefield"
+                ff_map[itp_key] = ctx.ff  # Only FF files get ctx.ff
+                class_map[itp_key] = "forcefield"
                 print(f"    + FF: {itp.name}")
-            
-            # Resolve includes from forcefield files
-            for itp in ff_itps:
-                include_dirs = self._build_include_search_paths(ctx, itp)
-                includes = ItpParser.resolve_includes(
-                    itp,
-                    include_dirs=include_dirs,
-                    strict=ctx.strict_include_resolution,
-                    diagnostics=self.diagnostics,
-                    check_shadowing=True,
-                    allow_shadowing=ctx.allow_include_shadowing,
-                )
-                allow_escape = bool(
-                    getattr(ctx, "allow_unsafe_include_escape", DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE)
-                )
-                allowed_roots = self._include_allowed_roots(
-                    including_file=itp,
-                    include_dirs=include_dirs,
-                    ctx=ctx,
-                )
-                for inc in includes:
-                    if not allow_escape and not self._include_path_allowed(inc.resolve(), allowed_roots):
-                        roots_text = ", ".join(str(r) for r in allowed_roots) or "(none)"
-                        msg = (
-                            f"Blocked include escape '{inc}' while scanning {itp.name}.\n"
-                            f"  Allowed roots: {roots_text}\n"
-                            "Use --allow-unsafe-include-escape to override."
-                        )
-                        if ctx.strict_include_resolution:
-                            raise SanitizerError(msg)
-                        print(f"  [WARN] {msg}")
-                        continue
-                    if str(inc) not in ff_map:
-                        itp_paths.append(inc)
-                        ff_map[str(inc)] = ctx.ff
-                        class_map[str(inc)] = "forcefield"
-                        print(f"    + FF (included): {inc.name}")
         
         # 2. Staged system ITPs from gromacs/itp/
         staged_itp_dir = system_gromacs_dir / "itp"
         if staged_itp_dir.exists():
             staged_itps = self._sorted_paths_casefold(staged_itp_dir.glob("*.itp"))
             for itp in staged_itps:
-                if str(itp) not in ff_map:  # Avoid duplicates
+                itp_key = self._path_identity(itp)
+                if itp_key not in ff_map:  # Avoid duplicates
                     itp_paths.append(itp)
-                    ff_map[str(itp)] = "UNKNOWN"  # Not from forcefield
-                    class_map[str(itp)] = "staged"
+                    ff_map[itp_key] = "UNKNOWN"  # Not from forcefield
+                    class_map[itp_key] = "staged"
                     print(f"    + Staged: {itp.name}")
         
         # 3. HTPolyNet produced ITPs
@@ -245,10 +268,11 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
         if htpolynet_itp_dir.exists():
             htpolynet_itps = self._sorted_paths_casefold(htpolynet_itp_dir.glob("*.itp"))
             for itp in htpolynet_itps:
-                if str(itp) not in ff_map:  # Avoid duplicates
+                itp_key = self._path_identity(itp)
+                if itp_key not in ff_map:  # Avoid duplicates
                     itp_paths.append(itp)
-                    ff_map[str(itp)] = "UNKNOWN"  # From HTPolyNet, not FF library
-                    class_map[str(itp)] = "htpolynet"
+                    ff_map[itp_key] = "UNKNOWN"  # From HTPolyNet, not FF library
+                    class_map[itp_key] = "htpolynet"
                     print(f"    + HTPolyNet: {itp.name}")
         
         # 4. Molecule ITPs (molecules library)
@@ -262,7 +286,8 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 if mol_itp_dir.exists():
                     mol_itps = self._sorted_paths_casefold(mol_itp_dir.glob("*.itp"))
                     for itp in mol_itps:
-                        if str(itp) in ff_map:
+                        itp_key = self._path_identity(itp)
+                        if itp_key in ff_map:
                             continue
                         mol_names = self._get_moleculetype_names(itp, ctx=ctx)
                         matched_names = sorted(
@@ -275,10 +300,10 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                         )
                         if not matched_names:
                             continue
-                        if str(itp) not in ff_map:
+                        if itp_key not in ff_map:
                             itp_paths.append(itp)
-                            ff_map[str(itp)] = "UNKNOWN"
-                            class_map[str(itp)] = "molecule"
+                            ff_map[itp_key] = "UNKNOWN"
+                            class_map[itp_key] = "molecule"
                             print(
                                 f"    + Molecules-lib {','.join(matched_names)}: {itp.name}"
                             )
@@ -380,6 +405,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
             atomtype_prefix=atomtype_prefix,
             strict_charge=strict_charge,
         )
+        mixed_defaults_warnings: List[str] = []
         
         try:
             # Run sanitization
@@ -414,17 +440,21 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 print(f"  [ defaults ] comb-rule: {result.defaults_used.comb_rule}")
             if getattr(result, "mixed_defaults_detected", False):
                 defaults_report = getattr(result, "mixed_defaults_report", {})
-                print("  [WARN] Mixed [defaults] tuples detected in sources.")
-                print(
-                    "  [WARN] Classification: "
-                    f"{defaults_report.get('classification', 'unknown')} "
-                    f"(fields: {defaults_report.get('differing_fields', [])})"
+                mixed_defaults_warnings.append(
+                    "Mixed [defaults] tuples detected; this is an unsafe topology mode."
                 )
-                print(
-                    "  [WARN] Primary policy: "
+                mixed_defaults_warnings.append(
+                    "Mixed defaults classification="
+                    f"{defaults_report.get('classification', 'unknown')}, "
+                    f"differing_fields={defaults_report.get('differing_fields', [])}"
+                )
+                mixed_defaults_warnings.append(
+                    "Mixed defaults chosen_policy="
                     f"{defaults_report.get('chosen_policy', 'unknown')}, "
-                    f"primary={defaults_report.get('primary_defaults_signature', 'n/a')}"
+                    f"primary_signature={defaults_report.get('primary_defaults_signature', 'n/a')}"
                 )
+                for warning in mixed_defaults_warnings:
+                    print(f"  [WARN] {warning}")
                 if getattr(ctx, "allow_mixed_defaults", False):
                     print("  [WARN] Continuing due to explicit unsafe override (--allow-mixed-defaults).")
                     print(
@@ -465,6 +495,36 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
             )
         if getattr(result, "defaults_guessed", False):
             print("  [WARN] Using fallback [ defaults ] per ctx.allow_default_defaults")
+        if bool(getattr(ctx, "allow_mixed_defaults", False)) and bool(
+            getattr(result, "mixed_defaults_detected", False)
+        ):
+            cross_group_summary = getattr(result, "nonbond_params_cross_group_summary", {})
+            policy = (
+                cross_group_summary.get("policy")
+                if isinstance(cross_group_summary, dict)
+                else None
+            )
+            status = (
+                cross_group_summary.get("status")
+                if isinstance(cross_group_summary, dict)
+                else None
+            )
+            cross_group_current = getattr(
+                result, "nonbond_params_cross_group_current_path", None
+            )
+            if policy == "generate":
+                if not cross_group_current:
+                    raise SanitizerError(
+                        "Mixed [defaults] override requested cross-group remediation (policy=generate) "
+                        "but no nonbond_params cross-group include was produced."
+                    )
+                cross_group_path = Path(cross_group_current)
+                if not cross_group_path.exists():
+                    raise SanitizerError(
+                        "Mixed [defaults] cross-group remediation include path is missing on disk.\n"
+                        f"  expected: {cross_group_path}\n"
+                        f"  status: {status}"
+                    )
         
         cross_ff_conflicts = [
             c for c in result.conflicts_detected
@@ -482,6 +542,8 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
         # v4: Pass comb_rule for comb-rule-aware LJ outlier detection
         comb_rule = result.defaults_used.comb_rule if result.defaults_used else None
         outlier_warnings = self._warn_atomtype_outliers(result.combined_atomtypes_current_path, ctx, comb_rule)
+        if outlier_warnings:
+            print(f"  [WARN] LJ outlier warnings: {len(outlier_warnings)}")
         
         # v4 Issue 3: Invoke gen-pairs/[pairs] consistency check
         # Scan all source ITPs (not just sanitized_files) to catch FF/staged/htpolynet-derived pairs
@@ -506,6 +568,22 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
             needed_molecule_names,
             ctx=ctx,
         )
+        active_molecule_names = sorted(needed_molecule_names, key=str.casefold)
+        if active_molecule_names and not sanitized_molecule_itp_paths:
+            if not result.sanitized_current_dir.exists():
+                raise SanitizerError(
+                    "Charge neutrality check cannot run: active molecules are present but "
+                    "sanitized ITP output directory is missing.\n"
+                    f"  active_molecules: {active_molecule_names}\n"
+                    f"  expected_dir: {result.sanitized_current_dir}"
+                )
+            raise SanitizerError(
+                "Charge neutrality check cannot run: active molecules are present but "
+                "sanitized molecule-to-ITP mapping is empty.\n"
+                f"  active_molecules: {active_molecule_names}\n"
+                f"  sanitized_dir: {result.sanitized_current_dir}\n"
+                "Ensure sanitizer outputs include moleculetype definitions for all active molecules."
+            )
         
         if sanitized_molecule_itp_paths:
             print("  Running charge neutrality preflight...")
@@ -530,10 +608,6 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
             ion_classifications = self._classify_ionic_moleculetypes(
                 sanitized_molecule_itp_paths, ctx
             )
-
-            class_by_casefold = {
-                name.casefold(): cls for name, cls in ion_classifications.items()
-            }
             protected_classes = {
                 "protected_ion",
                 "ionic",
@@ -699,7 +773,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                         correction_result.max_delta_applied > max_delta_limit
                     ):
                         raise SanitizerError(
-                            f"Charge correction exceeds per-atom limit: |螖q|={correction_result.max_delta_applied:.3e} "
+                            f"Charge correction exceeds per-atom limit: |Δq|={correction_result.max_delta_applied:.3e} "
                             f"> {max_delta_limit:.3e} (limit used)"
                         )
                     # v4 Issue 5: Use abs(total_delta) and guard for None
@@ -708,7 +782,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                         and abs(correction_result.total_delta) > max_total_limit
                     ):
                         raise SanitizerError(
-                            f"Charge correction exceeds total limit: |螖Q|={abs(correction_result.total_delta):.3e} "
+                            f"Charge correction exceeds total limit: |ΔQ|={abs(correction_result.total_delta):.3e} "
                             f"> {max_total_limit:.3e} (limit used)"
                         )
                     
@@ -750,14 +824,14 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                             )
                             print(
                                 "  Dipole shift summary: "
-                                f"avg |螖渭|={dipole_info.delta_dipole_debye:.4f} D, "
-                                f"max |螖渭|={max_delta_val:.4f} D"
+                                f"avg |Δμ|={dipole_info.delta_dipole_debye:.4f} D, "
+                                f"max |Δμ|={max_delta_val:.4f} D"
                             )
                             # v4: Dipole check is heuristic by default
                             # Only hard-fail if strict_dipole_check=True AND no gating reasons
                             if dipole_info.delta_dipole_debye > dipole_limit:
                                 msg = (
-                                    f"Dipole shift |螖渭|={dipole_info.delta_dipole_debye:.4f} D exceeds "
+                                    f"Dipole shift |Δμ|={dipole_info.delta_dipole_debye:.4f} D exceeds "
                                     f"limit {dipole_limit:.4f} D"
                                 )
                                 # Check gating: skip enforcement for giant/percolated molecules
@@ -812,7 +886,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 print(f"  [FAIL] {e}")
                 raise SanitizerError(str(e))
         else:
-            print("  [SKIP] Charge neutrality check (no molecule ITPs)")
+            print("  [SKIP] Charge neutrality check (no active molecules in [molecules])")
         
         # === Validate GRO/TOP consistency ===
         # Fail fast if coordinate file doesn't match topology molecule counts
@@ -861,13 +935,15 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 Path(os.path.relpath(secondary_nonbond_current, top_dir)).as_posix()
             )
         
-        # Check if HTPolyNet-staged system.top already exists
-        # If so, preserve its [molecules] section and only update includes
-        self._system_top_update_status = {
-            "mode": "generated_new",
-            "degraded": False,
-        }
-        if system_top_path.exists() and htpolynet_molecules_present:
+        existing_top_before = system_top_path.exists()
+        molecule_source_used = molecule_count_source.get("source")
+        preserve_existing_molecules = (
+            existing_top_before and molecule_source_used == "raw_system_top"
+        )
+        update_strategy = "generated_from_trusted_counts"
+        strategy_details: Dict[str, Any] = {}
+        strategy_degraded = False
+        if preserve_existing_molecules:
             print(f"  Updating existing system.top (preserving [molecules] section)...")
             top_content = self._update_system_top_includes(
                 existing_top=system_top_path,
@@ -879,7 +955,15 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 ctx=ctx,
                 extra_includes=extra_includes,
             )
+            strategy_details = dict(getattr(self, "_system_top_update_status", {}))
+            update_strategy = str(strategy_details.get("mode", "updated_existing_block"))
+            strategy_degraded = bool(strategy_details.get("degraded", False))
         else:
+            if existing_top_before and molecule_source_used != "raw_system_top":
+                print(
+                    "  Rebuilding existing system.top from trusted molecule-count source "
+                    f"'{molecule_source_used}' to avoid stale [molecules] state."
+                )
             # Generate new system.top with proper include order
             top_content = generate_system_top(
                 combined_atomtypes_path=result.combined_atomtypes_current_path,
@@ -905,12 +989,22 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
         previous_top = ""
         if system_top_path.exists():
             previous_top = self.safe_read_text(system_top_path, strict=True)
-        if previous_top != top_content:
+        top_changed = previous_top != top_content
+        if top_changed:
             self._atomic_write_text(system_top_path, top_content, encoding="utf-8")
             print(f"  Wrote: {system_top_path}")
         else:
             print(f"  system.top unchanged: {system_top_path}")
         self._validate_system_top_includes(system_top_path, ctx)
+        self._system_top_update_status = {
+            "mode": "updated_existing" if existing_top_before else "generated_new",
+            "strategy": update_strategy,
+            "degraded": bool(strategy_degraded),
+            "changed": bool(top_changed),
+            "molecule_count_source": molecule_source_used,
+            "preserved_existing_molecules": bool(preserve_existing_molecules),
+            "strategy_details": strategy_details,
+        }
         
         # === Record in manifest ===
         
@@ -1119,11 +1213,25 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                     "warnings": [str(w) for w in result.charge_warnings],
                 }
             )
+            ctx.manifest.set_sanitizer_output(
+                "lj_outlier_warnings",
+                {
+                    "count": len(outlier_warnings),
+                    "warnings": outlier_warnings,
+                },
+            )
+            ctx.manifest.set_sanitizer_output(
+                "mixed_defaults_warnings",
+                {
+                    "count": len(mixed_defaults_warnings),
+                    "warnings": mixed_defaults_warnings,
+                },
+            )
             
             # v5 Hardening: Include resolution report (Issue 1)
             ctx.manifest.set_sanitizer_output(
                 "include_resolution",
-                [asdict(d) for d in self.diagnostics]
+                [self._serialize_manifest_entry(d) for d in self.diagnostics]
             )
             ctx.manifest.save()
         
@@ -1139,6 +1247,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
             f"Conflicts: {len(result.conflicts_detected)}",
             f"Overridden: {len(result.conflicts_overridden)}",
             f"Charge warnings: {len(result.charge_warnings)}",
+            f"LJ outlier warnings: {len(outlier_warnings)}",
         ]
         
         if result.defaults_used:
@@ -1178,6 +1287,14 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 f"strategy={prefix_summary.get('applied_strategy')}, "
                 f"effective_prefix={prefix_summary.get('effective_prefix')}"
             )
+        if mixed_defaults_warnings:
+            log_lines.append("Mixed defaults safety warnings:")
+            for warning in mixed_defaults_warnings:
+                log_lines.append(f"  - {warning}")
+        if outlier_warnings:
+            log_lines.append("LJ outlier details:")
+            for warning in outlier_warnings:
+                log_lines.append(f"  - {warning}")
         
         if result.conflicts_overridden:
             log_lines.append("\nOverridden conflicts (winner selected by priority):")

@@ -16,6 +16,7 @@ import shutil
 import uuid
 
 from ..manifest import _best_effort_fsync, _best_effort_fsync_dir
+from ..itp_sanitizer import IncludeResolution
 
 if TYPE_CHECKING:
     from ..context import PipelineContext

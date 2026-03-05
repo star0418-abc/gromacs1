@@ -649,6 +649,7 @@ Module layout:
   - Ambiguity is handled at actual include resolution time using configured search order.
   - Sanitized output materializes only the resolved include winner for a given include target; shadowed losers are not written.
 - **Coverage**: The same resolver/shadowing policy is applied to forcefield and non-forcefield include-closure expansion (not just top-level forcefield files).
+- **Single enforcement path**: include policy checks (roots/escape/shadowing/strictness) are enforced through one include-closure expansion path; forcefield and non-forcefield files use identical policy semantics.
 - **Priority**: Search order is configurable via `--itp-include-dirs-priority`.
   - `forcefield_first` (default; legacy alias: `last`): Local > System > FF > User.
   - `sanitized_first` (legacy alias: `first`): Local > User > System > FF.
@@ -656,6 +657,7 @@ Module layout:
 
 ### Charge Neutrality Protection
 Solvents, ions, and protected polymers are guarded against accidental charge correction modification.
+- **Active-molecule gate**: charge-neutrality checks are skipped only when `[molecules]` has no active species (`count <= 0` for all rows). If active molecules exist but sanitized molecule-to-ITP mapping is missing/empty, sanitizer fails fast with actionable diagnostics.
 - **Rounding-only default policy**:
   - Auto-correction is allowed only when all active moleculetype charges satisfy `d = |Q_mol - round(Q_mol)| <= tol`.
   - `tol` is controlled by `--charge-fix-moleculetype-rounding-tol` (default `1e-4`).
@@ -692,6 +694,10 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
   - Dipole correction for triclinic boxes is NOT supported (safe failure) to prevent artifacts.
 
 ### Robustness
+- **Molecule-count source-of-truth**:
+  - If staged `system.top` `[molecules]` parsing is uncertain/empty, sanitizer requires `grompp -pp` preprocessed `[molecules]` for trusted counts.
+  - For staged/post-reaction topologies, sanitizer no longer silently falls back to manifest pre-reaction counts when trusted topology counts are unavailable.
+  - `system.top` preserves existing `[molecules]` only when trusted raw staged `[molecules]` is used; otherwise it is regenerated from the trusted source used for validation.
 - **Grompp Timeout**: Preprocessing (finding atoms) has an adaptive timeout logic.
   - Retries once with extended duration.
   - Configurable via `GMX_GROMPP_PP_TIMEOUT_S` env var or `--grompp-preprocess-timeout-s`.
@@ -1036,7 +1042,7 @@ The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, d
 3. **Defaults Validation**: Ensures all `[ defaults ]` tuples are consistent across all reachable sources (`nbfunc/comb-rule/gen-pairs/fudgeLJ/fudgeQQ`)
 4. **Combined Atomtypes**: Generates a single `combined_atomtypes_current.itp` with all unique atomtypes
 5. **Sanitized ITPs**: Removes `[ atomtypes ]` and `[ defaults ]` from individual ITPs
-6. **system.top Generation**: Creates topology with correct include order (defaults 鈫?atomtypes 鈫?extra includes 鈫?molecules), while avoiding duplicate `[ defaults ]` injection when existing `system.top` already has defaults/forcefield include
+6. **system.top Generation**: Creates topology with correct include order (defaults 鈫?atomtypes 鈫?extra includes 鈫?molecules), while avoiding duplicate `[ defaults ]` injection when existing `system.top` already has defaults/forcefield include; existing `[molecules]` is preserved only when raw staged `[molecules]` was the trusted source
 7. **Molecule Scope**: `system.top` includes only molecule ITPs for species present in `[molecules]` (include-aware moleculetype detection)
 8. **Include Integrity**: Resolves `#include` targets like GROMACS `-I`, detects shadowing in strict mode, sanitizes include-closure files with `[ defaults ]`/`[ atomtypes ]`, validates paths on disk, and writes winner-only sanitized files for include-target collisions
 
@@ -1104,6 +1110,7 @@ Atomtype conflicts are detected based on **physical parameters only**:
   - `--mixed-defaults-cross-group-max-pairs N` (default: `20000`, hard cap)
   - `--mixed-defaults-cross-group-reason "TEXT"` (required when policy=`generate`)
 - `generate` writes sanitizer-managed `nonbond_params_cross_group_current.itp` and includes it in `system.top`.
+- When policy=`generate`, sanitizer verifies the expected cross-group artifact path exists before continuing; missing remediation artifacts are treated as hard failures.
 - Existing explicit `pairtypes` / `nonbond_params` pairs are never overwritten; generated pairs skip preexisting entries and are reported.
 
 ### Limitations: Mixed Forcefields & Combination Rules
