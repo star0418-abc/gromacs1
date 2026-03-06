@@ -626,6 +626,81 @@ def test_update_system_top_includes_non_strict_collapses_multiple_blocks_without
     assert "old_b.itp" not in updated
 
 
+def test_update_system_top_includes_non_strict_rebuilds_safe_malformed_managed_fragments(
+    tmp_path,
+    capsys,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "#include \"oplsaa.ff/forcefield.itp\"\n"
+        f"{SANITIZER_BLOCK_BEGIN}\n"
+        "#include \"old_combined.itp\"\n"
+        f"{SANITIZER_BLOCK_END}\n"
+        f"{SANITIZER_BLOCK_END}\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    updated = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_itp],
+        top_dir=existing_top.parent,
+        ctx=ctx,
+    )
+
+    assert "Malformed sanitizer managed markers in system.top" in capsys.readouterr().out
+    assert updated.count(SANITIZER_BLOCK_BEGIN) == 1
+    assert updated.count(SANITIZER_BLOCK_END) == 1
+    assert "old_combined.itp" not in updated
+    assert '#include "combined_atomtypes_current.itp"' in updated
+    assert '#include "../itp/A.itp"' in updated
+    assert "[ system ]\nDemo" in updated
+
+
+def test_update_system_top_includes_non_strict_fails_closed_on_unsafe_malformed_managed_fragments(
+    tmp_path,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "#include \"oplsaa.ff/forcefield.itp\"\n"
+        f"{SANITIZER_BLOCK_BEGIN}\n"
+        "#include \"old_combined.itp\"\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    with pytest.raises(
+        SanitizerError,
+        match="Cannot safely rebuild non-strict system.top because malformed managed-block fragments overlap non-managed topology content",
+    ):
+        sanitizer._update_system_top_includes(
+            existing_top,
+            combined_atomtypes,
+            [molecule_itp],
+            top_dir=existing_top.parent,
+            ctx=ctx,
+        )
+
+
 def test_uncertain_same_name_conflict_fails_closed_in_strict_mode(tmp_path):
     sanitizer = DummySanitizer()
     ctx = DummyContext(tmp_path, strict_charge_neutrality=True)

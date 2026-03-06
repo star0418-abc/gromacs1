@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pipeline.itp_sanitizer import AtomtypeEntry, DefaultsEntry, ItpSanitizer
+from pipeline.itp_sanitizer import AtomtypeEntry, DefaultsEntry, ItpSanitizer, generate_system_top
 from pipeline.stages.sanitizer_stage import SanitizerError, SanitizerStage
 
 
@@ -521,3 +521,47 @@ def test_generate_cross_group_nonbond_params_produces_current_artifact(tmp_path)
     assert "AA" in content
     assert "BB" in content
     assert not list(tmp_path.glob(".nonbond_params_cross_group_current.itp.tmp.*"))
+
+
+def test_generate_system_top_dedupes_and_orders_extra_and_molecule_includes(tmp_path):
+    top_dir = tmp_path / "gromacs/top"
+    combined_atomtypes = top_dir / "combined_atomtypes_current.itp"
+    molecule_a = tmp_path / "gromacs/itp/A.itp"
+    molecule_b = tmp_path / "gromacs/itp/B.itp"
+    _write(combined_atomtypes, "[ atomtypes ]\n")
+    _write(molecule_a, "[ moleculetype ]\nA 3\n")
+    _write(molecule_b, "[ moleculetype ]\nB 3\n")
+
+    content = generate_system_top(
+        combined_atomtypes_path=combined_atomtypes,
+        sanitized_itp_paths=[molecule_a, molecule_b, molecule_a],
+        molecule_itp_files=[molecule_b, molecule_a, molecule_a],
+        system_name="SYS",
+        molecule_counts={"B": 1, "A": 2},
+        defaults=DefaultsEntry(
+            nbfunc=1,
+            comb_rule=2,
+            gen_pairs="yes",
+            fudge_lj=0.5,
+            fudge_qq=0.8333,
+            source_file=str(combined_atomtypes),
+        ),
+        top_dir=top_dir,
+        extra_includes=[
+            "prefix_injected_types_current.itp",
+            "nonbond_params_cross_group_current.itp",
+            "prefix_injected_types_current.itp",
+            "nonbond_params_secondary_current.itp",
+        ],
+    )
+
+    assert content.count('prefix_injected_types_current.itp') == 1
+    assert content.count('nonbond_params_cross_group_current.itp') == 1
+    assert content.count('nonbond_params_secondary_current.itp') == 1
+    assert content.count('#include "../itp/B.itp"') == 1
+    assert content.count('#include "../itp/A.itp"') == 1
+    assert content.index('combined_atomtypes_current.itp') < content.index('prefix_injected_types_current.itp')
+    assert content.index('prefix_injected_types_current.itp') < content.index('nonbond_params_cross_group_current.itp')
+    assert content.index('nonbond_params_cross_group_current.itp') < content.index('nonbond_params_secondary_current.itp')
+    assert content.index('nonbond_params_secondary_current.itp') < content.index('../itp/B.itp')
+    assert content.index('../itp/B.itp') < content.index('../itp/A.itp')

@@ -1456,7 +1456,7 @@ The Sanitizer now uses **sentinel-block based updates** to preserve custom conte
 - Sanitizer does not attempt broad macro-block parsing to find a "smart" insertion point
 - If **multiple blocks** are found, the sanitizer replaces all managed blocks with one clean block (strict mode via `--strict-top-update` or `--strict-include-resolution` fails fast)
 - If markers are **malformed** (unmatched or misordered), strict mode (`--strict-top-update` or `--strict-include-resolution`) fails fast; non-strict mode only rebuilds when the damaged payload is still recognizable as managed-block content, otherwise it fails closed instead of deleting user topology sections
-- When existing `system.top` already defines `[ defaults ]` or includes `forcefield.itp`, the managed block omits a new `[ defaults ]` section to avoid duplicates
+- Duplicate-`[ defaults ]` avoidance during existing-top updates is raw-top based: the sanitizer recognizes direct `[ defaults ]` sections and unconditional `forcefield.itp` / `*.ff` include lines in `system.top`, but does not chase arbitrary pre-section includes to infer nested defaults ownership
 - Atomic writes prevent partial files on crash
 
 ### v4 Hardening: Moleculetype Exact-Name Policy
