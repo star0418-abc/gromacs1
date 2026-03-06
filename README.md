@@ -639,6 +639,19 @@ Module layout:
 - `pipeline/stages/spatial_checker.py`: GRO parsing, PBC unwrapping, dipole checks, and grompp-based GRO/TOP consistency helpers.
 - `pipeline/stages/sanitizer.py`: compatibility facade that re-exports the stage and legacy symbols for existing imports.
 
+### Stage 1 Internal Parsing Refactor
+
+`topology_sanitizer.py` now includes a small internal IR layer used only for the most fragile parsing paths:
+- `AtomRecord`: one supported `[ atoms ]` row
+- `MoleculeTypeIR`: one target moleculetype with parsed atom rows
+- `TopMoleculesEntry`: one `[ molecules ]` entry with both raw count token and optional resolved integer count
+
+Stage 1 is intentionally narrow:
+- existing sanitizer entrypoints and `TopologySanitizerMixin` call shapes stay the same
+- same-name moleculetype signature/charge comparison now consumes typed `[ atoms ]` rows internally
+- ordered `[ molecules ]` extraction now delegates low-level row parsing to a dedicated helper and preserves unresolved count tokens explicitly
+- unsupported/ambiguous row formats are surfaced as explicit parser states instead of being silently treated as valid data
+
 
 ### Include Resolution
 - **Shadowing Detection**: If an included file (e.g., `posre.itp`) exists in multiple search paths, the pipeline detects it.

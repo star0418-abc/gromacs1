@@ -8,9 +8,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline.stages.topology_sanitizer import (
+    ATOMS_ROW_STATUS_INVALID,
+    ATOMS_ROW_STATUS_PARSED,
+    ATOMS_ROW_STATUS_UNSUPPORTED,
     DEFAULT_MOLECULE_SIG_QUANT_STEP,
     SanitizerError,
+    TOP_MOLECULES_ENTRY_STATUS_PARSED,
+    TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED,
     TopologySanitizerMixin,
+    parse_atoms_row,
+    parse_top_molecules_entry,
 )
 
 
@@ -244,6 +251,113 @@ def test_moleculetype_signature_quantization_is_deterministic_at_boundaries():
     assert sanitizer._quantize_moleculetype_charge(below, step) == 0.0
     assert sanitizer._quantize_moleculetype_charge(above, step) == step
     assert sanitizer._quantize_moleculetype_charge(-above, step) == -step
+
+
+def test_parse_atoms_row_parses_standard_8_column_record():
+    result = parse_atoms_row("1 CT 2 MOL C1 7 -0.125000 12.011")
+
+    assert result.status == ATOMS_ROW_STATUS_PARSED
+    assert result.record is not None
+    assert result.record.atom_id == 1
+    assert result.record.atom_type == "CT"
+    assert result.record.resnr == 2
+    assert result.record.residue == "MOL"
+    assert result.record.atom_name == "C1"
+    assert result.record.cgnr == 7
+    assert result.record.charge == pytest.approx(-0.125)
+    assert result.record.mass == pytest.approx(12.011)
+
+
+@pytest.mark.parametrize(
+    ("line", "expected_cgnr", "expected_charge"),
+    [
+        ("1 HC 1 MOL H1 0.125000 1.008", None, 0.125),
+        ("1 HC 1 MOL H1 3-0.125000 1.008", 3, -0.125),
+    ],
+)
+def test_parse_atoms_row_preserves_supported_7_column_variants(
+    line,
+    expected_cgnr,
+    expected_charge,
+):
+    result = parse_atoms_row(line)
+
+    assert result.status == ATOMS_ROW_STATUS_PARSED
+    assert result.record is not None
+    assert result.record.cgnr == expected_cgnr
+    assert result.record.charge == pytest.approx(expected_charge)
+    assert result.record.mass == pytest.approx(1.008)
+
+
+def test_parse_atoms_row_returns_explicit_failure_states():
+    invalid = parse_atoms_row("1 CT 1 MOL C1")
+    unsupported = parse_atoms_row("1 CT 1 MOL C1 1 0.0 12.0 2 0.0 12.0")
+
+    assert invalid.status == ATOMS_ROW_STATUS_INVALID
+    assert invalid.record is None
+    assert unsupported.status == ATOMS_ROW_STATUS_UNSUPPORTED
+    assert unsupported.record is None
+
+
+def test_parse_top_molecules_entry_parses_integer_count():
+    result = parse_top_molecules_entry("SOL 42")
+
+    assert result.status == TOP_MOLECULES_ENTRY_STATUS_PARSED
+    assert result.entry is not None
+    assert result.entry.name == "SOL"
+    assert result.entry.count_token == "42"
+    assert result.entry.count_value == 42
+
+
+def test_parse_top_molecules_entry_surfaces_unresolved_macro_count():
+    result = parse_top_molecules_entry("POLY N_POLY")
+
+    assert result.status == TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED
+    assert result.entry is not None
+    assert result.entry.name == "POLY"
+    assert result.entry.count_token == "N_POLY"
+    assert result.entry.count_value is None
+
+
+def test_extract_moleculetype_atom_charges_remains_compatible_with_stage1_ir(tmp_path):
+    sanitizer = DummySanitizer()
+    itp = tmp_path / "mol.itp"
+    _write(
+        itp,
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        "1 CT 1 MOL C1 1 -0.125000 12.011\n"
+        "2 HC 1 MOL H1 0.125000 1.008\n",
+    )
+
+    charges, uncertain = sanitizer._extract_moleculetype_atom_charges(itp, "MOL")
+
+    assert charges == pytest.approx([-0.125, 0.125])
+    assert uncertain is False
+
+
+def test_get_ordered_molecules_from_top_preserves_ordered_counts_and_raw_entries(tmp_path):
+    sanitizer = DummySanitizer()
+    top = tmp_path / "system.top"
+    _write(
+        top,
+        "[ molecules ]\n"
+        "A 1\n"
+        "B N_B\n"
+        "A 2\n",
+    )
+
+    result = sanitizer._get_ordered_molecules_from_top(top)
+
+    assert result.ordered == [("A", 3)]
+    assert [(entry.name, entry.count_token, entry.count_value) for entry in result.entries] == [
+        ("A", "1", 1),
+        ("B", "N_B", None),
+        ("A", "2", 2),
+    ]
+    assert result.uncertain is True
+    assert any("N_B" in reason for reason in result.uncertainty_reasons)
 
 
 def test_negative_sigma_policy_warns_by_default_and_errors_when_requested(tmp_path):

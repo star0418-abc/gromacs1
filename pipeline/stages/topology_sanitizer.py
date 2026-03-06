@@ -297,8 +297,196 @@ def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
 class TopMoleculesParseResult:
     """Raw [ molecules ] parse result with uncertainty metadata."""
     ordered: List[Tuple[str, int]]
+    entries: List["TopMoleculesEntry"] = field(default_factory=list)
     uncertain: bool = False
     uncertainty_reasons: List[str] = field(default_factory=list)
+
+
+ATOMS_ROW_STATUS_PARSED = "parsed"
+ATOMS_ROW_STATUS_UNSUPPORTED = "unsupported"
+ATOMS_ROW_STATUS_INVALID = "invalid"
+
+TOP_MOLECULES_ENTRY_STATUS_PARSED = "parsed"
+TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED = "unresolved"
+TOP_MOLECULES_ENTRY_STATUS_INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class AtomRecord:
+    """Minimal IR for one supported [ atoms ] row."""
+    atom_id: int
+    atom_type: str
+    resnr: int
+    residue: str
+    atom_name: str
+    cgnr: Optional[int]
+    charge: float
+    mass: float
+
+
+@dataclass
+class MoleculeTypeIR:
+    """Minimal IR for one moleculetype atoms table."""
+    name: str
+    atoms: List[AtomRecord] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TopMoleculesEntry:
+    """Minimal IR for one [ molecules ] entry."""
+    name: str
+    count_token: str
+    count_value: Optional[int]
+
+
+@dataclass(frozen=True)
+class AtomRowParseResult:
+    """Explicit parse result for one [ atoms ] row."""
+    status: str
+    record: Optional[AtomRecord] = None
+    reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TopMoleculesEntryParseResult:
+    """Explicit parse result for one [ molecules ] entry."""
+    status: str
+    entry: Optional[TopMoleculesEntry] = None
+    reason: Optional[str] = None
+
+
+def _tokenize_atoms_row(data: str) -> List[str]:
+    """Split an [ atoms ] row and explode glued numeric tokens when exact."""
+    tokens: List[str] = []
+    for token in data.split():
+        numeric_chunks = FLOAT_FINDER_RE.findall(token)
+        if len(numeric_chunks) >= 2 and "".join(numeric_chunks) == token:
+            tokens.extend(numeric_chunks)
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def _parse_int_token(token: str) -> Optional[int]:
+    """Parse an integer token, returning None on failure."""
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
+def _parse_float_token(token: str) -> Optional[float]:
+    """Parse a float token, returning None on failure."""
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def parse_atoms_row(line: str) -> AtomRowParseResult:
+    """Parse a supported [ atoms ] row into AtomRecord."""
+    data = strip_gmx_comment(line).strip()
+    if not data:
+        return AtomRowParseResult(
+            status=ATOMS_ROW_STATUS_INVALID,
+            reason="empty [ atoms ] row",
+        )
+
+    tokens = _tokenize_atoms_row(data)
+    if len(tokens) < 7:
+        return AtomRowParseResult(
+            status=ATOMS_ROW_STATUS_INVALID,
+            reason=f"too few tokens for [ atoms ] row ({len(tokens)})",
+        )
+    if len(tokens) > 8:
+        return AtomRowParseResult(
+            status=ATOMS_ROW_STATUS_UNSUPPORTED,
+            reason=f"unsupported [ atoms ] row width ({len(tokens)})",
+        )
+
+    atom_id = _parse_int_token(tokens[0])
+    resnr = _parse_int_token(tokens[2])
+    if atom_id is None or resnr is None:
+        return AtomRowParseResult(
+            status=ATOMS_ROW_STATUS_INVALID,
+            reason="atom id/resnr must be integers",
+        )
+
+    charge = _parse_float_token(tokens[-2])
+    mass = _parse_float_token(tokens[-1])
+    if charge is None or mass is None:
+        return AtomRowParseResult(
+            status=ATOMS_ROW_STATUS_INVALID,
+            reason="charge/mass must be numeric",
+        )
+
+    cgnr: Optional[int] = None
+    if len(tokens) == 8:
+        cgnr = _parse_int_token(tokens[5])
+        if cgnr is None:
+            return AtomRowParseResult(
+                status=ATOMS_ROW_STATUS_INVALID,
+                reason="cgnr must be an integer in 8-column [ atoms ] rows",
+            )
+
+    return AtomRowParseResult(
+        status=ATOMS_ROW_STATUS_PARSED,
+        record=AtomRecord(
+            atom_id=atom_id,
+            atom_type=tokens[1],
+            resnr=resnr,
+            residue=tokens[3],
+            atom_name=tokens[4],
+            cgnr=cgnr,
+            charge=charge,
+            mass=mass,
+        ),
+    )
+
+
+def parse_top_molecules_entry(line: str) -> TopMoleculesEntryParseResult:
+    """Parse one [ molecules ] entry without applying caller policy."""
+    data = strip_gmx_comment(line).strip()
+    if not data:
+        return TopMoleculesEntryParseResult(
+            status=TOP_MOLECULES_ENTRY_STATUS_INVALID,
+            reason="empty [ molecules ] row",
+        )
+    if data.startswith("#"):
+        return TopMoleculesEntryParseResult(
+            status=TOP_MOLECULES_ENTRY_STATUS_INVALID,
+            reason="preprocessor directives are handled by the caller",
+        )
+
+    parts = data.split()
+    if len(parts) != 2:
+        return TopMoleculesEntryParseResult(
+            status=TOP_MOLECULES_ENTRY_STATUS_INVALID,
+            reason=f"expected 2 fields in [ molecules ] row, got {len(parts)}",
+        )
+
+    name, count_token = parts
+    try:
+        count_value = int(count_token)
+    except ValueError:
+        return TopMoleculesEntryParseResult(
+            status=TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED,
+            entry=TopMoleculesEntry(
+                name=name,
+                count_token=count_token,
+                count_value=None,
+            ),
+            reason=f"unresolved [ molecules ] count token '{count_token}'",
+        )
+
+    return TopMoleculesEntryParseResult(
+        status=TOP_MOLECULES_ENTRY_STATUS_PARSED,
+        entry=TopMoleculesEntry(
+            name=name,
+            count_token=count_token,
+            count_value=count_value,
+        ),
+    )
 
 
 
@@ -1036,65 +1224,13 @@ class TopologySanitizerMixin:
         """Return True when value is numerically close to an integer."""
         return abs(value - round(value)) <= tol
 
-    def _extract_atoms_row_charge_value(self, data: str) -> Tuple[Optional[float], bool]:
-        """
-        Extract charge from an [ atoms ] row.
-
-        Supports glued numeric tokens (e.g., '1.234-5.678') and marks uncertain
-        parses instead of failing closed immediately.
-        """
-        parts = data.split()
-        if len(parts) < 6 or not parts[0].isdigit():
-            return None, False
-
-        uncertain = False
-        tail_floats = _extract_floats_from_text(" ".join(parts[5:]))
-        if len(tail_floats) < 1:
-            return None, True
-        if len(tail_floats) > 3:
-            uncertain = True
-
-        token5_floats = _extract_floats_from_text(parts[5]) if len(parts) > 5 else []
-        canonical_charge = tail_floats[1] if len(tail_floats) >= 2 else None
-        charge_value: Optional[float] = None
-
-        # Glued cgnr+charge token (common pathological export).
-        if len(token5_floats) >= 2:
-            charge_value = token5_floats[-1]
-            if canonical_charge is not None and abs(canonical_charge - charge_value) > 1e-12:
-                uncertain = True
-            return charge_value, True
-
-        if len(parts) >= 8:
-            if canonical_charge is None:
-                return None, True
-            return canonical_charge, uncertain
-
-        if len(parts) == 7:
-            if len(token5_floats) == 1 and self._is_int_like(token5_floats[0]):
-                if canonical_charge is None:
-                    return None, True
-                return canonical_charge, uncertain
-            if len(token5_floats) == 1:
-                return token5_floats[0], True
-            if canonical_charge is not None:
-                return canonical_charge, True
-            return None, True
-
-        # 6-token rows are interpreted as no-cgnr forms.
-        if len(token5_floats) == 1:
-            return token5_floats[0], uncertain
-        if canonical_charge is not None:
-            return canonical_charge, True
-        return None, True
-
-    def _extract_moleculetype_atom_charges(
+    def _parse_moleculetype_ir(
         self,
         itp_path: Path,
         mol_name: str,
         ctx: Optional["PipelineContext"] = None,
-    ) -> Tuple[Optional[List[float]], bool]:
-        """Extract per-atom charges for one moleculetype with uncertainty signaling."""
+    ) -> Tuple[Optional[MoleculeTypeIR], bool]:
+        """Parse one target moleculetype into the minimal IR used in Stage 1."""
         if not itp_path.exists():
             return None, False
         strict_reads = bool(ctx and ctx.strict_include_resolution)
@@ -1105,8 +1241,8 @@ class TopologySanitizerMixin:
         current_section = ""
         current_mol = None
         in_target_mol = False
-        charges: List[float] = []
-        charges_uncertain = False
+        parse_uncertain = False
+        atoms: List[AtomRecord] = []
 
         for line in content.splitlines():
             stripped = line.strip()
@@ -1133,18 +1269,47 @@ class TopologySanitizerMixin:
                 continue
 
             if data.startswith("#"):
-                charges_uncertain = True
+                parse_uncertain = True
                 continue
             if current_section != "atoms":
                 continue
 
-            charge_value, row_uncertain = self._extract_atoms_row_charge_value(data)
-            charges_uncertain = charges_uncertain or row_uncertain
-            if charge_value is None:
+            row_result = parse_atoms_row(data)
+            if row_result.status != ATOMS_ROW_STATUS_PARSED or row_result.record is None:
+                parse_uncertain = True
                 continue
-            charges.append(charge_value)
+            atoms.append(row_result.record)
 
-        return (charges if charges else None), charges_uncertain
+        if not atoms:
+            return None, parse_uncertain
+        return MoleculeTypeIR(name=mol_name, atoms=atoms), parse_uncertain
+
+    def _extract_atoms_row_charge_value(self, data: str) -> Tuple[Optional[float], bool]:
+        """
+        Extract charge from an [ atoms ] row.
+
+        Compatibility wrapper around the Stage 1 row parser.
+        """
+        row_result = parse_atoms_row(data)
+        if row_result.status == ATOMS_ROW_STATUS_PARSED and row_result.record is not None:
+            return row_result.record.charge, False
+        return None, row_result.status == ATOMS_ROW_STATUS_UNSUPPORTED
+
+    def _extract_moleculetype_atom_charges(
+        self,
+        itp_path: Path,
+        mol_name: str,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> Tuple[Optional[List[float]], bool]:
+        """Extract per-atom charges for one moleculetype with uncertainty signaling."""
+        mol_ir, charges_uncertain = self._parse_moleculetype_ir(
+            itp_path,
+            mol_name,
+            ctx=ctx,
+        )
+        if mol_ir is None or not mol_ir.atoms:
+            return None, charges_uncertain
+        return [atom.charge for atom in mol_ir.atoms], charges_uncertain
     
     def _classify_ionic_moleculetypes(
         self,
@@ -1780,25 +1945,27 @@ class TopologySanitizerMixin:
                 parts = data.split()
                 if len(parts) >= 5 and parts[0].isdigit():
                     atom_count += 1
-                    charge_value, charge_uncertain = self._extract_atoms_row_charge_value(data)
-                    if charge_value is None:
+                    row_result = parse_atoms_row(data)
+                    if row_result.status != ATOMS_ROW_STATUS_PARSED or row_result.record is None:
                         unknown_key = "atoms:charge_unknown"
+                        if row_result.status == ATOMS_ROW_STATUS_UNSUPPORTED:
+                            unknown_key = "atoms:charge_uncertain"
                         sections_present.add(unknown_key)
                         section_line_counts[unknown_key] = section_line_counts.get(unknown_key, 0) + 1
                         hasher.update(f"{unknown_key}|{' '.join(parts[:5])}\n".encode("utf-8"))
                         continue
-                    if charge_uncertain:
-                        uncertain_key = "atoms:charge_uncertain"
-                        sections_present.add(uncertain_key)
-                        section_line_counts[uncertain_key] = section_line_counts.get(uncertain_key, 0) + 1
-                    raw_q = charge_value
+                    raw_q = row_result.record.charge
 
                     qmin = raw_q if qmin is None else min(qmin, raw_q)
                     qmax = raw_q if qmax is None else max(qmax, raw_q)
                     sum_abs_q += abs(raw_q)
                     sum_q2 += raw_q * raw_q
                     quant_q = self._quantize_moleculetype_charge(raw_q, quant_step)
-                    canonical = f"{parts[1]}|{parts[4]}|{quant_q:+.10f}\n"
+                    canonical = (
+                        f"{row_result.record.atom_type}|"
+                        f"{row_result.record.atom_name}|"
+                        f"{quant_q:+.10f}\n"
+                    )
                     hasher.update(canonical.encode("utf-8"))
         
         if atom_count == 0:
@@ -1832,6 +1999,7 @@ class TopologySanitizerMixin:
             return TopMoleculesParseResult(ordered=[])
         # Use list for order + dict for fast lookup of first occurrence index
         ordered: List[Tuple[str, int]] = []
+        entries: List[TopMoleculesEntry] = []
         seen_indices: Dict[str, int] = {}  # name -> index in ordered list
         in_molecules = False
         uncertain_reasons: List[str] = []
@@ -1861,24 +2029,35 @@ class TopologySanitizerMixin:
             data = stripped.split(";")[0].strip()
             if not data:
                 continue
-            parts = data.split()
-            if len(parts) >= 2:
-                try:
-                    name = parts[0]
-                    count = int(parts[1])
-                    if name in seen_indices:
-                        # Collapse: add count to existing entry
-                        idx = seen_indices[name]
-                        old_name, old_count = ordered[idx]
-                        ordered[idx] = (old_name, old_count + count)
-                    else:
-                        # First occurrence: add new entry
-                        seen_indices[name] = len(ordered)
-                        ordered.append((name, count))
-                except ValueError:
-                    continue
+            entry_result = parse_top_molecules_entry(data)
+            if entry_result.entry is not None:
+                entries.append(entry_result.entry)
+            if entry_result.status == TOP_MOLECULES_ENTRY_STATUS_PARSED and entry_result.entry is not None:
+                name = entry_result.entry.name
+                count = entry_result.entry.count_value or 0
+                if name in seen_indices:
+                    # Collapse: add count to existing entry
+                    idx = seen_indices[name]
+                    old_name, old_count = ordered[idx]
+                    ordered[idx] = (old_name, old_count + count)
+                else:
+                    # First occurrence: add new entry
+                    seen_indices[name] = len(ordered)
+                    ordered.append((name, count))
+                continue
+            if entry_result.status == TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED and entry_result.entry is not None:
+                uncertain_reasons.append(
+                    f"unresolved [molecules] count token '{entry_result.entry.count_token}' "
+                    f"for '{entry_result.entry.name}' at {top_path.name}:{line_no}"
+                )
+                continue
+            uncertain_reasons.append(
+                f"invalid [molecules] row at {top_path.name}:{line_no}: "
+                f"{entry_result.reason or data}"
+            )
         return TopMoleculesParseResult(
             ordered=ordered,
+            entries=entries,
             uncertain=bool(uncertain_reasons),
             uncertainty_reasons=uncertain_reasons,
         )
