@@ -917,18 +917,9 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                     ion_classifications,
                     ctx,
                     classification_audit=ion_classification_audit,
+                    enforce=True,
                 )
-                violations = protection_audit.get("violations", [])
                 charge_summary["target_policy"] = protection_audit
-                if violations:
-                    for v in violations:
-                        print(f"  [ERROR] {v}")
-                    raise SanitizerError(
-                        f"Charge protection policy violations: {violations}. "
-                        "Use --charge-fix-allow-ions/--charge-fix-allow-solvents, and for polymer "
-                        "targets provide --charge-fix-target-allowlist with "
-                        "--charge-fix-polymer-method spread_safe."
-                    )
                 
                 # Record in manifest
                 if ctx.manifest:

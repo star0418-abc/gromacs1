@@ -19,6 +19,7 @@ from pipeline.stages.topology_sanitizer import (
     ATOMS_ROW_STATUS_UNSUPPORTED,
     DEFAULT_MOLECULE_SIG_QUANT_STEP,
     MOLECULETYPE_COMPARE_UNCERTAIN,
+    MOLECULETYPE_IR_STATUS_UNCERTAIN,
     SANITIZER_BLOCK_BEGIN,
     SANITIZER_BLOCK_END,
     SanitizerError,
@@ -71,6 +72,14 @@ class DummyContext:
 
     def get_input_path(self, *parts) -> Path:
         return self.root / "IN" / Path(*parts)
+
+
+class ManifestRecorder:
+    def __init__(self) -> None:
+        self.outputs = {}
+
+    def set_sanitizer_output(self, key, value) -> None:
+        self.outputs[key] = value
 
 
 def _write(path: Path, content: str) -> None:
@@ -861,6 +870,56 @@ def test_uncertain_same_name_conflict_is_not_treated_as_equal_in_non_strict_mode
     assert "Treating definitions as conflicting" in capsys.readouterr().out
 
 
+def test_resolve_requested_moleculetype_name_ignores_hidden_conditional_blocks(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    itp = tmp_path / "mixed.itp"
+    content = (
+        "#ifdef USE_ALT\n"
+        "[ moleculetype ]\n"
+        "ALT 3\n"
+        "#endif\n"
+        "[ moleculetype ]\n"
+        "BASE 3\n"
+    )
+    _write(itp, content)
+
+    resolved, available, error = sanitizer._resolve_requested_moleculetype_name_in_content(
+        content,
+        "ALT",
+        itp,
+        ctx=ctx,
+    )
+
+    assert resolved is None
+    assert available == ["BASE"]
+    assert "cannot be resolved safely" in (error or "")
+
+
+def test_parse_moleculetype_ir_excludes_hidden_conditional_atoms_from_charge_inputs(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    itp = tmp_path / "mol.itp"
+    _write(
+        itp,
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        "#ifdef ALT_CHARGE\n"
+        "1 CT 1 MOL C1 1 9.000000 12.011\n"
+        "#endif\n"
+        "1 CT 1 MOL C1 1 0.000000 12.011\n",
+    )
+
+    parsed = sanitizer._parse_moleculetype_ir(itp, "MOL", ctx=ctx)
+
+    assert parsed.status == MOLECULETYPE_IR_STATUS_UNCERTAIN
+    assert parsed.molecule is not None
+    assert len(parsed.molecule.atoms) == 1
+    assert parsed.total_charge == pytest.approx(0.0)
+    assert any("ambiguous without preprocessing" in reason for reason in parsed.uncertainty_reasons)
+
+
 def test_same_name_moleculetype_comparison_uses_ir_for_valid_supported_rows(tmp_path):
     sanitizer = DummySanitizer()
     itp1 = tmp_path / "a.itp"
@@ -978,6 +1037,7 @@ def test_degraded_and_protected_polymer_classification_refuses_unallowlisted_tar
         classifications,
         ctx,
         classification_audit=audit,
+        enforce=False,
     )
     assert any("BROKEN" in item and "classification" in item for item in protection_audit["violations"])
 
@@ -987,9 +1047,48 @@ def test_degraded_and_protected_polymer_classification_refuses_unallowlisted_tar
         classifications,
         allow_ctx,
         classification_audit=audit,
+        enforce=False,
     )
     assert allow_audit["violations"] == []
     assert allow_audit["target_from_allowlist"] is True
+
+
+def test_verify_ion_protection_enforces_after_writing_audit(tmp_path):
+    sanitizer = DummySanitizer()
+    manifest = ManifestRecorder()
+    ctx = DummyContext(tmp_path, manifest=manifest)
+    correction_result = SimpleNamespace(
+        target_molecule="BROKEN",
+        corrected=True,
+        correction_refused=False,
+        max_delta_applied=1e-6,
+        total_delta=1e-6,
+        correction_method="safe_subset",
+        atoms_adjusted=1,
+        effective_method="safe_subset",
+        neutrality_status="corrected",
+        polymer_policy=None,
+    )
+    classifications = {"BROKEN": "unknown"}
+    audit = {
+        "details": {
+            "BROKEN": {
+                "status": "degraded",
+                "classification": "unknown",
+            }
+        }
+    }
+
+    with pytest.raises(SanitizerError, match="Charge protection policy violations"):
+        sanitizer._verify_ion_protection(
+            correction_result,
+            classifications,
+            ctx,
+            classification_audit=audit,
+        )
+
+    assert "charge_protection_audit" in manifest.outputs
+    assert manifest.outputs["charge_protection_audit"]["violations"]
 
 
 def test_charge_fix_protect_resnames_extends_built_in_protection(tmp_path):
@@ -1253,6 +1352,16 @@ def test_parse_atoms_row_preserves_supported_7_column_variants(
     assert result.record.mass == pytest.approx(1.008)
 
 
+def test_parse_atoms_row_does_not_split_hyphenated_business_identifiers():
+    result = parse_atoms_row("1 CT 1 MOL 2024-01 0.125000 12.011")
+
+    assert result.status == ATOMS_ROW_STATUS_PARSED
+    assert result.record is not None
+    assert result.record.atom_name == "2024-01"
+    assert result.record.cgnr is None
+    assert result.record.charge == pytest.approx(0.125)
+
+
 def test_parse_atoms_row_returns_explicit_failure_states():
     invalid = parse_atoms_row("1 CT 1 MOL C1")
     unsupported = parse_atoms_row("1 CT 1 MOL C1 1 0.0 12.0 2 0.0 12.0")
@@ -1336,6 +1445,25 @@ def test_get_ordered_molecules_from_top_preserves_ordered_counts_and_raw_entries
     ]
     assert result.uncertain is True
     assert any("N_B" in reason for reason in result.uncertainty_reasons)
+
+
+def test_get_molecules_from_htpolynet_top_reuses_conservative_truth_source_parser(tmp_path):
+    sanitizer = DummySanitizer()
+    sanitizer.get_output_dir = lambda ctx: tmp_path / "OUT_GMX" / ctx.run_id
+    ctx = DummyContext(tmp_path)
+    top = ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")
+    _write(
+        top,
+        "[ molecules ]\n"
+        "#ifdef HIDDEN_BRANCH\n"
+        "HIDDEN 99\n"
+        "#endif\n"
+        "BASE 1\n",
+    )
+
+    molecules = sanitizer._get_molecules_from_htpolynet_top(ctx)
+
+    assert molecules == {"BASE": 1}
 
 
 def test_map_sanitized_itps_to_molecules_maps_all_expected_names_deterministically(tmp_path):
@@ -1477,6 +1605,44 @@ def test_check_lj_outliers_robust_excludes_near_zero_values_from_log_domain_stat
 
     assert any("Near-zero comb-rule=1 p1 value(s) excluded" in warning for warning in warnings)
     assert not any("Statistical LJ outlier 'TINY' for p1" in warning for warning in warnings)
+
+
+def test_check_lj_outliers_robust_zero_mad_fallback_still_flags_material_outlier(tmp_path):
+    sanitizer = DummySanitizer()
+    combined = tmp_path / "combined_atomtypes.itp"
+    _write(
+        combined,
+        "[ atomtypes ]\n"
+        "A 12.011 0.000 A 1.000000e+00 2.000000e+00\n"
+        "B 12.011 0.000 A 1.000000e+00 2.000000e+00\n"
+        "C 12.011 0.000 A 1.000000e+00 2.000000e+00\n"
+        "ROGUE 12.011 0.000 A 4.000000e+00 2.000000e+00\n",
+    )
+
+    warnings = sanitizer._warn_atomtype_outliers(combined, DummyContext(tmp_path), comb_rule=1)
+
+    assert any("Statistical LJ outlier 'ROGUE' for p1" in warning for warning in warnings)
+
+
+def test_relative_top_include_target_falls_back_when_relpath_is_unavailable(tmp_path, monkeypatch):
+    sanitizer = DummySanitizer()
+    include_path = tmp_path / "other_mount" / "A.itp"
+    top_dir = tmp_path / "system_top"
+
+    def _raise_relpath(src, dest):
+        raise ValueError("different mount")
+
+    monkeypatch.setattr(topology_sanitizer_module.os.path, "relpath", _raise_relpath)
+
+    assert (
+        sanitizer._relative_top_include_target(
+            include_path,
+            top_dir=top_dir,
+            fallback_dir="../itp",
+        )
+        == "../itp/A.itp"
+    )
+    assert sanitizer._relative_top_include_target(include_path, top_dir=top_dir) == "A.itp"
 
 
 def test_parse_lj_atomtypes_row_supports_missing_ptype_and_shell_ptype(tmp_path):

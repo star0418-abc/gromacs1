@@ -52,6 +52,9 @@ UNWRAP_LOOP_TOL_FACTOR = 10.0
 FLOAT_FINDER_RE = re.compile(
     r"[+-]?(?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[eE][+-]?\d+)?"
 )
+GLUED_CGNR_CHARGE_RE = re.compile(
+    r"^([+-]?\d+)([+-](?:(?:\d+\.\d*)|(?:\.\d+)|(?:\d+))(?:[eE][+-]?\d+)?)$"
+)
 
 # LJ outlier bound profiles (comb-rule 2/3; sigma/epsilon interpretation).
 LJ_BOUNDS_PROFILES = {
@@ -81,6 +84,7 @@ LJ_UNIT_SCREAMING_THRESHOLDS = {
 LJ_ROBUST_LOG_MEDIAN_RELATIVE_FLOOR = 1e-12
 LJ_ROBUST_LOG_ABSOLUTE_FLOOR = sys.float_info.min * 1024.0
 LJ_ROBUST_Z_THRESHOLD = 5.0
+LJ_ROBUST_ZERO_MAD_LOG_FLOOR = 1e-2
 
 # Hardening v6: Protected molecule patterns for charge correction
 # These molecules should NEVER have their charges modified unless explicitly allowed
@@ -441,15 +445,13 @@ class TopMoleculesEntryParseResult:
 
 
 def _tokenize_atoms_row(data: str) -> List[str]:
-    """Split an [ atoms ] row and explode glued numeric tokens when exact."""
-    tokens: List[str] = []
-    for token in data.split():
-        numeric_chunks = FLOAT_FINDER_RE.findall(token)
-        if len(numeric_chunks) >= 2 and "".join(numeric_chunks) == token:
-            tokens.extend(numeric_chunks)
-        else:
-            tokens.append(token)
-    return tokens
+    """Split an [ atoms ] row, only ungluing the supported cgnr+charge form."""
+    raw_tokens = data.split()
+    if len(raw_tokens) == 7:
+        glued = GLUED_CGNR_CHARGE_RE.fullmatch(raw_tokens[-2])
+        if glued is not None:
+            return raw_tokens[:-2] + [glued.group(1), glued.group(2), raw_tokens[-1]]
+    return raw_tokens
 
 
 def _parse_int_token(token: str) -> Optional[int]:
@@ -1633,13 +1635,26 @@ class TopologySanitizerMixin:
         content: str,
         requested_name: str,
         itp_path: Path,
+        *,
+        ctx: Optional["PipelineContext"] = None,
+        active_lines: Optional[List[Tuple[int, str]]] = None,
+        semantic_issues: Optional[List[str]] = None,
     ) -> Tuple[Optional[str], List[str], Optional[str]]:
         """Resolve request to one real [ moleculetype ] name in content."""
+        if active_lines is None:
+            strict_semantics = bool(ctx and getattr(ctx, "strict_include_resolution", False))
+            active_lines, semantic_issues = self._conservative_topology_lines(
+                lines=content.splitlines(),
+                file_path=itp_path,
+                purpose="moleculetype name resolution",
+                strict=strict_semantics,
+            )
+        semantic_issues = list(semantic_issues or [])
         available: List[str] = []
         current_section = ""
         awaiting_moleculetype = False
 
-        for raw in content.splitlines():
+        for _, raw in active_lines:
             section = parse_section_name(raw)
             if section is not None:
                 current_section = section
@@ -1659,6 +1674,15 @@ class TopologySanitizerMixin:
             awaiting_moleculetype = False
 
         if not available:
+            if semantic_issues:
+                return (
+                    None,
+                    [],
+                    (
+                        f"moleculetype '{requested_name}' cannot be resolved safely in {itp_path}; "
+                        "unresolved preprocessor directives leave active [ moleculetype ] selection ambiguous"
+                    ),
+                )
             fallback = requested_name or itp_path.stem
             return fallback, [], None
         if requested_name in available:
@@ -1677,6 +1701,15 @@ class TopologySanitizerMixin:
                 (
                     f"ambiguous case-insensitive moleculetype match for '{requested_name}' "
                     f"in {itp_path}: {casefold_matches}"
+                ),
+            )
+        if semantic_issues:
+            return (
+                None,
+                available,
+                (
+                    f"moleculetype '{requested_name}' cannot be resolved safely in {itp_path}; "
+                    f"active moleculetypes: {available}"
                 ),
             )
         if len(available) == 1:
@@ -1797,18 +1830,34 @@ class TopologySanitizerMixin:
                 status=MOLECULETYPE_IR_STATUS_MISSING,
                 uncertainty_reasons=[f"{itp_path} is empty or unreadable"],
             )
+        active_lines, semantic_issues = self._conservative_topology_lines(
+            lines=content.splitlines(),
+            file_path=itp_path,
+            purpose=f"moleculetype IR parsing for '{mol_name}'",
+            strict=strict_reads,
+        )
 
         resolved_name, available_names, resolution_error = (
             self._resolve_requested_moleculetype_name_in_content(
                 content,
                 mol_name,
                 itp_path,
+                ctx=ctx,
+                active_lines=active_lines,
+                semantic_issues=semantic_issues,
             )
         )
         if resolved_name is None:
+            reasons = list(semantic_issues)
+            reasons.append(resolution_error or f"unable to resolve '{mol_name}'")
+            status = (
+                MOLECULETYPE_IR_STATUS_UNCERTAIN
+                if semantic_issues or "ambiguous" in (resolution_error or "").casefold()
+                else MOLECULETYPE_IR_STATUS_MISSING
+            )
             return MoleculeTypeIRParseResult(
-                status=MOLECULETYPE_IR_STATUS_MISSING,
-                uncertainty_reasons=[resolution_error or f"unable to resolve '{mol_name}'"],
+                status=status,
+                uncertainty_reasons=reasons,
             )
 
         current_section = ""
@@ -1817,7 +1866,7 @@ class TopologySanitizerMixin:
         target_found = False
         awaiting_moleculetype = False
         atoms: List[AtomRecord] = []
-        uncertainty_reasons: List[str] = []
+        uncertainty_reasons: List[str] = list(semantic_issues)
         topology_entries: List[Tuple[str, str]] = []
         local_atomtypes: Dict[str, LocalAtomTypeRecord] = {}
         local_atomtype_issues: Dict[str, str] = {}
@@ -1842,7 +1891,7 @@ class TopologySanitizerMixin:
             "orientation_restraints",
         }
 
-        for line_no, line in enumerate(content.splitlines(), start=1):
+        for line_no, line in active_lines:
             stripped = line.strip()
             section = parse_section_name(line)
             if section is not None:
@@ -1933,14 +1982,20 @@ class TopologySanitizerMixin:
                 continue
 
         if not target_found:
+            reasons = list(uncertainty_reasons)
+            reasons.append(
+                (
+                    f"target moleculetype '{mol_name}' not found in {itp_path}; "
+                    f"available moleculetypes: {available_names or ['<none>']}"
+                )
+            )
             return MoleculeTypeIRParseResult(
-                status=MOLECULETYPE_IR_STATUS_MISSING,
-                uncertainty_reasons=[
-                    (
-                        f"target moleculetype '{mol_name}' not found in {itp_path}; "
-                        f"available moleculetypes: {available_names or ['<none>']}"
-                    )
-                ],
+                status=(
+                    MOLECULETYPE_IR_STATUS_UNCERTAIN
+                    if uncertainty_reasons
+                    else MOLECULETYPE_IR_STATUS_MISSING
+                ),
+                uncertainty_reasons=reasons,
             )
 
         for atomtype_name in sorted(used_atomtypes, key=str.casefold):
@@ -2412,6 +2467,8 @@ class TopologySanitizerMixin:
         classifications: Dict[str, str],
         ctx: "PipelineContext",
         classification_audit: Optional[Dict[str, Any]] = None,
+        *,
+        enforce: bool = True,
     ) -> Dict[str, Any]:
         """
         Verify that charge correction obeys protected-species policy.
@@ -2614,6 +2671,16 @@ class TopologySanitizerMixin:
         if ctx.manifest:
             ctx.manifest.set_sanitizer_output("charge_protection_audit", audit)
 
+        if violations and enforce:
+            for violation in violations:
+                print(f"  [ERROR] {violation}")
+            raise SanitizerError(
+                f"Charge protection policy violations: {violations}. "
+                "Use --charge-fix-allow-ions/--charge-fix-allow-solvents, and for polymer "
+                "targets provide --charge-fix-target-allowlist with "
+                "--charge-fix-polymer-method spread_safe."
+            )
+
         return audit
     
     def _compute_moleculetype_signature(
@@ -2660,9 +2727,13 @@ class TopologySanitizerMixin:
                 reason=f"preferred preprocessed topology could not be parsed: {truth_source.path}",
                 candidate_paths=truth_source.candidate_paths,
             )
-        return self._get_ordered_molecules_from_top(top_path), truth_source
+        return self._get_ordered_molecules_from_top(top_path, ctx=ctx), truth_source
 
-    def _get_ordered_molecules_from_top(self, top_path: Path) -> TopMoleculesParseResult:
+    def _get_ordered_molecules_from_top(
+        self,
+        top_path: Path,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> TopMoleculesParseResult:
         """
         Parse [molecules] section preserving order, collapsing duplicates.
         
@@ -2677,34 +2748,34 @@ class TopologySanitizerMixin:
         entries: List[TopMoleculesEntry] = []
         seen_indices: Dict[str, int] = {}  # name -> index in ordered list
         in_molecules = False
-        uncertain_reasons: List[str] = []
-        conditional_depth = 0
-        content = self.safe_read_text(top_path, strict=False)
+        strict_semantics = bool(ctx and getattr(ctx, "strict_include_resolution", False))
+        content = self.safe_read_text(top_path, strict=strict_semantics)
         if not content:
             return TopMoleculesParseResult(ordered=[])
-        for line_no, line in enumerate(content.splitlines(), start=1):
+        scan_lines, semantic_issues = self._conservative_topology_lines(
+            lines=content.splitlines(),
+            file_path=top_path,
+            purpose="[molecules] parsing",
+            strict=strict_semantics,
+        )
+        uncertain_reasons: List[str] = list(semantic_issues)
+        for line_no, line in scan_lines:
             stripped = line.strip()
-            directive = preprocessor_directive_token(line)
             section = parse_section_name(line)
             if section is not None:
                 in_molecules = (section == "molecules")
                 continue
             if not in_molecules:
                 continue
-            if directive in PREPROCESSOR_UNRESOLVED_SEMANTIC_DIRECTIVES:
-                if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
-                    conditional_depth += 1
-                elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE and conditional_depth > 0:
-                    conditional_depth -= 1
+            directive = preprocessor_directive_token(line)
+            if directive is not None:
                 uncertain_reasons.append(
-                    f"{directive} in [molecules] at {top_path.name}:{line_no}"
+                    f"unsupported directive '{directive}' inside [molecules] at {top_path.name}:{line_no}"
                 )
-                continue
-            if directive is not None or conditional_depth > 0:
                 continue
             if not stripped or stripped.startswith(";") or stripped.startswith("#"):
                 continue
-            data = stripped.split(";")[0].strip()
+            data = strip_gmx_comment(line).strip()
             if not data:
                 continue
             entry_result = parse_top_molecules_entry(data)
@@ -2733,10 +2804,6 @@ class TopologySanitizerMixin:
                 f"invalid [molecules] row at {top_path.name}:{line_no}: "
                 f"{entry_result.reason or data}"
             )
-        if conditional_depth > 0:
-            uncertain_reasons.append(
-                f"unclosed conditional block in [molecules] at {top_path.name}"
-            )
         return TopMoleculesParseResult(
             ordered=ordered,
             entries=entries,
@@ -2762,39 +2829,26 @@ class TopologySanitizerMixin:
         if not top_path.exists():
             return None
 
-        content = self.safe_read_text(top_path, strict=False)
-        if not content:
+        output_dir = self.get_output_dir(ctx) if hasattr(self, "get_output_dir") else None
+        top_parse, truth_source = self._get_ordered_molecules_from_truth_source(
+            top_path,
+            output_dir=output_dir,
+            ctx=ctx,
+        )
+        if top_parse.uncertain:
+            summary = self._summarize_semantic_scan_issues(top_parse.uncertainty_reasons)
+            print(
+                "  [WARN][DEGRADED] HTPolyNet [molecules] parse is uncertain: "
+                f"{summary}"
+            )
+            if truth_source.is_preprocessed:
+                print(
+                    f"  [WARN][DEGRADED] Preferred truth source was preprocessed but still "
+                    f"reported degraded [molecules] parsing: {truth_source.path}"
+                )
+        if not top_parse.ordered:
             return None
-        
-        molecules: Dict[str, int] = {}
-        in_molecules = False
-        
-        for line in content.splitlines():
-            stripped = line.strip()
-            
-            # Detect section headers
-            section = parse_section_name(line)
-            if section is not None:
-                in_molecules = (section == "molecules")
-                continue
-            
-            if in_molecules:
-                # Skip comments and empty lines
-                data = stripped.split(";")[0].strip()
-                if not data:
-                    continue
-                
-                parts = data.split()
-                if len(parts) >= 2:
-                    try:
-                        mol_name = parts[0]
-                        mol_count = int(parts[1])
-                        # Accumulate in case same molecule appears multiple times
-                        molecules[mol_name] = molecules.get(mol_name, 0) + mol_count
-                    except ValueError:
-                        continue
-        
-        return molecules if molecules else None
+        return {name: count for name, count in top_parse.ordered}
 
     def _map_sanitized_itps_to_molecules(
         self,
@@ -3672,7 +3726,20 @@ class TopologySanitizerMixin:
             mad = _median(abs_devs)
 
             # Scale factor for MAD -> sigma-equivalent (1.4826 for normal distribution)
-            mad_scaled = mad * 1.4826 if mad > 0 else 1.0
+            if mad > 0:
+                mad_scaled = mad * 1.4826
+            else:
+                nonzero_abs_devs = sorted(dev for dev in abs_devs if dev > 0)
+                if not nonzero_abs_devs:
+                    continue
+                # When most values are identical, MAD collapses to zero and the
+                # detector would otherwise go blind. Fall back to the first
+                # observable log-scale deviation, with a floor to ignore tiny
+                # formatting noise while still flagging materially different rows.
+                mad_scaled = max(
+                    LJ_ROBUST_ZERO_MAD_LOG_FLOOR,
+                    nonzero_abs_devs[0] / 10.0,
+                )
 
             # Check for outliers
             for (row, val), log_val in zip(filtered_values, log_vals):
@@ -3893,8 +3960,12 @@ class TopologySanitizerMixin:
     ) -> str:
         """Return a normalized include target relative to system.top."""
         if top_dir is not None:
-            rel_path = Path(os.path.relpath(include_path, top_dir)).as_posix()
-            return self._normalize_top_include_target(rel_path)
+            try:
+                rel_path = Path(os.path.relpath(include_path, top_dir)).as_posix()
+            except (OSError, ValueError):
+                rel_path = None
+            if rel_path is not None:
+                return self._normalize_top_include_target(rel_path)
         if fallback_dir:
             return self._normalize_top_include_target(
                 f"{fallback_dir.rstrip('/')}/{include_path.name}"

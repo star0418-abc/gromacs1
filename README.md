@@ -735,7 +735,7 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
 - **Protected polymer net-charge policy**:
   - `--polymer-net-charge-tol` (default `1e-3`): if a protected polymer has `|q| <= tol`, sanitizer accepts drift and skips correction with manifest audit.
   - If `|q| > tol`: correction requires explicit target allowlist; non-strict mode warns+skips, strict mode fails.
-  - `--charge-fix-polymer-method spread_safe`: when correction is allowlisted, distribute across many C/H atoms while excluding hetero atoms and their bond-neighborhood.
+  - `--charge-fix-polymer-method spread_safe`: when correction is allowlisted, use the real spread-safe correction implemented in `pipeline/charge_neutrality.py`, distributing across many C/H atoms while excluding hetero atoms and their bond-neighborhood.
   - Polymer correction still requires rounding-only gate pass (or explicit `--charge-fix-allow-non-rounding` override).
 - **Hetero safeguard**: any correction touching hetero atoms (`O/N/S/B/F/P`) is refused unless those atom names are explicitly allowlisted via `--charge-fix-target-atomnames`.
 - **Strict Mode**: If strict charge neutrality is enabled, modifying any protected species requires explicit opt-in.
@@ -1577,6 +1577,7 @@ The Sanitizer performs charge neutrality preflight checking:
   - non-strict mode: warn + skip correction
   - strict mode: hard fail
 - If allowlisted, polymer correction uses `spread_safe`:
+  - the effective correction logic lives in `pipeline/charge_neutrality.py`; the sanitizer only audits and enforces that this method was actually selected
   - distributes `螖Q` uniformly across many atoms (minimizes max `|螖q_i|`)
   - excludes hetero atoms (`O/N/S/B/F/P`)
   - excludes atoms within `--charge-fix-polymer-exclusion-bonds` (default `2`) of hetero atoms
@@ -1599,6 +1600,7 @@ Recommended safer automation settings for GPE workflows:
 **Robust ITP Parsing** (Format Variants):
 - Handles both 8-token format (`nr type resnr residue atom cgnr charge mass`) and 7-token format (missing `cgnr`)
 - Tolerates trailing comments on section headers (`[ atoms ] ; comment`)
+- Unresolved `#if/#ifdef/#else/#endif/#define` regions are never treated as active by the Python fallback parser. Strict mode fails closed; non-strict mode records degraded/uncertain parse reasons instead of trusting hidden `[ moleculetype ]` or `[ molecules ]` content.
 - Recovers glued numeric fields in `[ atoms ]` charge extraction and `[ atomtypes ]` LJ tail parsing (e.g., `1.000-0.001`, `1.234-5.678`)
 - Supports scientific notation in charge/mass tokens (e.g., `1.2e-5`)
 - Uses token-based patching for reliable charge replacement
