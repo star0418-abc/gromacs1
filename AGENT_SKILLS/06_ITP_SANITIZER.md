@@ -74,15 +74,18 @@ Do not put new primary logic here.
 
 ---
 
-## Refactor Status
+## Freeze / Maintenance Status
 
-The staged refactor of `topology_sanitizer.py` is complete through the accepted Stage 5 scope.
+Freeze record:
+- freeze verdict: `READY TO FREEZE`
+- staged refactor status: complete through the accepted Stage 5 scope
+- stable compatibility facade: `TopologySanitizerMixin`
 
 Treat the current module as the frozen stable-maintenance baseline:
 - `topology_sanitizer.py` remains the single writer of final topology artifacts
-- `TopologySanitizerMixin` remains the stable compatibility boundary for sanitizer topology helpers
 - future changes should be bug fixes, maintenance patches, or explicitly scoped new features
-- do not open a new staged-refactor phase for this file unless a real correctness blocker appears in topology semantics, include truth, output determinism, charge protection, or documented behavior truthfulness
+- handle correctness/safety/truthfulness regressions as targeted fixes, not renewed architecture work
+- do not open a new staged-refactor phase or architectural redesign unless a real correctness blocker appears in topology semantics, include truth, output determinism, charge protection, or documented behavior truthfulness
 
 ---
 

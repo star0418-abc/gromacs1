@@ -664,9 +664,16 @@ Stage 2 keeps the same public sanitizer facade, but moves two safety-critical in
 - charge-fix classification/protection now uses the same typed moleculetype parse result
 - protected/degraded molecules are removed from the checker's default auto-target pool before any charge-fix write occurs; explicit `--charge-fix-target-allowlist` is now the intended opt-in path for those targets
 
-### Refactor Closeout Status
+### Freeze Closeout Record
 
-`topology_sanitizer.py` staged refactor work is complete through the accepted Stage 5 hardening scope and is now the stable maintenance-mode baseline for sanitizer topology behavior.
+Freeze record:
+- Freeze verdict: `READY TO FREEZE`
+- Staged refactor status: complete through the accepted Stage 5 hardening scope
+- Stable compatibility facade: `TopologySanitizerMixin`, re-exported via `pipeline/stages/sanitizer.py`
+- Future changes: bugfixes, maintenance patches, or explicitly scoped new features
+- Refactor archive policy: do not resume staged-refactor phases for this file unless a new correctness blocker is demonstrated
+
+`topology_sanitizer.py` is now the stable maintenance-mode baseline for sanitizer topology behavior.
 
 Freeze rationale:
 - external import/call surface remains stable via `pipeline/stages/sanitizer.py`
@@ -1089,7 +1096,7 @@ Default propagation safeguards:
 
 ## ITP Sanitizer
 
-The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, detecting conflicts, and ensuring consistent `[ defaults ]` settings. `topology_sanitizer.py` is the stable maintenance-mode baseline for this topology layer; future work should stay in maintenance/bugfix/feature mode rather than new staged refactor phases unless a real blocker is found.
+The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, detecting conflicts, and ensuring consistent `[ defaults ]` settings. The freeze verdict for `topology_sanitizer.py` is `READY TO FREEZE`; it now serves as the stable maintenance-mode baseline for this topology layer, with `TopologySanitizerMixin` kept as the compatibility facade for existing topology-helper call sites.
 
 ### What It Does
 
