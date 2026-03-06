@@ -68,8 +68,21 @@ Compatibility facade only.
 Responsibilities:
 - preserve old import paths
 - re-export public sanitizer symbols
+- keep `TopologySanitizerMixin` and `SanitizerStage` compatibility imports stable unless a deliberate feature change requires otherwise
 
 Do not put new primary logic here.
+
+---
+
+## Refactor Status
+
+The staged refactor of `topology_sanitizer.py` is complete through the accepted Stage 5 scope.
+
+Treat the current module as the frozen post-refactor baseline:
+- `topology_sanitizer.py` remains the single writer of final topology artifacts
+- `TopologySanitizerMixin` remains the stable compatibility boundary for sanitizer topology helpers
+- future changes should be bug fixes, maintenance patches, or explicitly scoped new features
+- do not open a new staged-refactor phase for this file unless a real correctness blocker appears in topology semantics, include truth, output determinism, charge protection, or documented behavior truthfulness
 
 ---
 

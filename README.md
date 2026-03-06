@@ -635,9 +635,9 @@ The sanitization stage enforces correctness, safety, and auditability for ITP fi
 
 Module layout:
 - `pipeline/stages/sanitizer_stage.py`: `SanitizerStage` orchestration entrypoint (`run()` and stage wiring).
-- `pipeline/stages/topology_sanitizer.py`: topology/ITP/include/defaults handling, sanitizer-managed `system.top` updates, and final output writing helpers.
+- `pipeline/stages/topology_sanitizer.py`: topology/ITP/include/defaults handling, sanitizer-managed `system.top` updates, final output writing helpers, and the frozen post-refactor baseline for sanitizer topology logic.
 - `pipeline/stages/spatial_checker.py`: GRO parsing, PBC unwrapping, dipole checks, and grompp-based GRO/TOP consistency helpers.
-- `pipeline/stages/sanitizer.py`: compatibility facade that re-exports the stage and legacy symbols for existing imports.
+- `pipeline/stages/sanitizer.py`: stable compatibility facade that re-exports `SanitizerStage`, `TopologySanitizerMixin`, and legacy symbols for existing imports.
 
 ### Stage 1 Internal Parsing Refactor
 
@@ -663,6 +663,28 @@ Stage 2 keeps the same public sanitizer facade, but moves two safety-critical in
   - non-strict mode records a degraded comparison and treats the definitions as conflicting
 - charge-fix classification/protection now uses the same typed moleculetype parse result
 - protected/degraded molecules are removed from the checker's default auto-target pool before any charge-fix write occurs; explicit `--charge-fix-target-allowlist` is now the intended opt-in path for those targets
+
+### Refactor Closeout Status
+
+`topology_sanitizer.py` staged refactor work is complete through the accepted Stage 5 hardening scope and is now the post-refactor baseline for sanitizer topology behavior.
+
+Freeze rationale:
+- external import/call surface remains stable via `pipeline/stages/sanitizer.py`
+- `TopologySanitizerMixin` remains the compatibility boundary for sanitizer topology helpers and existing call shapes are intentionally preserved
+- strict vs non-strict behavior is explicit: strict paths fail closed on ambiguity, while non-strict paths emit degraded warnings instead of silently claiming success
+- include discovery, winner selection, and sanitizer-managed `system.top` writes are deterministic and idempotent where expected
+- mixed-defaults handling has an explicit support envelope instead of implicit "best effort" behavior
+- LJ validation/outlier handling is policy-driven, auditable, and bounded by always-fatal unit-screaming checks
+
+Stable behavior boundaries for maintenance:
+- Include and macro handling: Python-side discovery does not evaluate unresolved preprocessor conditionals. Strict mode fails closed on conditional or macro-like ambiguity; non-strict mode records degraded fallback and skips ambiguous content rather than treating it as active.
+- Output layer and managed block: `topology_sanitizer.py` is the single writer for final topology artifacts. Managed-block rewrites preserve user content outside the block, dedupe managed includes, and keep deterministic include ordering. Non-strict rebuild is allowed only when malformed marker content can be identified as sanitizer-managed payload without overlapping user topology.
+- Mixed defaults: default behavior is still hard-fail on physically mixed `[ defaults ]`. The only implemented cross-group continuation path is the documented comb-rule-only `2/3` envelope with canonical `nbfunc=1` and explicit override/audit settings.
+- LJ validation: `--lj-outlier-policy` controls non-fatal review findings (`off`, `warn`, `error`), while obviously broken units still hard-fail regardless of policy. Comb-rule `1` uses robust statistical checks; comb-rule `2/3` uses profile bounds.
+
+Maintenance mode note:
+- future changes to `topology_sanitizer.py` should be bug fixes, maintenance patches, or explicitly scoped new features
+- do not continue staged-refactor phases for this file unless a new correctness blocker is found in topology semantics, output determinism, charge protection, include resolution, or documented feature truthfulness
 
 
 ### Include Resolution
@@ -1067,7 +1089,7 @@ Default propagation safeguards:
 
 ## ITP Sanitizer
 
-The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, detecting conflicts, and ensuring consistent `[ defaults ]` settings.
+The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, detecting conflicts, and ensuring consistent `[ defaults ]` settings. `topology_sanitizer.py` is the stable post-refactor baseline for this topology layer; future work should stay in maintenance/bugfix/feature mode rather than new staged refactor phases unless a real blocker is found.
 
 ### What It Does
 
