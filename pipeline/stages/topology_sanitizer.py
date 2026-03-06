@@ -297,9 +297,9 @@ def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
 class TopMoleculesParseResult:
     """Raw [ molecules ] parse result with uncertainty metadata."""
     ordered: List[Tuple[str, int]]
-    entries: List["TopMoleculesEntry"] = field(default_factory=list)
     uncertain: bool = False
     uncertainty_reasons: List[str] = field(default_factory=list)
+    entries: List["TopMoleculesEntry"] = field(default_factory=list)
 
 
 ATOMS_ROW_STATUS_PARSED = "parsed"
@@ -392,16 +392,23 @@ def parse_atoms_row(line: str) -> AtomRowParseResult:
             reason="empty [ atoms ] row",
         )
 
-    tokens = _tokenize_atoms_row(data)
-    if len(tokens) < 7:
+    raw_tokens = data.split()
+    if len(raw_tokens) < 7:
         return AtomRowParseResult(
             status=ATOMS_ROW_STATUS_INVALID,
-            reason=f"too few tokens for [ atoms ] row ({len(tokens)})",
+            reason=f"too few raw tokens for [ atoms ] row ({len(raw_tokens)})",
         )
+
+    tokens = _tokenize_atoms_row(data)
     if len(tokens) > 8:
         return AtomRowParseResult(
             status=ATOMS_ROW_STATUS_UNSUPPORTED,
             reason=f"unsupported [ atoms ] row width ({len(tokens)})",
+        )
+    if len(raw_tokens) == 7 and len(tokens) == 7 and _parse_int_token(raw_tokens[5]) is not None:
+        return AtomRowParseResult(
+            status=ATOMS_ROW_STATUS_UNSUPPORTED,
+            reason="ambiguous raw 7-column [ atoms ] row with integer-like sixth token",
         )
 
     atom_id = _parse_int_token(tokens[0])
@@ -418,6 +425,11 @@ def parse_atoms_row(line: str) -> AtomRowParseResult:
         return AtomRowParseResult(
             status=ATOMS_ROW_STATUS_INVALID,
             reason="charge/mass must be numeric",
+        )
+    if mass < 0:
+        return AtomRowParseResult(
+            status=ATOMS_ROW_STATUS_INVALID,
+            reason="mass must be non-negative",
         )
 
     cgnr: Optional[int] = None

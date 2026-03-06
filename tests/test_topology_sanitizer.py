@@ -15,6 +15,7 @@ from pipeline.stages.topology_sanitizer import (
     SanitizerError,
     TOP_MOLECULES_ENTRY_STATUS_PARSED,
     TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED,
+    TopMoleculesParseResult,
     TopologySanitizerMixin,
     parse_atoms_row,
     parse_top_molecules_entry,
@@ -299,6 +300,20 @@ def test_parse_atoms_row_returns_explicit_failure_states():
     assert unsupported.record is None
 
 
+def test_parse_atoms_row_rejects_ambiguous_raw_7_column_integer_token():
+    result = parse_atoms_row("1 CT 1 MOL C1 1 -0.125000")
+
+    assert result.status == ATOMS_ROW_STATUS_UNSUPPORTED
+    assert result.record is None
+
+
+def test_parse_atoms_row_rejects_raw_6_column_glued_charge_mass_form():
+    result = parse_atoms_row("1 CT 1 MOL C1 0.125000-12.011")
+
+    assert result.status == ATOMS_ROW_STATUS_INVALID
+    assert result.record is None
+
+
 def test_parse_top_molecules_entry_parses_integer_count():
     result = parse_top_molecules_entry("SOL 42")
 
@@ -358,6 +373,15 @@ def test_get_ordered_molecules_from_top_preserves_ordered_counts_and_raw_entries
     ]
     assert result.uncertain is True
     assert any("N_B" in reason for reason in result.uncertainty_reasons)
+
+
+def test_top_molecules_parse_result_positional_init_remains_compatible():
+    result = TopMoleculesParseResult([("A", 1)], True, ["raw-uncertain"])
+
+    assert result.ordered == [("A", 1)]
+    assert result.uncertain is True
+    assert result.uncertainty_reasons == ["raw-uncertain"]
+    assert result.entries == []
 
 
 def test_negative_sigma_policy_warns_by_default_and_errors_when_requested(tmp_path):

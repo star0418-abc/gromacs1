@@ -650,6 +650,7 @@ Stage 1 is intentionally narrow:
 - existing sanitizer entrypoints and `TopologySanitizerMixin` call shapes stay the same
 - same-name moleculetype signature/charge comparison now consumes typed `[ atoms ]` rows internally
 - ordered `[ molecules ]` extraction now delegates low-level row parsing to a dedicated helper and preserves unresolved count tokens explicitly
+- only unambiguous supported 7/8-column `[ atoms ]` rows are accepted in this path
 - unsupported/ambiguous row formats are surfaced as explicit parser states instead of being silently treated as valid data
 
 
