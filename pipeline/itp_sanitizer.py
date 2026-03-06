@@ -30,7 +30,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import shutil
 from enum import Enum
@@ -203,6 +203,47 @@ def _atomic_copy_file(src: Path, dest: Path) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+
+
+def _normalize_top_include_target(include_target: str) -> str:
+    """Normalize a system.top include target for deterministic emission."""
+    normalized = str(include_target or "").strip().replace("\\", "/")
+    if not normalized:
+        return ""
+    return PurePosixPath(normalized).as_posix()
+
+
+def _dedupe_top_include_targets(include_targets: Iterable[str]) -> List[str]:
+    """Deduplicate include targets while preserving first-seen order."""
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for include_target in include_targets:
+        normalized = _normalize_top_include_target(include_target)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _atomic_publish_current_file(versioned_path: Path, current_path: Path) -> None:
+    """Atomically update a current-file pointer via temp symlink or temp copy."""
+    current_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{current_path.name}.tmp.", dir=str(current_path.parent))
+    os.close(fd)
+    os.unlink(tmp_name)
+    temp_path = Path(tmp_name)
+    try:
+        try:
+            temp_path.symlink_to(versioned_path.name)
+            os.replace(temp_path, current_path)
+        except OSError:
+            if temp_path.exists() or temp_path.is_symlink():
+                temp_path.unlink()
+            _atomic_copy_file(versioned_path, current_path)
+    finally:
+        if temp_path.exists() or temp_path.is_symlink():
+            temp_path.unlink()
 
 
 # =============================================================================
@@ -2262,12 +2303,7 @@ class ItpSanitizer:
             summary["injected_counts"][section_name] = len(entries)
 
         _atomic_write_text(versioned, "\n".join(lines).rstrip() + "\n")
-        if current.exists() or current.is_symlink():
-            current.unlink()
-        try:
-            current.symlink_to(versioned.name)
-        except OSError:
-            shutil.copy2(versioned, current)
+        _atomic_publish_current_file(versioned, current)
 
         summary["applied"] = True
         summary["reason"] = "generated"
@@ -2673,9 +2709,10 @@ class ItpSanitizer:
         if policy is None:
             policy = "warn" if allow_mixed else "off"
         rule = getattr(ctx, "mixed_defaults_cross_group_rule", None) if ctx else None
-        max_pairs = int(
+        max_pairs_raw = (
             getattr(ctx, "mixed_defaults_cross_group_max_pairs", 20000) if ctx else 20000
         )
+        max_pairs = int(max_pairs_raw if max_pairs_raw is not None else 20000)
         reason = (
             (getattr(ctx, "mixed_defaults_cross_group_reason", None) if ctx else None) or None
         )
@@ -2889,13 +2926,7 @@ class ItpSanitizer:
         ]
         lines.extend(param_lines)
         _atomic_write_text(versioned_path, "\n".join(lines) + "\n")
-
-        if current_path.exists() or current_path.is_symlink():
-            current_path.unlink()
-        try:
-            current_path.symlink_to(versioned_path.name)
-        except OSError:
-            shutil.copy2(versioned_path, current_path)
+        _atomic_publish_current_file(versioned_path, current_path)
 
         summary.update(
             {
@@ -3101,13 +3132,7 @@ class ItpSanitizer:
         ]
         content_lines.extend(param_lines)
         _atomic_write_text(versioned_path, "\n".join(content_lines) + "\n")
-
-        if current_path.exists() or current_path.is_symlink():
-            current_path.unlink()
-        try:
-            current_path.symlink_to(versioned_path.name)
-        except OSError:
-            shutil.copy2(versioned_path, current_path)
+        _atomic_publish_current_file(versioned_path, current_path)
 
         print("  [WARN] ===========================================================")
         print(
@@ -3462,13 +3487,7 @@ class ItpSanitizer:
         
         # Create current symlink/copy
         combined_current = output_dir / "combined_atomtypes_current.itp"
-        if combined_current.exists() or combined_current.is_symlink():
-            combined_current.unlink()
-        try:
-            combined_current.symlink_to(combined_path.name)
-        except OSError:
-            # Symlinks may fail on Windows, use copy instead
-            _atomic_copy_file(combined_path, combined_current)
+        _atomic_publish_current_file(combined_path, combined_current)
         print(f"  Linked: {combined_current.name} -> {combined_path.name}")
         
         # Create sanitized directory
@@ -3744,6 +3763,7 @@ def generate_system_top(
         )
     
     molecule_counts = molecule_counts or {}
+    extra_includes = _dedupe_top_include_targets(extra_includes or [])
     
     lines = [
         "; System topology generated by ITP Sanitizer",
@@ -3776,14 +3796,17 @@ def generate_system_top(
             "",
         ])
     
-    combined_rel = Path(os.path.relpath(combined_atomtypes_path, top_dir))
+    combined_rel = _normalize_top_include_target(
+        Path(os.path.relpath(combined_atomtypes_path, top_dir)).as_posix()
+    )
 
     # Track paths for validation
-    include_paths = [(combined_atomtypes_path, combined_rel.as_posix())]
+    include_paths = [(combined_atomtypes_path, combined_rel)]
+    emitted_includes: Set[str] = {combined_rel}
     
     lines.extend([
         "; Combined atomtypes (after defaults for correct LJ interpretation)",
-        f'#include "{combined_rel.as_posix()}"',
+        f'#include "{combined_rel}"',
         "",
     ])
     
@@ -3791,23 +3814,46 @@ def generate_system_top(
     if extra_includes:
         lines.append("; Extra includes (POSRES, water models, etc.)")
         for inc in extra_includes:
+            if inc in emitted_includes:
+                continue
             lines.append(f'#include "{inc}"')
+            emitted_includes.add(inc)
         lines.append("")
     
     lines.append("; Molecule definitions (only files with [ moleculetype ] section)")
     
     # Only include molecule ITPs if list is provided
     if molecule_itp_files:
+        seen_molecule_paths: Set[Path] = set()
         for itp_path in molecule_itp_files:
-            rel_path = Path(os.path.relpath(itp_path, top_dir))
-            lines.append(f'#include "{rel_path.as_posix()}"')
-            include_paths.append((itp_path, rel_path.as_posix()))
+            resolved = itp_path.resolve()
+            if resolved in seen_molecule_paths:
+                continue
+            seen_molecule_paths.add(resolved)
+            rel_path = _normalize_top_include_target(
+                Path(os.path.relpath(itp_path, top_dir)).as_posix()
+            )
+            if rel_path in emitted_includes:
+                continue
+            lines.append(f'#include "{rel_path}"')
+            include_paths.append((itp_path, rel_path))
+            emitted_includes.add(rel_path)
     else:
         # Fallback: include all sanitized ITPs (legacy behavior)
+        seen_sanitized_paths: Set[Path] = set()
         for itp_path in sanitized_itp_paths:
-            rel_path = Path(os.path.relpath(itp_path, top_dir))
-            lines.append(f'#include "{rel_path.as_posix()}"')
-            include_paths.append((itp_path, rel_path.as_posix()))
+            resolved = itp_path.resolve()
+            if resolved in seen_sanitized_paths:
+                continue
+            seen_sanitized_paths.add(resolved)
+            rel_path = _normalize_top_include_target(
+                Path(os.path.relpath(itp_path, top_dir)).as_posix()
+            )
+            if rel_path in emitted_includes:
+                continue
+            lines.append(f'#include "{rel_path}"')
+            include_paths.append((itp_path, rel_path))
+            emitted_includes.add(rel_path)
     
     lines.extend([
         "",

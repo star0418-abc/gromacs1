@@ -6,6 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from pipeline.itp_sanitizer import AtomtypeEntry, DefaultsEntry, ItpSanitizer
 from pipeline.stages.sanitizer_stage import SanitizerError, SanitizerStage
 
 
@@ -389,3 +390,134 @@ def test_mixed_defaults_generate_includes_cross_group_artifact_in_system_top(tmp
     system_top = ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")
     content = system_top.read_text(encoding="utf-8")
     assert 'nonbond_params_cross_group_current.itp' in content
+
+
+def test_stage_orders_sanitizer_generated_extra_includes_deterministically(tmp_path, monkeypatch):
+    ctx = _prepare_base_tree(
+        tmp_path,
+        "[ molecules ]\nA 0\n",
+    )
+    ctx.allow_mixed_defaults = True
+    ctx.allow_mixed_defaults_reason = "test"
+    result = _make_stub_result(
+        ctx.get_input_path("systems", ctx.system_id, "gromacs"),
+        ctx.run_id,
+        mixed_defaults=True,
+    )
+    prefix_include = (
+        ctx.get_input_path("systems", ctx.system_id, "gromacs")
+        / "itp_sanitized_current"
+        / "prefix_injected_types_current.itp"
+    )
+    cross_group = (
+        ctx.get_input_path("systems", ctx.system_id, "gromacs")
+        / "itp_sanitized_current"
+        / "nonbond_params_cross_group_current.itp"
+    )
+    secondary_include = (
+        ctx.get_input_path("systems", ctx.system_id, "gromacs")
+        / "itp_sanitized_current"
+        / "nonbond_params_secondary_current.itp"
+    )
+    _write(prefix_include, "[ bondtypes ]\n")
+    _write(cross_group, "[ nonbond_params ]\n")
+    _write(secondary_include, "[ nonbond_params ]\n")
+    result.prefix_injected_types_current_path = prefix_include
+    result.nonbond_params_cross_group_current_path = cross_group
+    result.nonbond_params_cross_group_summary = {"policy": "generate", "status": "generated"}
+    result.nonbond_params_secondary_current_path = secondary_include
+    _patch_sanitizer_run(monkeypatch, ctx, result=result)
+
+    stage = SanitizerStage()
+    monkeypatch.setattr(stage, "_warn_atomtype_outliers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(stage, "_warn_pairs_consistency", lambda *args, **kwargs: None)
+
+    assert stage.run(ctx) is True
+    system_top = ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")
+    content = system_top.read_text(encoding="utf-8")
+    assert content.count('prefix_injected_types_current.itp') == 1
+    assert content.count('nonbond_params_cross_group_current.itp') == 1
+    assert content.count('nonbond_params_secondary_current.itp') == 1
+    assert content.index('prefix_injected_types_current.itp') < content.index('nonbond_params_cross_group_current.itp')
+    assert content.index('nonbond_params_cross_group_current.itp') < content.index('nonbond_params_secondary_current.itp')
+
+
+def test_generate_cross_group_nonbond_params_produces_current_artifact(tmp_path):
+    ctx = FakeContext(
+        tmp_path,
+        allow_mixed_defaults=True,
+        allow_mixed_defaults_reason="test",
+        mixed_defaults_cross_group_policy="generate",
+        mixed_defaults_cross_group_reason="test",
+    )
+    sanitizer = ItpSanitizer(source_ff="OPLS-AA")
+    primary_source = tmp_path / "primary.itp"
+    secondary_source = tmp_path / "secondary.itp"
+    primary_defaults = DefaultsEntry(
+        nbfunc=1,
+        comb_rule=2,
+        gen_pairs="yes",
+        fudge_lj=0.5,
+        fudge_qq=0.8333,
+        source_file=str(primary_source),
+    )
+    secondary_defaults = DefaultsEntry(
+        nbfunc=1,
+        comb_rule=3,
+        gen_pairs="yes",
+        fudge_lj=0.5,
+        fudge_qq=0.8333,
+        source_file=str(secondary_source),
+    )
+    sanitizer.canonical_defaults = primary_defaults
+    sanitizer.registry = {
+        "AA": AtomtypeEntry(
+            name="AA",
+            mass=12.0,
+            charge=0.0,
+            ptype="A",
+            sigma=0.30,
+            epsilon=0.20,
+            source_ff="OPLS-AA",
+            source_files=[str(primary_source)],
+        ),
+        "BB": AtomtypeEntry(
+            name="BB",
+            mass=12.0,
+            charge=0.0,
+            ptype="A",
+            sigma=0.40,
+            epsilon=0.10,
+            source_ff="GAFF2",
+            source_files=[str(secondary_source)],
+        ),
+    }
+
+    versioned_path, current_path, summary = sanitizer._generate_cross_group_nonbond_params(
+        output_dir=tmp_path,
+        run_id="RUN123",
+        source_defaults_map={
+            primary_source: primary_defaults,
+            secondary_source: secondary_defaults,
+        },
+        defaults_report={
+            "mixed_defaults_detected": True,
+            "classification": "comb-rule-only",
+            "primary_defaults_signature": primary_defaults.signature(),
+            "secondary_signatures": [secondary_defaults.signature()],
+        },
+        scan_paths=[],
+        ctx=ctx,
+    )
+
+    assert summary["status"] == "generated"
+    assert summary["pair_count"] == 1
+    assert versioned_path == tmp_path / "nonbond_params_cross_group_RUN123.itp"
+    assert current_path == tmp_path / "nonbond_params_cross_group_current.itp"
+    assert versioned_path.exists()
+    assert current_path.exists()
+    content = current_path.read_text(encoding="utf-8")
+    assert "[ nonbond_params ]" in content
+    assert "AA" in content
+    assert "BB" in content
+    assert not list(tmp_path.glob(".nonbond_params_cross_group_current.itp.tmp.*"))

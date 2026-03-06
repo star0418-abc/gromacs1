@@ -7,8 +7,8 @@ Contains ITP/include/topology/forcefield sanitization and final output helpers.
 from dataclasses import dataclass, field
 from collections import deque
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
 import math
 import hashlib
 import os
@@ -3510,6 +3510,146 @@ class TopologySanitizerMixin:
                     "(already validated during sanitizer defaults pass)."
                 )
 
+    @staticmethod
+    def _normalize_top_include_target(include_target: str) -> str:
+        """Normalize a system.top include target for deterministic emission."""
+        normalized = str(include_target or "").strip().replace("\\", "/")
+        if not normalized:
+            return ""
+        return PurePosixPath(normalized).as_posix()
+
+    def _relative_top_include_target(
+        self,
+        include_path: Path,
+        *,
+        top_dir: Optional[Path],
+        fallback_dir: Optional[str] = None,
+    ) -> str:
+        """Return a normalized include target relative to system.top."""
+        if top_dir is not None:
+            rel_path = Path(os.path.relpath(include_path, top_dir)).as_posix()
+            return self._normalize_top_include_target(rel_path)
+        if fallback_dir:
+            return self._normalize_top_include_target(
+                f"{fallback_dir.rstrip('/')}/{include_path.name}"
+            )
+        return self._normalize_top_include_target(include_path.name)
+
+    def _dedupe_include_targets(self, include_targets: Iterable[str]) -> List[str]:
+        """Deduplicate include targets while preserving first-seen order."""
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for include_target in include_targets:
+            normalized = self._normalize_top_include_target(include_target)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered
+
+    def _ordered_output_extra_includes(self, top_dir: Path, result: Any) -> List[str]:
+        """
+        Build deterministic sanitizer-generated sidecar includes for system.top.
+
+        Order is explicit:
+        1. Prefix-injected bonded/type tables
+        2. Mixed-defaults cross-group nonbond_params override
+        3. Mixed-defaults within-group preservation nonbond_params
+        """
+        ordered_targets: List[str] = []
+        for attr_name in (
+            "prefix_injected_types_current_path",
+            "nonbond_params_cross_group_current_path",
+            "nonbond_params_secondary_current_path",
+        ):
+            raw_path = getattr(result, attr_name, None)
+            if not raw_path:
+                continue
+            include_path = Path(raw_path)
+            if not include_path.exists():
+                continue
+            ordered_targets.append(
+                self._relative_top_include_target(
+                    include_path,
+                    top_dir=top_dir,
+                )
+            )
+        return self._dedupe_include_targets(ordered_targets)
+
+    def _insert_managed_block_at_index(
+        self,
+        lines: List[str],
+        managed_lines: List[str],
+        begin_marker: str,
+        end_marker: str,
+        insert_idx: int,
+    ) -> List[str]:
+        """Insert a managed block at an exact line index with stable spacing."""
+        result_lines = list(lines[:insert_idx])
+        if result_lines and result_lines[-1].strip():
+            result_lines.append("")
+        result_lines.append(begin_marker)
+        result_lines.extend(managed_lines)
+        result_lines.append(end_marker)
+        if insert_idx < len(lines) and lines[insert_idx].strip():
+            result_lines.append("")
+        result_lines.extend(lines[insert_idx:])
+        return result_lines
+
+    def _managed_block_payload_is_safe(self, payload_lines: List[str]) -> bool:
+        """Return True when removed malformed-block payload is managed-block shaped."""
+        in_defaults = False
+        for line in payload_lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(";"):
+                continue
+            section = parse_section_name(line)
+            if section is not None:
+                in_defaults = section == "defaults"
+                if in_defaults:
+                    continue
+                return False
+            if parse_include_target(line):
+                in_defaults = False
+                continue
+            if preprocessor_directive_token(line) is not None:
+                return False
+            if in_defaults:
+                continue
+            return False
+        return True
+
+    def _cleanup_malformed_managed_block(
+        self,
+        lines: List[str],
+        begin_marker: str,
+        end_marker: str,
+    ) -> Optional[List[str]]:
+        """
+        Remove malformed managed-block fragments only when the removed payload is safe.
+
+        This prevents non-strict rebuild mode from silently deleting user topology
+        content such as `[ system ]` / `[ molecules ]` sections.
+        """
+        cleaned_lines: List[str] = []
+        removed_payload: List[str] = []
+        in_managed = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped == begin_marker:
+                in_managed = True
+                continue
+            if stripped == end_marker:
+                in_managed = False
+                continue
+            if in_managed:
+                removed_payload.append(line)
+                continue
+            cleaned_lines.append(line)
+        if not self._managed_block_payload_is_safe(removed_payload):
+            return None
+        return cleaned_lines
+
 
 
 
@@ -3602,22 +3742,19 @@ class TopologySanitizerMixin:
             )
             if strict_top_update:
                 raise SanitizerError(msg)
+            cleaned_lines = self._cleanup_malformed_managed_block(
+                lines,
+                begin_marker,
+                end_marker,
+            )
+            if cleaned_lines is None:
+                raise SanitizerError(
+                    msg
+                    + "\nCannot safely rebuild non-strict system.top because malformed managed-block "
+                    "fragments overlap non-managed topology content."
+                )
             print(f"  [WARN] {msg}")
-            print("  [WARN] Rebuilding sanitizer managed block to avoid stale system.top.")
-
-            cleaned_lines: List[str] = []
-            in_managed = False
-            for line in lines:
-                stripped = line.strip()
-                if stripped == begin_marker:
-                    in_managed = True
-                    continue
-                if stripped == end_marker:
-                    in_managed = False
-                    continue
-                if in_managed:
-                    continue
-                cleaned_lines.append(line)
+            print("  [WARN] Rebuilding sanitizer managed block from safe managed-content fragments only.")
 
             has_defaults, has_forcefield_include = self._top_has_defaults_or_forcefield(
                 lines=cleaned_lines,
@@ -3651,6 +3788,12 @@ class TopologySanitizerMixin:
                 end_marker,
             )
             return '\n'.join(rebuilt) + '\n'
+
+        if len(pairs) > 1 and strict_top_update:
+            raise SanitizerError(
+                f"Multiple sanitizer managed blocks detected ({len(pairs)}). "
+                "Replacing all managed blocks with one clean block."
+            )
 
         # Detect pre-existing defaults/forcefield include outside managed block(s).
         # If found, do not inject a duplicate [ defaults ] section.
@@ -3711,20 +3854,21 @@ class TopologySanitizerMixin:
             for start, end in pairs_sorted:
                 skip_indices.update(range(start, end + 1))
 
-            result_lines: List[str] = []
-            inserted = False
-            for idx, line in enumerate(lines):
-                if not inserted and idx == insertion_at:
-                    result_lines.append(begin_marker)
-                    result_lines.extend(managed_lines)
-                    result_lines.append(end_marker)
-                    inserted = True
-                if idx in skip_indices:
-                    continue
-                    result_lines.append(line)
+            cleaned_lines = [
+                line for idx, line in enumerate(lines) if idx not in skip_indices
+            ]
+            removed_before_insertion = sum(1 for idx in skip_indices if idx < insertion_at)
+            cleaned_insert_idx = insertion_at - removed_before_insertion
+            result_lines = self._insert_managed_block_at_index(
+                cleaned_lines,
+                managed_lines,
+                begin_marker,
+                end_marker,
+                cleaned_insert_idx,
+            )
             self._system_top_update_status = {
                 "mode": "collapsed_multiple_managed_blocks",
-                "degraded": bool(top_preprocessor_issues),
+                "degraded": True,
                 "blocks_found": len(pairs),
                 "preprocessor_ambiguity": list(top_preprocessor_issues),
             }
@@ -3753,6 +3897,7 @@ class TopologySanitizerMixin:
     ) -> List[str]:
         """Build the content that goes inside the sanitizer managed block."""
         managed_lines: List[str] = []
+        emitted_includes: Set[str] = set()
 
         # Defaults section
         if emit_defaults:
@@ -3777,36 +3922,56 @@ class TopologySanitizerMixin:
                 )
         
         # Combined atomtypes include
-        if top_dir is not None:
-            combined_rel = Path(os.path.relpath(combined_atomtypes_path, top_dir))
-        else:
-            combined_rel = Path(combined_atomtypes_path.name)
+        combined_rel = self._relative_top_include_target(
+            combined_atomtypes_path,
+            top_dir=top_dir,
+        )
 
         if emit_defaults:
             managed_lines.append("; Combined atomtypes (after defaults for correct LJ interpretation)")
         else:
             managed_lines.append("; Combined atomtypes")
         managed_lines.extend([
-            f'#include "{combined_rel.as_posix()}"',
+            f'#include "{combined_rel}"',
             "",
         ])
+        emitted_includes.add(combined_rel)
 
-        if extra_includes:
+        normalized_extra_includes = self._dedupe_include_targets(extra_includes or [])
+        extra_to_emit = [
+            include_target
+            for include_target in normalized_extra_includes
+            if include_target not in emitted_includes
+        ]
+        if extra_to_emit:
             managed_lines.append("; Extra includes (sanitizer generated)")
-            for inc in extra_includes:
-                managed_lines.append(f'#include "{inc}"')
+            for include_target in extra_to_emit:
+                managed_lines.append(f'#include "{include_target}"')
+                emitted_includes.add(include_target)
             managed_lines.append("")
 
-        managed_lines.append("; Molecule definitions (sanitized)")
-        
-        # Molecule ITP includes
+        managed_lines.append("; Molecule definitions (sanitized, [molecules]-ordered)")
+
+        molecule_targets: List[str] = []
+        seen_molecule_paths: Set[Path] = set()
         for itp_path in molecule_itp_files:
-            if top_dir is not None:
-                rel_path = Path(os.path.relpath(itp_path, top_dir))
-                managed_lines.append(f'#include "{rel_path.as_posix()}"')
-            else:
-                managed_lines.append(f'#include "itp_sanitized_current/{itp_path.name}"')
-        
+            resolved = itp_path.resolve()
+            if resolved in seen_molecule_paths:
+                continue
+            seen_molecule_paths.add(resolved)
+            molecule_targets.append(
+                self._relative_top_include_target(
+                    itp_path,
+                    top_dir=top_dir,
+                    fallback_dir="itp_sanitized_current",
+                )
+            )
+        for include_target in molecule_targets:
+            if include_target in emitted_includes:
+                continue
+            managed_lines.append(f'#include "{include_target}"')
+            emitted_includes.add(include_target)
+
         managed_lines.append("")
         return managed_lines
 
@@ -3832,17 +3997,37 @@ class TopologySanitizerMixin:
 
         has_defaults = False
         has_forcefield = False
+        conditional_depth = 0
         for idx, line in enumerate(lines):
             if idx in skip_indices:
+                continue
+            directive = preprocessor_directive_token(line)
+            if directive == "#include":
+                if conditional_depth > 0:
+                    continue
+                include_target = parse_include_target(line)
+                if include_target:
+                    target = include_target.lower()
+                    if "forcefield.itp" in target or ".ff/" in target:
+                        has_forcefield = True
+                if has_defaults and has_forcefield:
+                    break
+                continue
+            if directive is not None:
+                if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
+                    conditional_depth += 1
+                elif directive in PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES:
+                    if conditional_depth == 0:
+                        conditional_depth = 1
+                elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
+                    if conditional_depth > 0:
+                        conditional_depth -= 1
+                continue
+            if conditional_depth > 0:
                 continue
             section = parse_section_name(line)
             if section == "defaults":
                 has_defaults = True
-            include_target = parse_include_target(line)
-            if include_target:
-                target = include_target.lower()
-                if "forcefield.itp" in target or ".ff/" in target:
-                    has_forcefield = True
             if has_defaults and has_forcefield:
                 break
 
@@ -3859,42 +4044,67 @@ class TopologySanitizerMixin:
         Insert the managed block at a safe location in system.top.
         
         Deterministic policy:
-        1. If forcefield include block exists, insert immediately after its last line.
-        2. Otherwise insert after leading comment/blank preamble.
+        1. If an unconditional forcefield include exists before the first topology
+           section, insert immediately after its last line.
+        2. Otherwise insert before the first non-preamble line, where the preamble
+           is limited to leading comments, blanks, and top-level macro definitions.
+        3. Never insert after the first topology section header.
         """
-        insert_idx = 0
-        forcefield_include_idx = None
+        first_section_idx = len(lines)
+        for idx, line in enumerate(lines):
+            if parse_section_name(line) is not None:
+                first_section_idx = idx
+                break
 
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            include_target = parse_include_target(stripped)
-            if include_target:
+        forcefield_include_idx = None
+        conditional_depth = 0
+
+        for idx, line in enumerate(lines[:first_section_idx]):
+            directive = preprocessor_directive_token(line)
+            if directive == "#include":
+                if conditional_depth > 0:
+                    continue
+                include_target = parse_include_target(line)
+                if include_target is None:
+                    continue
                 target_lower = include_target.lower()
                 if "forcefield.itp" in target_lower or ".ff/" in target_lower:
-                    forcefield_include_idx = i
+                    forcefield_include_idx = idx
+                continue
+            if directive is not None:
+                if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
+                    conditional_depth += 1
+                elif directive in PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES:
+                    if conditional_depth == 0:
+                        conditional_depth = 1
+                elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
+                    if conditional_depth > 0:
+                        conditional_depth -= 1
+                continue
 
         if forcefield_include_idx is not None:
             insert_idx = forcefield_include_idx + 1
         else:
-            idx = 0
-            while idx < len(lines):
-                stripped = lines[idx].strip()
-                if not stripped or stripped.startswith(";"):
-                    idx += 1
+            insert_idx = 0
+            while insert_idx < first_section_idx:
+                stripped = lines[insert_idx].strip()
+                directive = preprocessor_directive_token(lines[insert_idx])
+                if (
+                    not stripped
+                    or stripped.startswith(";")
+                    or directive in PREPROCESSOR_MACRO_DIRECTIVES
+                ):
+                    insert_idx += 1
                     continue
                 break
-            insert_idx = idx
-        
-        # Build result with markers
-        result_lines = lines[:insert_idx]
-        result_lines.append("")  # Blank line before block
-        result_lines.append(begin_marker)
-        result_lines.extend(managed_lines)
-        result_lines.append(end_marker)
-        result_lines.append("")  # Blank line after block
-        result_lines.extend(lines[insert_idx:])
-        
-        return result_lines
+
+        return self._insert_managed_block_at_index(
+            lines,
+            managed_lines,
+            begin_marker,
+            end_marker,
+            insert_idx,
+        )
     
     def _create_minimal_outputs(
         self,

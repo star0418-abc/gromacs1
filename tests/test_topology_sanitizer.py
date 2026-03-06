@@ -18,6 +18,8 @@ from pipeline.stages.topology_sanitizer import (
     ATOMS_ROW_STATUS_UNSUPPORTED,
     DEFAULT_MOLECULE_SIG_QUANT_STEP,
     MOLECULETYPE_COMPARE_UNCERTAIN,
+    SANITIZER_BLOCK_BEGIN,
+    SANITIZER_BLOCK_END,
     SanitizerError,
     TOP_MOLECULES_ENTRY_STATUS_PARSED,
     TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED,
@@ -378,6 +380,250 @@ def test_update_system_top_includes_strict_fails_closed_on_preprocessor_ambiguit
             top_dir=existing_top.parent,
             ctx=ctx,
         )
+
+
+def test_update_system_top_includes_inserts_new_managed_block_after_forcefield_include(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "; Banner\n"
+        "#define USE_SANITIZED\n"
+        "#include \"oplsaa.ff/forcefield.itp\"\n"
+        "; User comment\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    updated = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_itp],
+        top_dir=existing_top.parent,
+        ctx=ctx,
+    )
+
+    lines = updated.splitlines()
+    assert lines.count(SANITIZER_BLOCK_BEGIN) == 1
+    assert lines.count(SANITIZER_BLOCK_END) == 1
+    assert "[ defaults ]" not in updated
+    assert lines.index(SANITIZER_BLOCK_BEGIN) > lines.index('#include "oplsaa.ff/forcefield.itp"')
+    assert lines.index(SANITIZER_BLOCK_BEGIN) < lines.index("; User comment")
+    assert '#include "combined_atomtypes_current.itp"' in updated
+    assert '#include "../itp/A.itp"' in updated
+
+
+def test_update_system_top_includes_uses_safe_anchor_before_non_forcefield_includes(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "; Banner\n"
+        "#define KEEP_THIS\n"
+        "#include \"user_custom_before_block.itp\"\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    updated = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_itp],
+        defaults=SimpleNamespace(
+            nbfunc=1,
+            comb_rule=2,
+            gen_pairs="yes",
+            fudge_lj=0.5,
+            fudge_qq=0.8333,
+        ),
+        top_dir=existing_top.parent,
+        ctx=ctx,
+    )
+
+    lines = updated.splitlines()
+    assert lines.index(SANITIZER_BLOCK_BEGIN) > lines.index("#define KEEP_THIS")
+    assert lines.index(SANITIZER_BLOCK_BEGIN) < lines.index('#include "user_custom_before_block.itp"')
+    assert "[ defaults ]" in updated
+
+
+def test_update_system_top_includes_replaces_existing_block_without_duplicate_includes(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "#include \"oplsaa.ff/forcefield.itp\"\n"
+        f"{SANITIZER_BLOCK_BEGIN}\n"
+        "; Combined atomtypes\n"
+        "#include \"old_combined.itp\"\n"
+        "#include \"extra.itp\"\n"
+        "\n"
+        "; Molecule definitions (sanitized)\n"
+        "#include \"../itp/OLD.itp\"\n"
+        "\n"
+        f"{SANITIZER_BLOCK_END}\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    updated = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_itp],
+        top_dir=existing_top.parent,
+        ctx=ctx,
+        extra_includes=["extra.itp", "extra.itp"],
+    )
+
+    assert updated.count(SANITIZER_BLOCK_BEGIN) == 1
+    assert updated.count(SANITIZER_BLOCK_END) == 1
+    assert "old_combined.itp" not in updated
+    assert "../itp/OLD.itp" not in updated
+    assert updated.count('#include "extra.itp"') == 1
+    assert updated.count('#include "../itp/A.itp"') == 1
+    assert "[ system ]\nDemo" in updated
+
+
+def test_update_system_top_includes_is_idempotent_on_rerun(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_a = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    molecule_b = tmp_path / "IN/systems/SYS/gromacs/itp/B.itp"
+    _write(
+        existing_top,
+        "#include \"oplsaa.ff/forcefield.itp\"\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "B 1\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_a, "[ moleculetype ]\nA 3\n")
+    _write(molecule_b, "[ moleculetype ]\nB 3\n")
+
+    first = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_b, molecule_a, molecule_a],
+        top_dir=existing_top.parent,
+        ctx=ctx,
+        extra_includes=["extra.itp", "extra.itp"],
+    )
+    _write(existing_top, first)
+    second = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_b, molecule_a, molecule_a],
+        top_dir=existing_top.parent,
+        ctx=ctx,
+        extra_includes=["extra.itp", "extra.itp"],
+    )
+
+    assert second == first
+    assert second.count(SANITIZER_BLOCK_BEGIN) == 1
+    assert second.count(SANITIZER_BLOCK_END) == 1
+    assert second.count('#include "extra.itp"') == 1
+    assert second.count('#include "../itp/B.itp"') == 1
+    assert second.count('#include "../itp/A.itp"') == 1
+
+
+def test_update_system_top_includes_strict_rejects_multiple_managed_blocks(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path, strict_top_update=True)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        f"{SANITIZER_BLOCK_BEGIN}\n"
+        "#include \"old_a.itp\"\n"
+        f"{SANITIZER_BLOCK_END}\n"
+        "; keep me\n"
+        f"{SANITIZER_BLOCK_BEGIN}\n"
+        "#include \"old_b.itp\"\n"
+        f"{SANITIZER_BLOCK_END}\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    with pytest.raises(SanitizerError, match="Multiple sanitizer managed blocks detected"):
+        sanitizer._update_system_top_includes(
+            existing_top,
+            combined_atomtypes,
+            [molecule_itp],
+            top_dir=existing_top.parent,
+            ctx=ctx,
+        )
+
+
+def test_update_system_top_includes_non_strict_collapses_multiple_blocks_without_losing_user_content(
+    tmp_path,
+    capsys,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "#include \"oplsaa.ff/forcefield.itp\"\n"
+        f"{SANITIZER_BLOCK_BEGIN}\n"
+        "#include \"old_a.itp\"\n"
+        f"{SANITIZER_BLOCK_END}\n"
+        "#include \"user_custom.itp\"\n"
+        f"{SANITIZER_BLOCK_BEGIN}\n"
+        "#include \"old_b.itp\"\n"
+        f"{SANITIZER_BLOCK_END}\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    updated = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_itp],
+        top_dir=existing_top.parent,
+        ctx=ctx,
+    )
+
+    assert "Multiple sanitizer managed blocks detected" in capsys.readouterr().out
+    assert updated.count(SANITIZER_BLOCK_BEGIN) == 1
+    assert updated.count(SANITIZER_BLOCK_END) == 1
+    assert '#include "user_custom.itp"' in updated
+    assert "old_a.itp" not in updated
+    assert "old_b.itp" not in updated
 
 
 def test_uncertain_same_name_conflict_fails_closed_in_strict_mode(tmp_path):
@@ -901,6 +1147,57 @@ def test_get_ordered_molecules_from_top_preserves_ordered_counts_and_raw_entries
     ]
     assert result.uncertain is True
     assert any("N_B" in reason for reason in result.uncertainty_reasons)
+
+
+def test_map_sanitized_itps_to_molecules_maps_all_expected_names_deterministically(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    sanitized_current_dir = tmp_path / "itp_sanitized_current"
+    _write(sanitized_current_dir / "z_b.itp", _simple_itp("B"))
+    _write(sanitized_current_dir / "a_a.itp", _simple_itp("A"))
+
+    mapping = sanitizer._map_sanitized_itps_to_molecules(
+        sanitized_current_dir,
+        {"B", "A"},
+        ctx=ctx,
+    )
+
+    assert list(mapping.keys()) == ["A", "B"]
+    assert mapping["A"].name == "a_a.itp"
+    assert mapping["B"].name == "z_b.itp"
+
+
+def test_ordered_molecule_itp_paths_preserves_first_seen_order_and_dedupes_files(tmp_path):
+    sanitizer = DummySanitizer()
+    a_itp = tmp_path / "a.itp"
+    b_itp = tmp_path / "b.itp"
+    _write(a_itp, "")
+    _write(b_itp, "")
+
+    result = sanitizer._ordered_molecule_itp_paths(
+        [("B", 1), ("A", 2), ("D", 1), ("B", 3), ("C", 0)],
+        {
+            "A": a_itp,
+            "B": b_itp,
+            "D": a_itp,
+        },
+        tmp_path,
+    )
+
+    assert result == [b_itp, a_itp]
+
+
+def test_ordered_molecule_itp_paths_fails_when_expected_include_is_missing(tmp_path):
+    sanitizer = DummySanitizer()
+    a_itp = tmp_path / "a.itp"
+    _write(a_itp, "")
+
+    with pytest.raises(SanitizerError, match="No sanitized ITP found for molecule 'B'"):
+        sanitizer._ordered_molecule_itp_paths(
+            [("A", 1), ("B", 1)],
+            {"A": a_itp},
+            tmp_path,
+        )
 
 
 def test_top_molecules_parse_result_positional_init_remains_compatible():

@@ -1074,7 +1074,7 @@ The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, d
 3. **Defaults Validation**: Ensures all `[ defaults ]` tuples are consistent across all reachable sources (`nbfunc/comb-rule/gen-pairs/fudgeLJ/fudgeQQ`)
 4. **Combined Atomtypes**: Generates a single `combined_atomtypes_current.itp` with all unique atomtypes
 5. **Sanitized ITPs**: Removes `[ atomtypes ]` and `[ defaults ]` from individual ITPs
-6. **system.top Generation**: Creates topology with correct include order (defaults 鈫?atomtypes 鈫?extra includes 鈫?molecules), while avoiding duplicate `[ defaults ]` injection when existing `system.top` already has defaults/forcefield include; existing `[molecules]` is preserved only when raw staged `[molecules]` was the trusted source
+6. **system.top Generation**: Creates topology with correct include order (defaults 鈫?atomtypes 鈫?extra includes 鈫?molecules), writes one deterministic sanitizer-managed block in `system.top`, deduplicates managed includes, and avoids duplicate `[ defaults ]` injection when existing `system.top` already has defaults/forcefield include; existing `[molecules]` is preserved only when raw staged `[molecules]` was the trusted source
 7. **Molecule Scope**: `system.top` includes only molecule ITPs for species present in `[molecules]` (include-aware moleculetype detection)
 8. **Include Integrity**: Resolves `#include` targets like GROMACS `-I`, detects shadowing in strict mode, sanitizes include-closure files with `[ defaults ]`/`[ atomtypes ]`, validates paths on disk, and writes winner-only sanitized files for include-target collisions
 
@@ -1144,7 +1144,8 @@ Atomtype conflicts are detected based on **physical parameters only**:
   - `--mixed-defaults-cross-group-rule {lorentz-berthelot,geometric}` (auto default from canonical comb-rule: `2->LB`, `3->geometric`)
   - `--mixed-defaults-cross-group-max-pairs N` (default: `20000`, hard cap)
   - `--mixed-defaults-cross-group-reason "TEXT"` (required when policy=`generate`)
-- `generate` writes sanitizer-managed `nonbond_params_cross_group_current.itp`, and `topology_sanitizer.py` includes it when generating a new `system.top` or updating an existing managed block.
+- `generate` is implemented for mixed-defaults classification `comb-rule-only` with canonical `nbfunc=1` and canonical comb-rule `2` or `3`.
+- `generate` writes versioned/current sanitizer-managed `nonbond_params_cross_group_current.itp`, and `topology_sanitizer.py` includes it deterministically when generating a new `system.top` or updating an existing managed block.
 - When policy=`generate`, sanitizer verifies the expected cross-group artifact path exists before continuing; missing remediation artifacts are treated as hard failures.
 - Existing explicit `pairtypes` / `nonbond_params` pairs are never overwritten; generated pairs skip preexisting entries and are reported.
 
@@ -1221,9 +1222,14 @@ content = generate_system_top(
 Generated output order:
 1. `[ defaults ]`
 2. `#include "<relative path to combined_atomtypes_current.itp>"`
-3. Extra includes (POSRES, water models)
+3. Extra includes (POSRES, water models, sanitizer-generated sidecars), deduplicated in first-seen order
 4. Molecule ITPs
 5. `[ system ]` and `[ molecules ]`
+
+When the sanitizer itself builds extra includes, the managed order is explicit:
+1. `prefix_injected_types_current.itp` (if present)
+2. `nonbond_params_cross_group_current.itp` (if present)
+3. `nonbond_params_secondary_current.itp` (if present)
 
 ### Instance Reuse Safety
 
@@ -1445,10 +1451,11 @@ The Sanitizer now uses **sentinel-block based updates** to preserve custom conte
 - Content **outside** sentinel markers is never modified
 - `#define`, `#ifdef`, extra includes, and custom sections are preserved
 - If markers already exist, sanitizer always uses that managed block location (preferred placeholder mechanism)
-- If markers don't exist, insertion is deterministic: immediately after the forcefield include block; if forcefield include is absent, after leading comment/blank preamble
+- Managed-block body generation is deterministic and idempotent: repeated runs rewrite the same block body, dedupe repeated managed includes, and keep molecule includes in the sanitizer's trusted `[molecules]` order
+- If markers don't exist, insertion is deterministic: immediately after the last unconditional forcefield include before the first topology section; if forcefield include is absent, after leading comment/blank/`#define`/`#undef` preamble and before other pre-section includes
 - Sanitizer does not attempt broad macro-block parsing to find a "smart" insertion point
 - If **multiple blocks** are found, the sanitizer replaces all managed blocks with one clean block (strict mode via `--strict-top-update` or `--strict-include-resolution` fails fast)
-- If markers are **malformed** (unmatched or misordered), strict mode (`--strict-top-update` or `--strict-include-resolution`) fails fast; non-strict mode warns and rebuilds one clean managed block (no stale managed content left active)
+- If markers are **malformed** (unmatched or misordered), strict mode (`--strict-top-update` or `--strict-include-resolution`) fails fast; non-strict mode only rebuilds when the damaged payload is still recognizable as managed-block content, otherwise it fails closed instead of deleting user topology sections
 - When existing `system.top` already defines `[ defaults ]` or includes `forcefield.itp`, the managed block omits a new `[ defaults ]` section to avoid duplicates
 - Atomic writes prevent partial files on crash
 
@@ -2444,7 +2451,7 @@ Per-pair analysis results include:
 | `--allow-default-defaults` | Flag | False | Allow fallback [ defaults ] when missing |
 | `--allow-mixed-defaults` | Flag | False | Unsafe override to allow mixed [ defaults ] tuples |
 | `--allow-mixed-defaults-reason` | String | None | Required audit reason when `--allow-mixed-defaults` is enabled |
-| `--mixed-defaults-cross-group-policy` | `off`, `warn`, `generate` | `warn` with mixed-default override, else `off` | Cross-group LJ handling policy for mixed comb-rule 2/3 |
+| `--mixed-defaults-cross-group-policy` | `off`, `warn`, `generate` | `warn` with mixed-default override, else `off` | Cross-group LJ handling policy for implemented comb-rule-only mixed defaults (`nbfunc=1`, canonical comb-rule 2/3) |
 | `--mixed-defaults-cross-group-rule` | `lorentz-berthelot`, `geometric` | Auto from canonical comb-rule | Sigma mixing rule used when cross-group generation is enabled |
 | `--mixed-defaults-cross-group-max-pairs` | Integer | 20000 | Hard cap for generated cross-group pair count |
 | `--mixed-defaults-cross-group-reason` | String | None | Required audit reason when cross-group policy is `generate` |

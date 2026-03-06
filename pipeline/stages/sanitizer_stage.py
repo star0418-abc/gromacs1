@@ -5,7 +5,6 @@ Sanitizer stage orchestrator extracted from sanitizer.py.
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
-import os
 
 from .base import BaseStage
 from ..itp_sanitizer import IncludeResolution
@@ -971,22 +970,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
             sanitized_molecule_itp_paths,
             result.sanitized_current_dir,
         )
-        extra_includes: List[str] = []
-        prefix_injected_current = getattr(result, "prefix_injected_types_current_path", None)
-        if prefix_injected_current and Path(prefix_injected_current).exists():
-            extra_includes.append(
-                Path(os.path.relpath(prefix_injected_current, top_dir)).as_posix()
-            )
-        cross_group_nonbond_current = getattr(result, "nonbond_params_cross_group_current_path", None)
-        if cross_group_nonbond_current and Path(cross_group_nonbond_current).exists():
-            extra_includes.append(
-                Path(os.path.relpath(cross_group_nonbond_current, top_dir)).as_posix()
-            )
-        secondary_nonbond_current = getattr(result, "nonbond_params_secondary_current_path", None)
-        if secondary_nonbond_current and Path(secondary_nonbond_current).exists():
-            extra_includes.append(
-                Path(os.path.relpath(secondary_nonbond_current, top_dir)).as_posix()
-            )
+        extra_includes = self._ordered_output_extra_includes(top_dir, result)
         
         existing_top_before = system_top_path.exists()
         molecule_source_used = molecule_count_source.get("source")
