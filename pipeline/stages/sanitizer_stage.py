@@ -151,21 +151,47 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
         
         # Determine molecule counts early (ordered if possible)
         top_path = system_gromacs_dir / "top" / "system.top"
-        top_parse = self._get_ordered_molecules_from_top(top_path)
+        output_dir = self.get_output_dir(ctx)
+        top_parse, topology_truth_source = self._get_ordered_molecules_from_truth_source(
+            top_path,
+            output_dir=output_dir,
+            ctx=ctx,
+        )
         ordered_molecules = top_parse.ordered
         top_exists = top_path.exists()
-        output_dir = self.get_output_dir(ctx)
         molecule_count_source: Dict[str, Any] = {
             "raw_top_path": str(top_path),
             "raw_top_exists": bool(top_exists),
             "raw_top_uncertain": bool(top_parse.uncertain),
             "raw_top_uncertainty_reasons": list(top_parse.uncertainty_reasons),
+            "topology_truth_source": {
+                "path": str(topology_truth_source.path),
+                "source": topology_truth_source.source,
+                "is_preprocessed": bool(topology_truth_source.is_preprocessed),
+                "fallback_used": bool(topology_truth_source.fallback_used),
+                "reason": topology_truth_source.reason,
+                "candidate_paths": list(topology_truth_source.candidate_paths),
+            },
             "source": None,
             "fallback_used": False,
             "trusted": False,
         }
 
-        if top_exists and (top_parse.uncertain or not ordered_molecules):
+        if topology_truth_source.is_preprocessed:
+            print(f"  Using preprocessed topology truth source: {topology_truth_source.path}")
+        else:
+            print(
+                "  Using conservative Python topology fallback: "
+                f"{topology_truth_source.path}"
+            )
+
+        if topology_truth_source.is_preprocessed and ordered_molecules:
+            molecule_counts = {name: count for name, count in ordered_molecules}
+            molecule_count_source["source"] = "preferred_preprocessed_topology"
+            molecule_count_source["raw_top_used"] = False
+            molecule_count_source["trusted"] = True
+            print("  Using [molecules] from preferred preprocessed topology")
+        elif top_exists and (top_parse.uncertain or not ordered_molecules):
             if top_parse.uncertain:
                 print(
                     "  [WARN] Raw [molecules] parse is uncertain due to conditional directives. "
@@ -204,6 +230,14 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 molecule_count_source["source"] = "grompp_preprocessed_top"
                 molecule_count_source["raw_top_used"] = False
                 molecule_count_source["trusted"] = True
+                molecule_count_source["topology_truth_source"] = {
+                    "path": str(pp_path),
+                    "source": "grompp_preprocessed_topology",
+                    "is_preprocessed": True,
+                    "fallback_used": False,
+                    "reason": "raw topology parse was uncertain or empty",
+                    "candidate_paths": [str(pp_path)],
+                }
                 print("  Using [molecules] from grompp -pp preprocessed topology")
             else:
                 raise SanitizerError(
@@ -1055,6 +1089,10 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
             ctx.manifest.set_sanitizer_output(
                 "molecule_count_source",
                 getattr(self, "_molecule_count_source", {}),
+            )
+            ctx.manifest.set_sanitizer_output(
+                "topology_truth_source",
+                getattr(self, "_molecule_count_source", {}).get("topology_truth_source", {}),
             )
             ctx.manifest.set_sanitizer_output(
                 "combined_atomtypes",

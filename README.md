@@ -1080,17 +1080,18 @@ The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, d
 
 ### Include Resolution (GROMACS -I)
 
-For `#include` lines, the sanitizer searches in this order (default `forcefield_first` priority):
+For `#include` lines, the sanitizer rebuilds the search stack for each currently included file. Priority semantics are defined in one place (`_build_include_search_paths()`), and the per-file order is:
 1. Including file's directory
-2. `IN/systems/<SYSTEM_ID>/gromacs/top` and `.../itp`
-3. `IN/systems/<SYSTEM_ID>/htpolynet/itp`
-4. Forcefield directory (`IN/forcefield/<FF>/gromacs`)
-5. Sanitized output dir (`.../itp_sanitized_current`, if present)
-6. User-provided `--itp-include-dirs` (comma-separated)
+2. User-provided `--itp-include-dirs` immediately after local dir only when `--itp-include-dirs-priority sanitized_first`
+3. `IN/systems/<SYSTEM_ID>/gromacs/top` and `.../itp`
+4. `IN/systems/<SYSTEM_ID>/htpolynet/itp`
+5. Forcefield directory (`IN/forcefield/<FF>/gromacs`)
+6. Sanitized output dir (`.../itp_sanitized_current`, if present)
 7. Configured GROMACS share dirs (if provided via context)
+8. User-provided `--itp-include-dirs` at the end when priority is `forcefield_first`
 
 Relative paths in `--itp-include-dirs` are resolved against `--project-root` for reproducible behavior across working directories.
-With `--itp-include-dirs-priority sanitized_first` (alias `first`), user include dirs are searched immediately after the including file directory.
+Compatibility-only extra include roots are appended after the configured order; they do not create a second priority mechanism.
 
 If an include cannot be resolved, the sanitizer reports attempted paths (or fails fast if `--strict-include-resolution` is set).
 `system.top` validation uses the same resolver and parses both `"file.itp"` and `<file.itp>` includes.
@@ -1099,6 +1100,7 @@ If an include cannot be resolved, the sanitizer reports attempted paths (or fail
 For same-basename shadows, sanitizer output is winner-only per include target (no deterministic renaming of losers).
 Collection no longer enforces global basename uniqueness across all scanned ITP inputs; ambiguity is handled at include-resolution time using the configured search order.
 **Escape guard**: includes that resolve outside configured include roots are blocked by default; use `--allow-unsafe-include-escape` only as an explicit unsafe override.
+**Conditional/macro safety**: Python include/name discovery does not try to evaluate GROMACS preprocessor conditionals. If it sees unresolved macro/conditional directives in touched include-discovery paths, strict mode fails closed; non-strict mode logs explicit degraded fallback and skips conditionally ambiguous content instead of pretending it is active.
 
 **Include-closure sanitization**: Any reachable file containing `[ defaults ]` or `[ atomtypes ]` is sanitized and written into `itp_sanitized_current/` at its include path (relative includes only; `..` is not allowed for sanitization).
 
@@ -1291,10 +1293,11 @@ This ensures `grompp` receives a consistent `.gro/.itp/.top` set.
 
 The Sanitizer validates that the coordinate file (`.gro`) matches the topology's `[molecules]` section by comparing atom counts.
 
-- If raw `system.top` `[molecules]` parsing encounters conditional-control directives (`#if/#ifdef/#ifndef/#elif/#else/#endif`) in that region, the raw parse is marked **uncertain**.
-- In that case, sanitizer prefers `grompp -pp` preprocessed topology as the source of truth for molecule counts.
+- If an already available preprocessed topology exists (for example the sanitizer's cached `grompp -pp` artifact, or an explicitly provided preprocessed topology path in context), sanitizer prefers that as the topology truth source for semantic reads before falling back to raw Python parsing.
+- If raw `system.top` `[molecules]` parsing encounters conditional-control or macro directives in that region, the raw parse is marked **uncertain** and conditional blocks are not treated as active by the fallback parser.
+- When no trusted preprocessed topology is already available and the raw parse is uncertain/empty, sanitizer prefers `grompp -pp` preprocessed topology as the source of truth for molecule counts.
 - If preprocessing is unavailable, sanitizer falls back to weaker sources (manifest/ITP fallback) and keeps uncertainty metadata in sanitizer report/manifest fields.
-- Manifest QC/report fields include the uncertainty status and source choice (`raw_top_uncertain`, `raw_top_uncertainty_reasons`, `source`, `fallback_used`).
+- Manifest QC/report fields include the uncertainty status and source choice (`topology_truth_source`, `raw_top_uncertain`, `raw_top_uncertainty_reasons`, `source`, `fallback_used`).
 
 For atom-count validation, if GROMACS is available, sanitizer preprocesses topology via `gmx grompp -pp` and parses the fully expanded output. Otherwise it falls back to a strict ITP parser that ignores preprocessor lines and skips the check if ambiguity is detected (unless `--strict-gro-top-check` is set).
 

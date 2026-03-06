@@ -110,6 +110,182 @@ def test_recursive_include_resolution_rebuilds_current_file_search_stack(tmp_pat
     assert "FF_LEAF" not in names
 
 
+def test_nested_include_resolution_uses_current_included_file_directory(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    forcefield_dir = tmp_path / "IN/forcefield/oplsaa"
+    sanitizer._forcefield_dir = forcefield_dir
+
+    root_itp = forcefield_dir / "gromacs/root.itp"
+    child_itp = tmp_path / "IN/systems/SYS/gromacs/itp/nested/child.itp"
+    leaf_itp = tmp_path / "IN/systems/SYS/gromacs/itp/nested/deeper/leaf.itp"
+
+    _write(root_itp, '#include "nested/child.itp"\n[ moleculetype ]\nROOT 3\n')
+    _write(child_itp, '#include "deeper/leaf.itp"\n[ moleculetype ]\nCHILD 3\n')
+    _write(leaf_itp, "[ moleculetype ]\nLEAF 3\n")
+
+    names = sanitizer._get_moleculetype_names(root_itp, ctx=ctx)
+
+    assert names == ["LEAF", "CHILD", "ROOT"]
+
+
+@pytest.mark.parametrize(
+    ("priority", "expected_first"),
+    [
+        ("sanitized_first", "user_include"),
+        ("forcefield_first", "IN/systems/SYS/gromacs/top"),
+    ],
+)
+def test_build_include_search_paths_uses_single_priority_source(
+    tmp_path,
+    priority,
+    expected_first,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(
+        tmp_path,
+        itp_include_dirs="user_include",
+        itp_include_dirs_priority=priority,
+    )
+    sanitizer._forcefield_dir = tmp_path / "IN/forcefield/oplsaa"
+    sanitizer._sanitized_current_dir = tmp_path / "IN/systems/SYS/gromacs/itp_sanitized_current"
+
+    base_itp = tmp_path / "IN/systems/SYS/gromacs/itp/base.itp"
+    for path in [
+        base_itp.parent,
+        tmp_path / "user_include",
+        tmp_path / "IN/systems/SYS/gromacs/top",
+        tmp_path / "IN/systems/SYS/gromacs/itp",
+        tmp_path / "IN/systems/SYS/htpolynet/itp",
+        tmp_path / "IN/forcefield/oplsaa/gromacs",
+        tmp_path / "IN/systems/SYS/gromacs/itp_sanitized_current",
+    ]:
+        path.mkdir(parents=True, exist_ok=True)
+    _write(base_itp, "")
+
+    search_paths = sanitizer._build_include_search_paths(ctx, base_itp)
+    search_strings = [str(path.relative_to(tmp_path)).replace("\\", "/") for path in search_paths]
+
+    assert search_strings[0] == "IN/systems/SYS/gromacs/itp"
+    assert search_strings[1] == expected_first
+
+
+def test_resolve_include_strict_fails_on_shadowing_when_not_allowed(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(
+        tmp_path,
+        strict_include_resolution=True,
+        allow_include_shadowing=False,
+        itp_include_dirs="user_include",
+        itp_include_dirs_priority="sanitized_first",
+    )
+    forcefield_dir = tmp_path / "IN/forcefield/oplsaa"
+    sanitizer._forcefield_dir = forcefield_dir
+
+    root_itp = forcefield_dir / "gromacs/root.itp"
+    user_leaf = tmp_path / "user_include/leaf.itp"
+    ff_leaf = forcefield_dir / "gromacs/leaf.itp"
+    _write(root_itp, "#include \"leaf.itp\"\n")
+    _write(user_leaf, "[ moleculetype ]\nUSER 3\n")
+    _write(ff_leaf, "[ moleculetype ]\nFF 3\n")
+
+    with pytest.raises(SanitizerError, match="Include shadowing violation"):
+        sanitizer._resolve_include_in_dirs(
+            "leaf.itp",
+            root_itp,
+            [],
+            strict=True,
+            check_shadowing=True,
+            allow_shadowing=False,
+            ctx=ctx,
+        )
+
+
+def test_get_moleculetype_names_strict_fails_closed_on_unresolved_conditionals(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path, strict_include_resolution=True)
+    itp = tmp_path / "macro.itp"
+    _write(
+        itp,
+        "#ifdef USE_ALT\n"
+        "[ moleculetype ]\n"
+        "ALT 3\n"
+        "#endif\n",
+    )
+
+    with pytest.raises(SanitizerError, match="Cannot safely moleculetype name extraction"):
+        sanitizer._get_moleculetype_names(itp, ctx=ctx)
+
+
+def test_get_moleculetype_names_strict_fails_closed_on_macro_like_include(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path, strict_include_resolution=True)
+    itp = tmp_path / "macro_include.itp"
+    _write(
+        itp,
+        "#include SOME_MACRO\n"
+        "[ moleculetype ]\n"
+        "BASE 3\n",
+    )
+
+    with pytest.raises(SanitizerError, match="#include\\(macro-like\\)"):
+        sanitizer._get_moleculetype_names(itp, ctx=ctx)
+
+
+def test_get_moleculetype_names_non_strict_reports_degraded_macro_fallback(
+    tmp_path,
+    capsys,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    itp = tmp_path / "macro.itp"
+    _write(
+        itp,
+        "#ifdef USE_ALT\n"
+        "[ moleculetype ]\n"
+        "ALT 3\n"
+        "#endif\n"
+        "[ moleculetype ]\n"
+        "BASE 3\n",
+    )
+
+    names = sanitizer._get_moleculetype_names(itp, ctx=ctx)
+
+    assert names == ["BASE"]
+    assert "Conservative Python fallback used for moleculetype name extraction" in capsys.readouterr().out
+
+
+def test_expand_include_closure_reports_degraded_conditional_includes_in_non_strict_mode(
+    tmp_path,
+    capsys,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    root_itp = tmp_path / "IN/systems/SYS/gromacs/itp/root.itp"
+    leaf_itp = tmp_path / "IN/systems/SYS/gromacs/itp/leaf.itp"
+    _write(
+        root_itp,
+        "#ifdef USE_LEAF\n"
+        "#include \"leaf.itp\"\n"
+        "#endif\n"
+        "[ moleculetype ]\n"
+        "ROOT 3\n",
+    )
+    _write(leaf_itp, "[ moleculetype ]\nLEAF 3\n")
+
+    expanded, class_map, ff_map = sanitizer._expand_itp_include_closure(
+        [root_itp],
+        ctx,
+        {str(root_itp): "staged"},
+        {str(root_itp): "UNKNOWN"},
+    )
+
+    assert expanded == [root_itp.resolve()]
+    assert class_map[str(root_itp.resolve())] == "staged"
+    assert ff_map[str(root_itp.resolve())] == "UNKNOWN"
+    assert "Conservative Python fallback used for include closure discovery" in capsys.readouterr().out
+
+
 def test_uncertain_same_name_conflict_fails_closed_in_strict_mode(tmp_path):
     sanitizer = DummySanitizer()
     ctx = DummyContext(tmp_path, strict_charge_neutrality=True)

@@ -117,6 +117,17 @@ CANONICAL_INCLUDE_PRIORITIES = frozenset({"sanitized_first", "forcefield_first"}
 DEFAULT_ALLOW_INCLUDE_SHADOWING = False  # In strict mode, fail on shadowing
 DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE = False
 
+PREPROCESSOR_CONDITIONAL_START_DIRECTIVES = frozenset({"#if", "#ifdef", "#ifndef"})
+PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES = frozenset({"#elif", "#else"})
+PREPROCESSOR_CONDITIONAL_END_DIRECTIVE = "#endif"
+PREPROCESSOR_MACRO_DIRECTIVES = frozenset({"#define", "#undef"})
+PREPROCESSOR_UNRESOLVED_SEMANTIC_DIRECTIVES = (
+    PREPROCESSOR_CONDITIONAL_START_DIRECTIVES
+    | PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES
+    | PREPROCESSOR_MACRO_DIRECTIVES
+    | frozenset({PREPROCESSOR_CONDITIONAL_END_DIRECTIVE})
+)
+
 # Supported ptype tokens in [ atomtypes ].
 PTYPE_TOKENS = frozenset({"A", "D", "V"})
 
@@ -210,6 +221,17 @@ def parse_include_target(line: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def preprocessor_directive_token(line: str) -> Optional[str]:
+    """Return normalized preprocessor directive token for a raw line."""
+    stripped = line.lstrip()
+    if not stripped.startswith("#"):
+        return None
+    parts = stripped.split(None, 1)
+    if not parts:
+        return None
+    return parts[0].lower()
+
+
 def normalize_include_priority(raw_value: Optional[str]) -> str:
     """Normalize include-priority value to canonical semantics."""
     value = str(raw_value).strip().casefold() if raw_value is not None else ""
@@ -291,6 +313,17 @@ class TopMoleculesParseResult:
     uncertain: bool = False
     uncertainty_reasons: List[str] = field(default_factory=list)
     entries: List["TopMoleculesEntry"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TopologyTruthSource:
+    """Selected topology truth source for semantic reads."""
+    path: Path
+    source: str
+    is_preprocessed: bool = False
+    fallback_used: bool = False
+    reason: Optional[str] = None
+    candidate_paths: Tuple[str, ...] = ()
 
 
 ATOMS_ROW_STATUS_PARSED = "parsed"
@@ -593,6 +626,188 @@ class TopologySanitizerMixin:
             return frozenset()
         return frozenset(token.strip() for token in raw.split(",") if token.strip())
 
+    @staticmethod
+    def _project_root_path(ctx: Optional["PipelineContext"]) -> Optional[Path]:
+        """Return resolved project root if configured."""
+        project_root = getattr(ctx, "project_root", None) if ctx is not None else None
+        if not project_root:
+            return None
+        try:
+            return Path(project_root).resolve()
+        except OSError:
+            return Path(project_root)
+
+    def _resolve_include_root_path(
+        self,
+        raw_path: Path,
+        ctx: Optional["PipelineContext"],
+    ) -> Path:
+        """Resolve include-root candidates against project_root when needed."""
+        project_root_path = self._project_root_path(ctx)
+        if raw_path.is_absolute() or project_root_path is None:
+            return raw_path
+        return project_root_path / raw_path
+
+    def _collect_ctx_include_roots(self, ctx: Optional["PipelineContext"]) -> Tuple[List[Path], List[Path]]:
+        """Return configured include roots split into user paths and GROMACS share/data paths."""
+        if ctx is None:
+            return [], []
+
+        user_paths: List[Path] = []
+        raw_user_paths = getattr(ctx, "itp_include_dirs", "")
+        if raw_user_paths:
+            for item in str(raw_user_paths).split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                user_paths.append(self._resolve_include_root_path(Path(item), ctx))
+
+        gmx_share_paths: List[Path] = []
+        for attr in (
+            "gromacs_share_dirs",
+            "gromacs_share_dir",
+            "gmx_share_dirs",
+            "gmx_share_dir",
+            "gromacs_datadir",
+            "gmx_datadir",
+            "gmxdata",
+        ):
+            value = getattr(ctx, attr, None)
+            if not value:
+                continue
+            if isinstance(value, (list, tuple)):
+                raw_items = [str(entry) for entry in value if str(entry).strip()]
+            else:
+                raw_items = [entry.strip() for entry in str(value).split(",") if entry.strip()]
+            for item in raw_items:
+                gmx_share_paths.append(self._resolve_include_root_path(Path(item), ctx))
+        return user_paths, gmx_share_paths
+
+    def _dedupe_existing_paths(self, paths: List[Path]) -> List[Path]:
+        """Keep existing paths only, preserving deterministic order."""
+        deduped: List[Path] = []
+        seen: Set[Path] = set()
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                key = path.resolve()
+            except OSError:
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(path)
+        return deduped
+
+    @staticmethod
+    def _summarize_semantic_scan_issues(issues: List[str], max_items: int = 3) -> str:
+        """Compact human-readable summary for degraded semantic scans."""
+        if not issues:
+            return ""
+        summary = "; ".join(issues[:max_items])
+        remaining = len(issues) - min(len(issues), max_items)
+        if remaining > 0:
+            summary += f"; ... {remaining} more"
+        return summary
+
+    def _record_semantic_scan_issue(
+        self,
+        *,
+        issues: List[str],
+        file_path: Path,
+        line_no: int,
+        directive: str,
+        purpose: str,
+        strict: bool,
+    ) -> None:
+        """Record or raise on unresolved preprocessor ambiguity during Python parsing."""
+        reason = (
+            f"{directive} at {file_path.name}:{line_no} makes {purpose} ambiguous "
+            "without preprocessing"
+        )
+        if reason not in issues:
+            issues.append(reason)
+        if strict:
+            raise SanitizerError(
+                f"Cannot safely {purpose} in {file_path}: unresolved preprocessor directive "
+                f"{directive} at line {line_no}. Use a preprocessed topology truth source or "
+                "disable strict include resolution."
+            )
+
+    def _emit_semantic_scan_warning(
+        self,
+        *,
+        file_path: Path,
+        purpose: str,
+        issues: List[str],
+    ) -> None:
+        """Emit one explicit degraded warning for conservative Python fallback parsing."""
+        if not issues:
+            return
+        summary = self._summarize_semantic_scan_issues(issues)
+        print(
+            "  [WARN][DEGRADED] "
+            f"Conservative Python fallback used for {purpose} in {file_path}: {summary}"
+        )
+
+    def _candidate_preprocessed_topology_paths(
+        self,
+        *,
+        output_dir: Optional[Path] = None,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> List[Path]:
+        """Return existing candidate preprocessed topology paths in priority order."""
+        candidates: List[Path] = []
+        if ctx is not None:
+            for attr in (
+                "preprocessed_topology_path",
+                "preprocessed_topology",
+                "preprocessed_top_path",
+                "topology_truth_source_path",
+            ):
+                value = getattr(ctx, attr, None)
+                if not value:
+                    continue
+                candidate = self._resolve_include_root_path(Path(str(value)), ctx)
+                candidates.append(candidate)
+        if output_dir is not None and hasattr(self, "_grompp_preprocessed_top_path"):
+            try:
+                candidates.append(self._grompp_preprocessed_top_path(output_dir))
+            except Exception:
+                pass
+        return self._dedupe_existing_paths(candidates)
+
+    def _select_topology_truth_source(
+        self,
+        top_path: Path,
+        *,
+        output_dir: Optional[Path] = None,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> TopologyTruthSource:
+        """Prefer preprocessed topology when available; otherwise fall back explicitly."""
+        candidate_paths = self._candidate_preprocessed_topology_paths(
+            output_dir=output_dir,
+            ctx=ctx,
+        )
+        if candidate_paths:
+            selected = candidate_paths[0]
+            return TopologyTruthSource(
+                path=selected,
+                source="preprocessed_topology",
+                is_preprocessed=True,
+                fallback_used=False,
+                candidate_paths=tuple(str(path) for path in candidate_paths),
+            )
+        return TopologyTruthSource(
+            path=top_path,
+            source="python_fallback_raw_topology",
+            is_preprocessed=False,
+            fallback_used=True,
+            reason="no preprocessed topology truth source available",
+            candidate_paths=(),
+        )
+
     def _derive_include_search_paths(
         self,
         current_file: Path,
@@ -600,23 +815,15 @@ class TopologySanitizerMixin:
         ctx: Optional["PipelineContext"] = None,
     ) -> List[Path]:
         """
-        Rebuild include search paths for the currently scanned file.
-
-        Recursive include parsing must derive search order from the current include
-        context, not from the original parent file that started the walk.
+        Compatibility wrapper around the single include-priority implementation.
         """
-        if ctx is not None:
-            paths = list(self._build_include_search_paths(ctx, current_file))
-            for candidate in include_dirs or []:
-                if candidate not in paths:
-                    paths.append(candidate)
-            return paths
-
-        paths: List[Path] = [current_file.parent]
-        for candidate in include_dirs or []:
-            if candidate not in paths:
-                paths.append(candidate)
-        return paths
+        return list(
+            self._build_include_search_paths(
+                ctx,
+                current_file,
+                extra_include_dirs=include_dirs,
+            )
+        )
 
     def _assert_no_case_insensitive_duplicates(self, paths: List[Path], label: str) -> None:
         """Fail fast on case-insensitive basename duplicates (non-reproducible)."""
@@ -758,19 +965,6 @@ class TopologySanitizerMixin:
     ) -> Tuple[List[str], bool]:
         """
         Extract moleculetype names from an ITP, recursively following #include.
-        
-        Hardening v7: Now uses full GROMACS -I style include resolution instead
-        of only resolving relative to current file's directory.
-        
-        Args:
-            itp_path: Path to ITP file
-            visited: Set of already-visited paths (prevents infinite loops)
-            include_dirs: Optional list of include directories to search
-            ctx: PipelineContext (used to build include_dirs via _build_include_search_paths)
-            
-        Returns:
-            Tuple of (list of moleculetype names, uncertain flag)
-            The uncertain flag is True if some #include could not be resolved.
         """
         if not itp_path.exists():
             return [], False
@@ -786,12 +980,7 @@ class TopologySanitizerMixin:
                 "  [WARN] Include resolution context unavailable while scanning "
                 f"{itp_path}. Falling back to local directory only."
             )
-        include_dirs = self._derive_include_search_paths(
-            itp_path,
-            include_dirs=include_dirs,
-            ctx=ctx,
-        )
-        
+
         names: List[str] = []
         uncertain = False
         current_section = ""
@@ -800,36 +989,77 @@ class TopologySanitizerMixin:
         content = self.safe_read_text(itp_path, strict=strict_includes)
         if not content and not strict_includes:
             uncertain = True
+        semantic_issues: List[str] = []
+        conditional_depth = 0
 
-        for line in content.splitlines():
+        for line_no, line in enumerate(content.splitlines(), start=1):
             stripped = line.strip()
+            directive = preprocessor_directive_token(line)
 
-            # Handle #include directives using parse_include_target
-            if stripped.startswith("#include"):
-                include_target = parse_include_target(line)
-                if include_target:
-                    # Resolve using search paths (GROMACS -I semantics)
-                    include_path = self._resolve_include_in_dirs(
-                        include_target,
-                        itp_path,
-                        include_dirs,
+            if directive == "#include":
+                if conditional_depth > 0:
+                    self._record_semantic_scan_issue(
+                        issues=semantic_issues,
+                        file_path=itp_path,
+                        line_no=line_no,
+                        directive=directive,
+                        purpose="moleculetype name extraction",
                         strict=strict_includes,
-                        check_shadowing=True,
-                        allow_shadowing=allow_shadowing,
+                    )
+                    uncertain = True
+                    continue
+                include_target = parse_include_target(line)
+                if include_target is None:
+                    self._record_semantic_scan_issue(
+                        issues=semantic_issues,
+                        file_path=itp_path,
+                        line_no=line_no,
+                        directive="#include(macro-like)",
+                        purpose="moleculetype name extraction",
+                        strict=strict_includes,
+                    )
+                    uncertain = True
+                    continue
+                include_path = self._resolve_include_in_dirs(
+                    include_target,
+                    itp_path,
+                    include_dirs,
+                    strict=strict_includes,
+                    check_shadowing=True,
+                    allow_shadowing=allow_shadowing,
+                    ctx=ctx,
+                )
+                if include_path is not None:
+                    inc_names, inc_uncertain = self._get_moleculetype_names_recursive(
+                        include_path,
+                        visited,
+                        include_dirs=include_dirs,
                         ctx=ctx,
                     )
-                    if include_path is not None:
-                        inc_names, inc_uncertain = self._get_moleculetype_names_recursive(
-                            include_path, visited,
-                            include_dirs=include_dirs, ctx=ctx
-                        )
-                        names.extend(inc_names)
-                        uncertain = uncertain or inc_uncertain
-                    else:
-                        # Could not resolve include
-                        uncertain = True
+                    names.extend(inc_names)
+                    uncertain = uncertain or inc_uncertain
+                else:
+                    uncertain = True
                 continue
 
+            if directive is not None:
+                self._record_semantic_scan_issue(
+                    issues=semantic_issues,
+                    file_path=itp_path,
+                    line_no=line_no,
+                    directive=directive,
+                    purpose="moleculetype name extraction",
+                    strict=strict_includes,
+                )
+                uncertain = True
+                if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
+                    conditional_depth += 1
+                elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
+                    if conditional_depth > 0:
+                        conditional_depth -= 1
+                continue
+            if conditional_depth > 0:
+                continue
             if not stripped or stripped.startswith(";"):
                 continue
             section = parse_section_name(line)
@@ -843,7 +1073,23 @@ class TopologySanitizerMixin:
                     if parts:
                         names.append(parts[0])
                         current_section = ""
-        
+
+        if conditional_depth > 0:
+            self._record_semantic_scan_issue(
+                issues=semantic_issues,
+                file_path=itp_path,
+                line_no=len(content.splitlines()) or 1,
+                directive=f"unclosed conditional depth={conditional_depth}",
+                purpose="moleculetype name extraction",
+                strict=strict_includes,
+            )
+            uncertain = True
+        if semantic_issues and not strict_includes:
+            self._emit_semantic_scan_warning(
+                file_path=itp_path,
+                purpose="moleculetype name extraction",
+                issues=semantic_issues,
+            )
         return names, uncertain
 
     @staticmethod
@@ -909,27 +1155,13 @@ class TopologySanitizerMixin:
         ctx: Optional["PipelineContext"] = None,
     ) -> Optional[Path]:
         """
-        Resolve an include target using GROMACS -I style search order.
-        
-        Shared helper for include resolution with optional shadowing checks.
-        
-        Search order:
-        1. Including file's parent directory
-        2. Each directory in include_dirs (in order)
-        
-        Args:
-            include_target: The target path from #include directive
-            including_file: Path of the file containing the #include
-            include_dirs: List of directories to search
-            
-        Returns:
-            Resolved absolute path, or None if not found
+        Resolve an include target using the single per-file search-order builder.
         """
-        # Build search order: including file's parent first, then include_dirs
-        search_order = [including_file.parent]
-        for d in include_dirs:
-            if d not in search_order and d.exists():
-                search_order.append(d)
+        search_order = self._derive_include_search_paths(
+            including_file,
+            include_dirs=include_dirs,
+            ctx=ctx,
+        )
 
         allow_escape = bool(
             getattr(ctx, "allow_unsafe_include_escape", DEFAULT_ALLOW_UNSAFE_INCLUDE_ESCAPE)
@@ -1095,47 +1327,97 @@ class TopologySanitizerMixin:
             
             if not itp.exists():
                 continue
-            
-            # Build search paths for this file
-            include_dirs = self._build_include_search_paths(ctx, itp)
-            
+
             # Scan for includes
             content = self.safe_read_text(itp, strict=strict_includes)
             if not content:
                 continue
-            
-            for line in content.splitlines():
-                if not line.strip().startswith("#include"):
+
+            semantic_issues: List[str] = []
+            conditional_depth = 0
+            for line_no, line in enumerate(content.splitlines(), start=1):
+                directive = preprocessor_directive_token(line)
+                if directive == "#include":
+                    if conditional_depth > 0:
+                        self._record_semantic_scan_issue(
+                            issues=semantic_issues,
+                            file_path=itp,
+                            line_no=line_no,
+                            directive=directive,
+                            purpose="include closure discovery",
+                            strict=strict_includes,
+                        )
+                        continue
+                    include_target = parse_include_target(line)
+                    if not include_target:
+                        self._record_semantic_scan_issue(
+                            issues=semantic_issues,
+                            file_path=itp,
+                            line_no=line_no,
+                            directive="#include(macro-like)",
+                            purpose="include closure discovery",
+                            strict=strict_includes,
+                        )
+                        continue
+
+                    inc_path = self._resolve_include_in_dirs(
+                        include_target,
+                        itp,
+                        [],
+                        strict=strict_includes,
+                        check_shadowing=True,
+                        allow_shadowing=allow_shadowing,
+                        diagnostics=self.diagnostics,
+                        ctx=ctx,
+                    )
+                    if inc_path is None:
+                        continue
+
+                    inc_resolved = inc_path.resolve()
+                    if inc_resolved in visited:
+                        continue
+
+                    if str(inc_resolved) not in ff_map:
+                        class_map[str(inc_resolved)] = parent_class
+                        ff_map[str(inc_resolved)] = parent_ff
+                        print(f"    + Include ({parent_class}): {inc_resolved.name}")
+
+                    queue.append(inc_resolved)
                     continue
-                include_target = parse_include_target(line)
-                if not include_target:
+
+                if directive is not None:
+                    self._record_semantic_scan_issue(
+                        issues=semantic_issues,
+                        file_path=itp,
+                        line_no=line_no,
+                        directive=directive,
+                        purpose="include closure discovery",
+                        strict=strict_includes,
+                    )
+                    if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
+                        conditional_depth += 1
+                    elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
+                        if conditional_depth > 0:
+                            conditional_depth -= 1
                     continue
-                
-                inc_path = self._resolve_include_in_dirs(
-                    include_target,
-                    itp,
-                    include_dirs,
+                if conditional_depth > 0:
+                    continue
+
+            if conditional_depth > 0:
+                self._record_semantic_scan_issue(
+                    issues=semantic_issues,
+                    file_path=itp,
+                    line_no=len(content.splitlines()) or 1,
+                    directive=f"unclosed conditional depth={conditional_depth}",
+                    purpose="include closure discovery",
                     strict=strict_includes,
-                    check_shadowing=True,
-                    allow_shadowing=allow_shadowing,
-                    diagnostics=self.diagnostics,
-                    ctx=ctx,
                 )
-                if inc_path is None:
-                    continue
-                
-                inc_resolved = inc_path.resolve()
-                if inc_resolved in visited:
-                    continue
-                
-                # Only add if not already tracked
-                if str(inc_resolved) not in ff_map:
-                    # Inherit class/ff from parent
-                    class_map[str(inc_resolved)] = parent_class
-                    ff_map[str(inc_resolved)] = parent_ff
-                    print(f"    + Include ({parent_class}): {inc_resolved.name}")
-                
-                queue.append(inc_resolved)
+            if semantic_issues and not strict_includes:
+                self._emit_semantic_scan_warning(
+                    file_path=itp,
+                    purpose="include closure discovery",
+                    issues=semantic_issues,
+                )
         
         return expanded, class_map, ff_map
     
@@ -2217,6 +2499,38 @@ class TopologySanitizerMixin:
             return None
         return parsed.signature
 
+    def _get_ordered_molecules_from_truth_source(
+        self,
+        top_path: Path,
+        *,
+        output_dir: Optional[Path] = None,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> Tuple[TopMoleculesParseResult, TopologyTruthSource]:
+        """Prefer preprocessed topology when available, otherwise use conservative raw parsing."""
+        truth_source = self._select_topology_truth_source(
+            top_path,
+            output_dir=output_dir,
+            ctx=ctx,
+        )
+        if truth_source.is_preprocessed and hasattr(self, "_parse_preprocessed_molecules"):
+            ordered = self._parse_preprocessed_molecules(truth_source.path)
+            if ordered:
+                return TopMoleculesParseResult(ordered=ordered), truth_source
+            print(
+                "  [WARN][DEGRADED] Preferred preprocessed topology truth source was present "
+                f"but could not be parsed for [molecules]: {truth_source.path}. "
+                "Falling back to conservative Python parsing of system.top."
+            )
+            truth_source = TopologyTruthSource(
+                path=top_path,
+                source="python_fallback_raw_topology",
+                is_preprocessed=False,
+                fallback_used=True,
+                reason=f"preferred preprocessed topology could not be parsed: {truth_source.path}",
+                candidate_paths=truth_source.candidate_paths,
+            )
+        return self._get_ordered_molecules_from_top(top_path), truth_source
+
     def _get_ordered_molecules_from_top(self, top_path: Path) -> TopMoleculesParseResult:
         """
         Parse [molecules] section preserving order, collapsing duplicates.
@@ -2233,26 +2547,29 @@ class TopologySanitizerMixin:
         seen_indices: Dict[str, int] = {}  # name -> index in ordered list
         in_molecules = False
         uncertain_reasons: List[str] = []
-        conditional_directives = frozenset(
-            {"#if", "#ifdef", "#ifndef", "#elif", "#else", "#endif"}
-        )
+        conditional_depth = 0
         content = self.safe_read_text(top_path, strict=False)
         if not content:
             return TopMoleculesParseResult(ordered=[])
         for line_no, line in enumerate(content.splitlines(), start=1):
             stripped = line.strip()
+            directive = preprocessor_directive_token(line)
             section = parse_section_name(line)
             if section is not None:
                 in_molecules = (section == "molecules")
                 continue
             if not in_molecules:
                 continue
-            if stripped.startswith("#"):
-                directive = stripped.split()[0].lower()
-                if directive in conditional_directives:
-                    uncertain_reasons.append(
-                        f"{directive} in [molecules] at {top_path.name}:{line_no}"
-                    )
+            if directive in PREPROCESSOR_UNRESOLVED_SEMANTIC_DIRECTIVES:
+                if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
+                    conditional_depth += 1
+                elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE and conditional_depth > 0:
+                    conditional_depth -= 1
+                uncertain_reasons.append(
+                    f"{directive} in [molecules] at {top_path.name}:{line_no}"
+                )
+                continue
+            if directive is not None or conditional_depth > 0:
                 continue
             if not stripped or stripped.startswith(";") or stripped.startswith("#"):
                 continue
@@ -2284,6 +2601,10 @@ class TopologySanitizerMixin:
             uncertain_reasons.append(
                 f"invalid [molecules] row at {top_path.name}:{line_no}: "
                 f"{entry_result.reason or data}"
+            )
+        if conditional_depth > 0:
+            uncertain_reasons.append(
+                f"unclosed conditional block in [molecules] at {top_path.name}"
             )
         return TopMoleculesParseResult(
             ordered=ordered,
@@ -2960,128 +3281,55 @@ class TopologySanitizerMixin:
             if temp_path.exists():
                 temp_path.unlink()
 
-    def _build_include_search_paths(self, ctx: "PipelineContext", base_path: Path) -> List[Path]:
+    def _build_include_search_paths(
+        self,
+        ctx: Optional["PipelineContext"],
+        base_path: Path,
+        extra_include_dirs: Optional[List[Path]] = None,
+    ) -> List[Path]:
         """
-        Build restricted search paths for #include resolution.
-        
-        Hardening v5 - Issue D: Priority-aware include resolution.
-        Priority values are normalized with deterministic aliases:
-        - sanitized_first (alias: first)
-        - forcefield_first (alias: last)
-        
-        Order when priority == "forcefield_first" (legacy alias: "last"):
-        1. Current file's parent directory
-        2. system_gromacs_dir/top and /itp
-        3. system_htpolynet_dir/itp
-        4. Forcefield directory
-        5. Sanitized output directory
-        6. Configured GROMACS share/data dirs from context
-        7. User-provided ctx.itp_include_dirs (LAST)
+        Build per-file include search paths.
 
-        Order when priority == "sanitized_first" (legacy alias: "first"):
-        1. Current file's parent directory
-        2. User-provided ctx.itp_include_dirs (FIRST - override position)
-        3. system_gromacs_dir/top and /itp
-        4. system_htpolynet_dir/itp
-        5. Forcefield directory
-        6. Sanitized output directory
-        7. Configured GROMACS share/data dirs from context
+        This is the single source of include-priority semantics:
+        - `sanitized_first` places configured user include dirs immediately after the
+          currently included file's parent directory.
+        - `forcefield_first` keeps configured user include dirs after system/forcefield
+          roots.
 
-        Relative user paths are resolved against ctx.project_root.
-        
-        Returns:
-            List of existing directories to search (in priority order)
+        `extra_include_dirs` are compatibility-only append roots. They never define a
+        second priority mechanism.
         """
         paths: List[Path] = [base_path.parent]
-        project_root = getattr(ctx, "project_root", None)
-        project_root_path = Path(project_root).resolve() if project_root else None
+        if ctx is not None:
+            user_paths, gmx_share_paths = self._collect_ctx_include_roots(ctx)
+            raw_priority = getattr(ctx, "itp_include_dirs_priority", DEFAULT_INCLUDE_PRIORITY)
+            priority = normalize_include_priority(raw_priority)
 
-        def _resolve_path(raw_path: Path) -> Path:
-            if raw_path.is_absolute() or project_root_path is None:
-                return raw_path
-            return project_root_path / raw_path
+            system_gromacs_dir = ctx.get_input_path("systems", ctx.system_id, "gromacs")
+            system_htpolynet_dir = ctx.get_input_path("systems", ctx.system_id, "htpolynet")
+            configured_paths: List[Path] = [
+                system_gromacs_dir / "top",
+                system_gromacs_dir / "itp",
+                system_htpolynet_dir / "itp",
+            ]
 
-        # Collect user paths (resolve relative paths against project_root for reproducibility)
-        user_paths: List[Path] = []
-        if ctx.itp_include_dirs:
-            for d in ctx.itp_include_dirs.split(","):
-                d = d.strip()
-                if not d:
-                    continue
-                resolved = _resolve_path(Path(d))
-                if resolved.exists():
-                    user_paths.append(resolved)
+            if hasattr(self, "_forcefield_dir") and self._forcefield_dir:
+                configured_paths.append(self._forcefield_dir / "gromacs")
+            if hasattr(self, "_sanitized_current_dir") and self._sanitized_current_dir:
+                configured_paths.append(self._sanitized_current_dir)
+            configured_paths.extend(gmx_share_paths)
 
-        # Configured GROMACS share/data dirs from context
-        gmx_share_paths: List[Path] = []
-        for attr in (
-            "gromacs_share_dirs",
-            "gromacs_share_dir",
-            "gmx_share_dirs",
-            "gmx_share_dir",
-            "gromacs_datadir",
-            "gmx_datadir",
-            "gmxdata",
-        ):
-            value = getattr(ctx, attr, None)
-            if not value:
-                continue
-            if isinstance(value, (list, tuple)):
-                raw_items = [str(item) for item in value if str(item).strip()]
+            if priority == "sanitized_first":
+                paths.extend(user_paths)
+                paths.extend(configured_paths)
             else:
-                raw_items = [item.strip() for item in str(value).split(",") if item.strip()]
-            for item in raw_items:
-                resolved = _resolve_path(Path(item))
-                if resolved.exists():
-                    gmx_share_paths.append(resolved)
+                paths.extend(configured_paths)
+                paths.extend(user_paths)
 
-        # Normalize priority setting and reject invalid values with clear guidance.
-        raw_priority = getattr(ctx, "itp_include_dirs_priority", DEFAULT_INCLUDE_PRIORITY)
-        priority = normalize_include_priority(raw_priority)
+        for candidate in extra_include_dirs or []:
+            paths.append(self._resolve_include_root_path(candidate, ctx))
 
-        # If priority == "sanitized_first", add user paths early (position 1, after base_path)
-        if priority == "sanitized_first" and user_paths:
-            paths.extend(user_paths)
-
-        # System paths
-        system_gromacs_dir = ctx.get_input_path("systems", ctx.system_id, "gromacs")
-        system_htpolynet_dir = ctx.get_input_path("systems", ctx.system_id, "htpolynet")
-
-        paths.extend([
-            system_gromacs_dir / "top",
-            system_gromacs_dir / "itp",
-            system_htpolynet_dir / "itp",
-        ])
-
-        # Forcefield directory (cached if available)
-        if hasattr(self, "_forcefield_dir") and self._forcefield_dir:
-            paths.append(self._forcefield_dir / "gromacs")
-
-        # Sanitized output directory
-        if hasattr(self, "_sanitized_current_dir") and self._sanitized_current_dir:
-            paths.append(self._sanitized_current_dir)
-
-        # Configured GROMACS share/data paths
-        paths.extend(gmx_share_paths)
-
-        # If priority == "forcefield_first" (default), add user paths at end
-        if priority == "forcefield_first" and user_paths:
-            paths.extend(user_paths)
-
-        deduped: List[Path] = []
-        seen: Set[Path] = set()
-        for path in paths:
-            if not path.exists():
-                continue
-            try:
-                key = path.resolve()
-            except OSError:
-                key = path
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(path)
-        return deduped
+        return self._dedupe_existing_paths(paths)
 
 
 

@@ -224,8 +224,54 @@ def test_existing_system_top_reports_updated_existing_when_regenerated(tmp_path,
 
     assert stage.run(ctx) is True
     status = ctx.manifest.sanitizer_outputs["system_top_update"]["status"]
+    truth_source = ctx.manifest.sanitizer_outputs["topology_truth_source"]
     assert status["mode"] == "updated_existing"
     assert status["preserved_existing_molecules"] is False
+    assert truth_source["source"] == "grompp_preprocessed_topology"
+
+
+def test_stage_prefers_existing_preprocessed_topology_truth_source(tmp_path, monkeypatch):
+    ctx = _prepare_base_tree(
+        tmp_path,
+        "[ molecules ]\nA 1\n",
+    )
+    _patch_sanitizer_run(monkeypatch, ctx)
+
+    stage = SanitizerStage()
+    pp_path = stage._grompp_preprocessed_top_path(ctx.ensure_output_dir(stage.output_subdir))
+    _write(pp_path, "[ molecules ]\nA 0\n")
+    monkeypatch.setattr(stage, "_expected_atoms_from_grompp", lambda **kwargs: (_ for _ in ()).throw(AssertionError("grompp -pp should not run when preferred preprocessed topology already exists")))
+    monkeypatch.setattr(stage, "_warn_atomtype_outliers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(stage, "_warn_pairs_consistency", lambda *args, **kwargs: None)
+
+    assert stage.run(ctx) is True
+    truth_source = ctx.manifest.sanitizer_outputs["topology_truth_source"]
+    count_source = ctx.manifest.sanitizer_outputs["molecule_count_source"]
+    assert truth_source["source"] == "preprocessed_topology"
+    assert truth_source["is_preprocessed"] is True
+    assert count_source["source"] == "preferred_preprocessed_topology"
+
+
+def test_stage_records_python_fallback_truth_source_when_preprocessed_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    ctx = _prepare_base_tree(
+        tmp_path,
+        "[ molecules ]\nA 0\n",
+    )
+    _patch_sanitizer_run(monkeypatch, ctx)
+
+    stage = SanitizerStage()
+    monkeypatch.setattr(stage, "_warn_atomtype_outliers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(stage, "_warn_pairs_consistency", lambda *args, **kwargs: None)
+
+    assert stage.run(ctx) is True
+    truth_source = ctx.manifest.sanitizer_outputs["topology_truth_source"]
+    count_source = ctx.manifest.sanitizer_outputs["molecule_count_source"]
+    assert truth_source["source"] == "python_fallback_raw_topology"
+    assert truth_source["fallback_used"] is True
+    assert count_source["topology_truth_source"]["source"] == "python_fallback_raw_topology"
 
 
 def test_active_molecules_require_sanitized_mapping(tmp_path, monkeypatch):
