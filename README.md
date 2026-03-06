@@ -718,8 +718,10 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
   - Use `--lj-outlier-policy {off,warn,error}` with `--lj-bounds-profile {aa,coarse_grained,polarizable,custom}`.
   - For `--lj-bounds-profile custom`, provide `--lj-sigma-max-nm` and `--lj-epsilon-max-kj-mol`.
   - Dummy/virtual (`ptype D/V`) LJ outlier checks are skipped.
-  - Negative sigma is treated as a special encoding warning by default, not auto-classified as unit corruption.
-  - If you want negative sigma to hard-fail as part of the LJ outlier policy, use `--lj-outlier-policy error` (or legacy `--strict-lj-validation`).
+  - Negative sigma is warning-only by default because some legacy/special GROMACS encodings use it intentionally.
+  - Negative sigma paired with `epsilon <= 0` is still warning-only by default for compatibility, but it is diagnosed as more suspicious than the legacy/special-encoding case.
+  - If you want negative-sigma or other non-fatal LJ findings to hard-fail, use `--lj-outlier-policy error` (or legacy `--strict-lj-validation`).
+  - For comb-rule `1`, near-zero positive `p1/p2` values that are more than 12 orders of magnitude below the median positive magnitude are excluded from log-domain MAD statistics and reported explicitly instead of silently distorting the outlier score.
   - Unit-screaming values (for example sigma > 10 nm or epsilon > 1e6 kJ/mol) always hard-fail.
 - **Triclinic Support**:
   - Charges are validated on rectangular boxes.
@@ -1170,10 +1172,11 @@ TIP4P-like water models and other systems with virtual sites (ptype D or V) are 
 
 ### Robust Atomtype Parsing
 
-The parser tolerates various formats across OPLS/GAFF/AmberTools:
-- **Missing ptype**: If ptype column is absent, parsing continues with `ptype=None`
-- **Variable column counts**: Parser identifies LJ params from last 2 tokens, then searches for ptype
-- Files with unusual formats produce actionable errors only when LJ params are truly ambiguous
+The LJ-validation parser is intentionally conservative:
+- Supported tails are `... mass charge ptype sigma epsilon` and `... mass charge sigma epsilon` (missing `ptype`)
+- `ptype` is recognized only in the canonical third token from the tail and accepts `A/D/S/V`
+- Middle tokens ahead of `mass/charge` may exist, but rows with additional ptype-like middle tokens are rejected as ambiguous instead of guessed
+- Files with unusual or shifted layouts produce actionable errors rather than silently reinterpreting columns
 
 ### Deterministic Ordering
 
@@ -1427,12 +1430,13 @@ LJ outlier checks now use a **policy + profile** model:
 
 Behavior:
 - Comb-rule `2/3`: interpret LJ columns as sigma/epsilon and apply profile bounds
-- Comb-rule `1`: treat LJ columns as raw `p1/p2` and use robust statistical outlier checks (MAD on log-scale)
+- Comb-rule `1`: treat LJ columns as raw `p1/p2` and use robust statistical outlier checks (MAD on log-scale) after excluding explicitly reported near-zero values that would otherwise pollute the log-domain statistics
 - Dummy/virtual atomtypes (`ptype D/V`) are skipped to reduce false positives
-- Negative sigma is treated as a special case (warn/review), not auto-classified as unit corruption
+- Negative sigma with `epsilon > 0` is treated as a compatibility warning/review case, not auto-classified as unit corruption
+- Negative sigma with `epsilon <= 0` stays warning-only by default but is reported as more suspicious than the legacy/special-encoding case
 - A second-level unit-screaming guard always hard-fails for absurd values (e.g., sigma > 10 nm or epsilon > 1e6 kJ/mol)
 
-A structured LJ report is always emitted (manifest `sanitizer.lj_validation`) with active profile/policy, thresholds, and top offenders including provenance.
+A structured LJ report is always emitted (manifest `sanitizer.lj_validation`) with active profile/policy, thresholds, parse issues, and top offenders including provenance and source locations.
 
 ### v4 Hardening: Sentinel Block system.top Updates
 
@@ -1452,11 +1456,11 @@ The Sanitizer now uses **sentinel-block based updates** to preserve custom conte
 - `#define`, `#ifdef`, extra includes, and custom sections are preserved
 - If markers already exist, sanitizer always uses that managed block location (preferred placeholder mechanism)
 - Managed-block body generation is deterministic and idempotent: repeated runs rewrite the same block body, dedupe repeated managed includes, and keep molecule includes in the sanitizer's trusted `[molecules]` order
-- If markers don't exist, insertion is deterministic: immediately after the last unconditional forcefield include before the first topology section; if forcefield include is absent, after leading comment/blank/`#define`/`#undef` preamble and before other pre-section includes
+- If markers don't exist, insertion is deterministic: immediately after the last already-owned defaults prefix before the first non-defaults topology section (direct `[ defaults ]`, direct pre-section include with direct defaults, or unconditional `forcefield.itp` / `*.ff` include); if no such ownership prefix exists, after leading comment/blank/`#define`/`#undef` preamble and before other pre-section includes
 - Sanitizer does not attempt broad macro-block parsing to find a "smart" insertion point
 - If **multiple blocks** are found, the sanitizer replaces all managed blocks with one clean block (strict mode via `--strict-top-update` or `--strict-include-resolution` fails fast)
 - If markers are **malformed** (unmatched or misordered), strict mode (`--strict-top-update` or `--strict-include-resolution`) fails fast; non-strict mode only rebuilds when the damaged payload is still recognizable as managed-block content, otherwise it fails closed instead of deleting user topology sections
-- Duplicate-`[ defaults ]` avoidance during existing-top updates is raw-top based: the sanitizer recognizes direct `[ defaults ]` sections and unconditional `forcefield.itp` / `*.ff` include lines in `system.top`, but does not chase arbitrary pre-section includes to infer nested defaults ownership
+- Existing-top defaults ownership is checked conservatively: direct `[ defaults ]`, unconditional `forcefield.itp` / `*.ff` includes, and direct pre-section includes whose target file directly defines `[ defaults ]` are treated as owned defaults prefixes; nested pre-section include chains remain ambiguous, fail closed in strict mode, and are flagged as degraded warnings otherwise
 - Atomic writes prevent partial files on crash
 
 ### v4 Hardening: Moleculetype Exact-Name Policy

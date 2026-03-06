@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from collections import deque
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path, PurePosixPath
+import sys
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
 import math
 import hashlib
@@ -17,7 +18,7 @@ import shutil
 import uuid
 
 from ..manifest import _best_effort_fsync, _best_effort_fsync_dir
-from ..itp_sanitizer import IncludeResolution
+from ..itp_sanitizer import IncludeResolution, ItpParser
 
 if TYPE_CHECKING:
     from ..context import PipelineContext
@@ -77,6 +78,10 @@ LJ_UNIT_SCREAMING_THRESHOLDS = {
     "epsilon_max_kj_mol": 1e6,
 }
 
+LJ_ROBUST_LOG_MEDIAN_RELATIVE_FLOOR = 1e-12
+LJ_ROBUST_LOG_ABSOLUTE_FLOOR = sys.float_info.min * 1024.0
+LJ_ROBUST_Z_THRESHOLD = 5.0
+
 # Hardening v6: Protected molecule patterns for charge correction
 # These molecules should NEVER have their charges modified unless explicitly allowed
 PROTECTED_SOLVENT_PATTERNS = frozenset({
@@ -129,7 +134,7 @@ PREPROCESSOR_UNRESOLVED_SEMANTIC_DIRECTIVES = (
 )
 
 # Supported ptype tokens in [ atomtypes ].
-PTYPE_TOKENS = frozenset({"A", "D", "V"})
+PTYPE_TOKENS = frozenset({"A", "D", "S", "V"})
 
 # Sentinel markers for sanitizer-managed include block in system.top
 # Hardening v6: Consistent marker wording
@@ -269,6 +274,18 @@ def _decimal_places_from_numeric_token(token: str) -> Optional[int]:
     return len(frac) if frac is not None else 0
 
 
+def _median(values: List[float]) -> float:
+    """Deterministic median helper for small numeric lists."""
+    if not values:
+        raise ValueError("median requires at least one value")
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
     """
     Check if name matches any protected pattern using canonicalized boundaries.
@@ -375,9 +392,18 @@ class TopMoleculesEntry:
 class LocalAtomTypeRecord:
     """Minimal local LJ record for atomtypes used by a target moleculetype."""
     name: str
-    ptype: str
+    ptype: Optional[str]
     sigma: float
     epsilon: float
+
+
+@dataclass(frozen=True)
+class TopDefaultsOwnershipScan:
+    """Existing system.top defaults/forcefield ownership scan result."""
+    has_defaults: bool
+    has_forcefield_include: bool
+    owner_insert_after_idx: Optional[int] = None
+    ambiguity_reasons: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -1711,10 +1737,11 @@ class TopologySanitizerMixin:
                 record = local_atomtypes[atomtype_name]
                 sigma = self._quantize_moleculetype_value(record.sigma, quant_step)
                 epsilon = self._quantize_moleculetype_value(record.epsilon, quant_step)
+                ptype_token = record.ptype or "-"
                 hasher.update(
                     (
                         "atomtypes_local|"
-                        f"{record.name}|{record.ptype}|{sigma:.10f}|{epsilon:.10f}\n"
+                        f"{record.name}|{ptype_token}|{sigma:.10f}|{epsilon:.10f}\n"
                     ).encode("utf-8")
                 )
 
@@ -2869,22 +2896,207 @@ class TopologySanitizerMixin:
                         f"  Searched: {searched}"
                     )
 
+    def _format_lj_row_location(
+        self,
+        source_name: str,
+        line_no: int,
+        provenance: Optional[str] = None,
+    ) -> str:
+        """Format a stable source location for LJ diagnostics."""
+        location = f"{source_name}:{line_no}"
+        if provenance:
+            return f"{location} (from {provenance})"
+        return location
+
+    def _scan_direct_include_for_defaults_ownership(
+        self,
+        include_path: Path,
+        strict: bool,
+    ) -> Tuple[bool, List[str]]:
+        """
+        Inspect one directly included file for obvious defaults ownership.
+
+        Returns:
+            (owns_defaults, ambiguity_reasons)
+        """
+        try:
+            content = self.safe_read_text(include_path, strict=True)
+        except SanitizerError as exc:
+            return False, [f"{include_path.name}: {exc}"]
+
+        if not content:
+            return False, []
+
+        lines = content.splitlines()
+        _, issues = self._conservative_topology_lines(
+            lines=lines,
+            file_path=include_path,
+            purpose="defaults ownership scan",
+            strict=strict,
+        )
+        if issues:
+            return False, list(issues)
+
+        current_section: Optional[str] = None
+        for line_no, line in enumerate(lines, start=1):
+            section = parse_section_name(line)
+            if section is not None:
+                current_section = section
+                if section == "defaults":
+                    return True, []
+                if section != "defaults":
+                    break
+                continue
+
+            if current_section is not None:
+                continue
+
+            include_target = parse_include_target(line)
+            if include_target:
+                return (
+                    False,
+                    [
+                        f"{include_path.name}:{line_no} contains nested pre-section include "
+                        f"'{include_target}'"
+                    ],
+                )
+
+        if ItpParser.extract_defaults_from_file(include_path) is not None:
+            return True, []
+        return False, []
+
+    def _scan_existing_top_defaults_ownership(
+        self,
+        *,
+        system_top_path: Path,
+        lines: List[str],
+        ignore_ranges: Optional[List[Tuple[int, int]]] = None,
+        ctx: Optional["PipelineContext"] = None,
+        strict: bool = False,
+    ) -> TopDefaultsOwnershipScan:
+        """Inspect existing system.top for defaults ownership and insertion anchoring."""
+        skip_indices: Set[int] = set()
+        if ignore_ranges:
+            for start, end in ignore_ranges:
+                skip_indices.update(range(start, end + 1))
+
+        include_dirs = [system_top_path.parent]
+        if ctx is not None:
+            include_dirs = self._build_include_search_paths(ctx, system_top_path)
+
+        allow_shadowing = getattr(ctx, "allow_include_shadowing", False) if ctx else False
+        has_defaults = False
+        has_forcefield_include = False
+        owner_insert_after_idx: Optional[int] = None
+        ambiguity_reasons: List[str] = []
+        conditional_depth = 0
+        current_section: Optional[str] = None
+
+        def _note_owner(idx: int) -> None:
+            nonlocal owner_insert_after_idx
+            candidate = idx + 1
+            if owner_insert_after_idx is None or candidate > owner_insert_after_idx:
+                owner_insert_after_idx = candidate
+
+        for idx, line in enumerate(lines):
+            if idx in skip_indices:
+                continue
+
+            directive = preprocessor_directive_token(line)
+            if directive == "#include":
+                if conditional_depth > 0:
+                    continue
+                include_target = parse_include_target(line)
+                if include_target is None:
+                    continue
+                include_target_lower = include_target.lower()
+                if "forcefield.itp" in include_target_lower or ".ff/" in include_target_lower:
+                    has_forcefield_include = True
+                    _note_owner(idx)
+                    continue
+                if current_section is not None:
+                    continue
+                resolved = self._resolve_include_in_dirs(
+                    include_target,
+                    system_top_path,
+                    include_dirs,
+                    strict=False,
+                    check_shadowing=True,
+                    allow_shadowing=allow_shadowing,
+                    ctx=ctx,
+                )
+                if resolved is None:
+                    ambiguity_reasons.append(
+                        f"{system_top_path.name}:{idx + 1} direct pre-section include "
+                        f"'{include_target}' could not be resolved"
+                    )
+                    continue
+                owns_defaults, nested_issues = self._scan_direct_include_for_defaults_ownership(
+                    resolved,
+                    strict=strict,
+                )
+                if owns_defaults:
+                    has_defaults = True
+                    _note_owner(idx)
+                    continue
+                for issue in nested_issues:
+                    ambiguity_reasons.append(
+                        f"{system_top_path.name}:{idx + 1} include '{include_target}' "
+                        f"keeps [ defaults ] ownership ambiguous: {issue}"
+                    )
+                continue
+
+            if directive is not None:
+                if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
+                    conditional_depth += 1
+                elif directive in PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES:
+                    if conditional_depth == 0:
+                        conditional_depth = 1
+                elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
+                    if conditional_depth > 0:
+                        conditional_depth -= 1
+                continue
+
+            if conditional_depth > 0:
+                continue
+
+            section = parse_section_name(line)
+            if section is not None:
+                if section == "defaults":
+                    has_defaults = True
+                    current_section = section
+                    _note_owner(idx)
+                    continue
+                break
+
+            if current_section == "defaults":
+                _note_owner(idx)
+
+        return TopDefaultsOwnershipScan(
+            has_defaults=has_defaults,
+            has_forcefield_include=has_forcefield_include,
+            owner_insert_after_idx=owner_insert_after_idx,
+            ambiguity_reasons=tuple(ambiguity_reasons),
+        )
+
     def _parse_lj_atomtypes_row(
         self,
         data: str,
         source_name: str,
         line_no: int,
-    ) -> Tuple[str, str, float, float, Optional[str]]:
+    ) -> Tuple[str, Optional[str], float, float, Optional[str]]:
         """
         Parse one [ atomtypes ] data row for LJ validation.
 
         Conservative parser:
-        - Requires ptype in the canonical position (third token from tail)
-        - Requires tail shape: ... mass charge ptype sigma epsilon
+        - Supports tail shapes:
+          * ... mass charge ptype sigma epsilon
+          * ... mass charge sigma epsilon  (missing ptype)
+        - Requires ptype, when present, in the canonical third token from tail
         - Rejects ambiguous rows rather than guessing shifted columns
         """
         parts = data.split()
-        if len(parts) < 6:
+        if len(parts) < 5:
             raise ValueError(f"Too few fields for [ atomtypes ] row: '{data}'")
 
         atomtype_name = parts[0]
@@ -2897,28 +3109,34 @@ class TopologySanitizerMixin:
             )
         p1, p2 = lj_tail_floats
 
-        ptype = parts[-3].upper()
-        if ptype not in PTYPE_TOKENS:
-            raise ValueError(
-                f"Ambiguous/missing ptype token at {source_name}:{line_no}. "
-                f"Expected one of {sorted(PTYPE_TOKENS)} in column -3; got '{parts[-3]}'. "
-                f"Raw: {data}"
-            )
+        ptype: Optional[str]
+        middle_tokens: List[str]
+        if len(parts) >= 6 and parts[-3].upper() in PTYPE_TOKENS:
+            ptype = parts[-3].upper()
+            middle_tokens = parts[1:-5]
+            charge_fields = _extract_floats_from_text(parts[-4])
+            mass_fields = _extract_floats_from_text(parts[-5])
+        else:
+            ptype = None
+            middle_tokens = parts[1:-4]
+            charge_fields = _extract_floats_from_text(parts[-3]) if len(parts) >= 4 else []
+            mass_fields = _extract_floats_from_text(parts[-4]) if len(parts) >= 5 else []
 
-        extra_ptypes = [
-            token for token in parts[:-3] if token.upper() in PTYPE_TOKENS
-        ]
+        extra_ptypes = [token for token in middle_tokens if token.upper() in PTYPE_TOKENS]
         if extra_ptypes:
+            if ptype is None:
+                raise ValueError(
+                    f"Ambiguous row without explicit ptype at {source_name}:{line_no}: "
+                    f"middle token(s) look like ptype markers {extra_ptypes}. Raw: {data}"
+                )
             raise ValueError(
                 f"Ambiguous row with multiple ptype-like tokens at {source_name}:{line_no}: "
                 f"{extra_ptypes + [ptype]}. Raw: {data}"
             )
 
-        charge_fields = _extract_floats_from_text(parts[-4]) if len(parts) >= 4 else []
-        mass_fields = _extract_floats_from_text(parts[-5]) if len(parts) >= 5 else []
         if len(charge_fields) != 1 or len(mass_fields) != 1:
             raise ValueError(
-                f"Malformed mass/charge columns before ptype in {source_name}:{line_no}. Raw: {data}"
+                f"Malformed mass/charge columns in {source_name}:{line_no}. Raw: {data}"
             )
 
         return atomtype_name, ptype, p1, p2, None
@@ -2999,11 +3217,9 @@ class TopologySanitizerMixin:
                 )
                 if policy == "error":
                     raise SanitizerError(msg)
-                print(f"  [WARN] {msg}")
                 warnings.append(msg)
                 continue
             if parse_warning:
-                print(f"  [WARN] {parse_warning}")
                 warnings.append(parse_warning)
 
             comment = stripped.split(";", 1)[1].strip() if ";" in stripped else ""
@@ -3019,10 +3235,12 @@ class TopologySanitizerMixin:
                     "p2": p2,
                     "provenance": provenance,
                     "raw": data,
+                    "line_no": line_no,
+                    "source_name": combined_atomtypes_path.name,
                 }
             )
 
-        if not atomtype_data:
+        if not atomtype_data and not warnings:
             return warnings
 
         report: Dict[str, Any] = {
@@ -3036,32 +3254,26 @@ class TopologySanitizerMixin:
             },
             "unit_screaming_thresholds": dict(LJ_UNIT_SCREAMING_THRESHOLDS),
             "top_offenders": [],
+            "top_parse_issues": [],
             "warning_count": 0,
+            "parse_issue_count": 0,
             "unit_error_count": 0,
         }
 
-        # comb-rule=1: retain robust statistical fallback.
-        if comb_rule == 1:
-            print(
-                "  [INFO] comb-rule=1: treating last two fields as raw LJ params "
-                "(p1/p2), not sigma/epsilon"
-            )
-            robust_data = [
-                (row["name"], float(row["p1"]), float(row["p2"]), str(row["raw"]))
-                for row in atomtype_data
-            ]
-            warnings.extend(self._check_lj_outliers_robust(
-                robust_data, combined_atomtypes_path.name
-            ))
+        report["parse_issue_count"] = len(warnings)
+        report["top_parse_issues"] = warnings[:10]
+        if not atomtype_data:
             report["warning_count"] = len(warnings)
-            report["top_offenders"] = [
-                {"message": msg} for msg in warnings[:10]
-            ]
+            report["top_offenders"] = [{"message": msg} for msg in warnings[:10]]
             if ctx and hasattr(ctx, "manifest") and ctx.manifest:
                 ctx.manifest.set_sanitizer_output("lj_validation", report)
-            if warnings and policy == "error":
-                raise SanitizerError(
-                    "LJ outlier policy=error triggered for comb-rule=1 robust outlier checks."
+            if policy == "off":
+                return []
+            for msg in warnings[:20]:
+                print(f"  [WARN] {msg}")
+            if len(warnings) > 20:
+                print(
+                    f"  [WARN] ... {len(warnings) - 20} additional LJ outlier warning(s) omitted."
                 )
             return warnings
 
@@ -3070,12 +3282,78 @@ class TopologySanitizerMixin:
         unit_sigma_max = float(LJ_UNIT_SCREAMING_THRESHOLDS["sigma_max_nm"])
         unit_eps_max = float(LJ_UNIT_SCREAMING_THRESHOLDS["epsilon_max_kj_mol"])
 
+        # comb-rule=1: retain robust statistical fallback with finite-value guardrails.
+        if comb_rule == 1:
+            print(
+                "  [INFO] comb-rule=1: treating last two fields as raw LJ params "
+                "(p1/p2), not sigma/epsilon"
+            )
+            for row in atomtype_data:
+                name = str(row["name"])
+                p1 = float(row["p1"])
+                p2 = float(row["p2"])
+                location = self._format_lj_row_location(
+                    str(row.get("source_name", combined_atomtypes_path.name)),
+                    int(row.get("line_no", 0)),
+                    row.get("provenance"),
+                )
+                if any((math.isnan(p1), math.isnan(p2), math.isinf(p1), math.isinf(p2))):
+                    msg = (
+                        f"Non-finite comb-rule=1 LJ params in atomtype '{name}' at {location}: "
+                        f"p1={p1}, p2={p2}."
+                    )
+                    unit_errors.append(
+                        {
+                            "name": name,
+                            "ptype": row.get("ptype"),
+                            "sigma_nm": p1,
+                            "epsilon_kj_mol": p2,
+                            "provenance": row.get("provenance"),
+                            "kind": "nan_or_inf",
+                            "message": msg,
+                        }
+                    )
+            warnings.extend(self._check_lj_outliers_robust(atomtype_data))
+            report["warning_count"] = len(warnings)
+            report["warning_examples"] = warnings[:10]
+            report["top_offenders"] = [{"message": msg} for msg in warnings[:10]]
+            report["unit_error_count"] = len(unit_errors)
+            if unit_errors:
+                report["top_unit_errors"] = unit_errors[:10]
+            if ctx and hasattr(ctx, "manifest") and ctx.manifest:
+                ctx.manifest.set_sanitizer_output("lj_validation", report)
+            if unit_errors:
+                first = unit_errors[0]
+                raise SanitizerError(
+                    "LJ unit-screaming threshold violated: "
+                    f"{first.get('message')}"
+                )
+            if policy == "off":
+                return []
+            if warnings and policy == "error":
+                raise SanitizerError(
+                    "LJ outlier policy=error triggered for comb-rule=1 robust outlier checks. "
+                    f"First issue: {warnings[0]}"
+                )
+            for msg in warnings[:20]:
+                print(f"  [WARN] {msg}")
+            if len(warnings) > 20:
+                print(
+                    f"  [WARN] ... {len(warnings) - 20} additional LJ outlier warning(s) omitted."
+                )
+            return warnings
+
         for row in atomtype_data:
             name = str(row["name"])
-            ptype = str(row.get("ptype", "A")).upper()
+            ptype = str(row.get("ptype") or "A").upper()
             sigma = float(row["p1"])
             epsilon = float(row["p2"])
             provenance = row.get("provenance")
+            location = self._format_lj_row_location(
+                str(row.get("source_name", combined_atomtypes_path.name)),
+                int(row.get("line_no", 0)),
+                provenance,
+            )
 
             if ptype in {"D", "V"}:
                 # Skip dummy/virtual sites to avoid false positives in modern topologies.
@@ -3083,8 +3361,8 @@ class TopologySanitizerMixin:
 
             if any((math.isnan(sigma), math.isnan(epsilon), math.isinf(sigma), math.isinf(epsilon))):
                 msg = (
-                    f"NaN/Inf LJ params in atomtype '{name}': sigma={sigma}, epsilon={epsilon} "
-                    f"({provenance or combined_atomtypes_path.name})"
+                    f"NaN/Inf LJ params in atomtype '{name}' at {location}: "
+                    f"sigma={sigma}, epsilon={epsilon}."
                 )
                 unit_errors.append(
                     {
@@ -3101,7 +3379,7 @@ class TopologySanitizerMixin:
 
             if sigma > unit_sigma_max or epsilon > unit_eps_max:
                 msg = (
-                    f"Unit-screaming LJ value in atomtype '{name}': "
+                    f"Unit-screaming LJ value in atomtype '{name}' at {location}: "
                     f"sigma={sigma:.6g} nm, epsilon={epsilon:.6g} kJ/mol "
                     f"(>{unit_sigma_max} nm or >{unit_eps_max} kJ/mol)."
                 )
@@ -3119,10 +3397,22 @@ class TopologySanitizerMixin:
                 continue
 
             if sigma < 0:
-                msg = (
-                    f"Negative sigma in atomtype '{name}' (sigma={sigma:.6g} nm, epsilon={epsilon:.6g} kJ/mol). "
-                    "Some GROMACS forcefields use negative sigma as special encoding; review manually."
-                )
+                if epsilon <= 0:
+                    msg = (
+                        f"Negative sigma in atomtype '{name}' at {location}: "
+                        f"sigma={sigma:.6g} nm, epsilon={epsilon:.6g} kJ/mol. "
+                        "Legacy/special encodings normally still use epsilon>0, so this row "
+                        "is treated as suspicious."
+                    )
+                    kind = "negative_sigma_nonpositive_epsilon"
+                else:
+                    msg = (
+                        f"Negative sigma in atomtype '{name}' at {location}: "
+                        f"sigma={sigma:.6g} nm, epsilon={epsilon:.6g} kJ/mol. "
+                        "Some GROMACS forcefields use negative sigma as a special encoding; "
+                        "review manually."
+                    )
+                    kind = "negative_sigma_special"
                 offenders.append(
                     {
                         "name": name,
@@ -3130,7 +3420,7 @@ class TopologySanitizerMixin:
                         "sigma_nm": sigma,
                         "epsilon_kj_mol": epsilon,
                         "provenance": provenance,
-                        "kind": "negative_sigma_special",
+                        "kind": kind,
                         "severity": "warn",
                         "score": 0.0,
                         "message": msg,
@@ -3141,8 +3431,8 @@ class TopologySanitizerMixin:
 
             if epsilon < 0:
                 msg = (
-                    f"Negative epsilon in atomtype '{name}' (epsilon={epsilon:.6g} kJ/mol) "
-                    f"at {provenance or combined_atomtypes_path.name}."
+                    f"Negative epsilon in atomtype '{name}' at {location}: "
+                    f"sigma={sigma:.6g} nm, epsilon={epsilon:.6g} kJ/mol."
                 )
                 offenders.append(
                     {
@@ -3183,7 +3473,7 @@ class TopologySanitizerMixin:
 
             if local_msgs:
                 msg = (
-                    f"LJ profile outlier '{name}' ({provenance or combined_atomtypes_path.name}): "
+                    f"LJ profile outlier '{name}' at {location}: "
                     + "; ".join(local_msgs)
                 )
                 offenders.append(
@@ -3241,7 +3531,7 @@ class TopologySanitizerMixin:
         if policy == "error" and offenders:
             raise SanitizerError(
                 f"LJ outlier policy=error triggered ({len(offenders)} offender(s)); "
-                "inspect sanitizer lj_validation report in manifest."
+                f"first offender: {top_offenders[0].get('message') if top_offenders else 'n/a'}"
             )
 
         for msg in warnings[:20]:
@@ -3254,7 +3544,8 @@ class TopologySanitizerMixin:
         return warnings
     
     def _check_lj_outliers_robust(
-        self, atomtype_data: List[Tuple[str, float, float, str]], source_name: str
+        self,
+        atomtype_data: List[Dict[str, Any]],
     ) -> List[str]:
         """
         Check for LJ parameter outliers using robust statistics (MAD z-score on log-scale).
@@ -3263,8 +3554,7 @@ class TopologySanitizerMixin:
         Uses median and median absolute deviation (MAD) to detect outliers.
         
         Args:
-            atomtype_data: List of (name, p1, p2, raw_line) tuples
-            source_name: Source file name for warnings
+            atomtype_data: Parsed row dictionaries with name/p1/p2/location metadata
             
         Returns:
             List of warning messages
@@ -3272,51 +3562,89 @@ class TopologySanitizerMixin:
         warnings: List[str] = []
         
         # Filter to positive values only for log-scale analysis
-        p1_positive = [(name, abs(p1)) for name, p1, _, _ in atomtype_data if p1 != 0]
-        p2_positive = [(name, abs(p2)) for name, _, p2, _ in atomtype_data if p2 != 0]
+        def _row_location(row: Dict[str, Any]) -> str:
+            return self._format_lj_row_location(
+                str(row.get("source_name", "?")),
+                int(row.get("line_no", 0)),
+                row.get("provenance"),
+            )
+
+        p1_positive = [
+            (row, abs(float(row["p1"])))
+            for row in atomtype_data
+            if math.isfinite(float(row["p1"])) and float(row["p1"]) != 0.0
+        ]
+        p2_positive = [
+            (row, abs(float(row["p2"])))
+            for row in atomtype_data
+            if math.isfinite(float(row["p2"])) and float(row["p2"]) != 0.0
+        ]
         
         # Check for negative values (warn-only, not "impossible")
-        for name, p1, p2, _ in atomtype_data:
+        for row in atomtype_data:
+            name = str(row["name"])
+            p1 = float(row["p1"])
+            p2 = float(row["p2"])
             if p1 < 0 or p2 < 0:
                 msg = (
-                    f"Negative LJ params in atomtype '{name}': p1={p1:.4e}, p2={p2:.4e} "
-                    f"at {source_name}; comb-rule=1 is not sigma/epsilon, please review"
+                    f"Negative comb-rule=1 LJ params in atomtype '{name}' at {_row_location(row)}: "
+                    f"p1={p1:.4e}, p2={p2:.4e}. comb-rule=1 is not sigma/epsilon; review manually."
                 )
-                print(f"  [WARN] {msg}")
                 warnings.append(msg)
         
         # Robust outlier detection using MAD z-score on log scale
-        z_threshold = 5.0  # Conservative threshold for outliers
-        
         for label, values in [("p1", p1_positive), ("p2", p2_positive)]:
             if len(values) < 3:
                 continue  # Not enough data for statistics
-            
+
+            positive_values = [value for _, value in values]
+            median_positive = _median(positive_values)
+            near_zero_floor = max(
+                LJ_ROBUST_LOG_ABSOLUTE_FLOOR,
+                median_positive * LJ_ROBUST_LOG_MEDIAN_RELATIVE_FLOOR,
+            )
+            filtered_values = [
+                (row, value)
+                for row, value in values
+                if value >= near_zero_floor
+            ]
+            excluded_values = [
+                (row, value)
+                for row, value in values
+                if value < near_zero_floor
+            ]
+            if excluded_values:
+                examples = ", ".join(
+                    f"{row['name']}@{_row_location(row)}={value:.4e}"
+                    for row, value in excluded_values[:3]
+                )
+                msg = (
+                    f"Near-zero comb-rule=1 {label} value(s) excluded from log-domain MAD: "
+                    f"floor={near_zero_floor:.4e} derived from median |{label}|={median_positive:.4e}; "
+                    f"examples: {examples}"
+                )
+                warnings.append(msg)
+            if len(filtered_values) < 3:
+                continue
+
             # Compute log-scale values
-            log_vals = [math.log10(v) for _, v in values]
-            
-            # Median
-            sorted_logs = sorted(log_vals)
-            n = len(sorted_logs)
-            median = sorted_logs[n // 2] if n % 2 == 1 else (sorted_logs[n//2 - 1] + sorted_logs[n//2]) / 2
-            
-            # MAD (Median Absolute Deviation)
-            abs_devs = sorted([abs(lv - median) for lv in log_vals])
-            mad = abs_devs[n // 2] if n % 2 == 1 else (abs_devs[n//2 - 1] + abs_devs[n//2]) / 2
-            
+            log_vals = [math.log10(value) for _, value in filtered_values]
+            median = _median(log_vals)
+            abs_devs = [abs(log_val - median) for log_val in log_vals]
+            mad = _median(abs_devs)
+
             # Scale factor for MAD -> sigma-equivalent (1.4826 for normal distribution)
             mad_scaled = mad * 1.4826 if mad > 0 else 1.0
-            
+
             # Check for outliers
-            for (name, val), log_val in zip(values, log_vals):
+            for (row, val), log_val in zip(filtered_values, log_vals):
                 if mad_scaled > 0:
                     z_score = abs(log_val - median) / mad_scaled
-                    if z_score > z_threshold:
+                    if z_score > LJ_ROBUST_Z_THRESHOLD:
                         msg = (
-                            f"Statistical outlier in atomtype '{name}': "
-                            f"{label}={val:.4e} (z={z_score:.1f}) at {source_name}"
+                            f"Statistical LJ outlier '{row['name']}' for {label} at {_row_location(row)}: "
+                            f"value={val:.4e} (log-MAD z={z_score:.1f})"
                         )
-                        print(f"  [WARN] {msg}")
                         warnings.append(msg)
         
         return warnings
@@ -3756,11 +4084,25 @@ class TopologySanitizerMixin:
             print(f"  [WARN] {msg}")
             print("  [WARN] Rebuilding sanitizer managed block from safe managed-content fragments only.")
 
-            has_defaults, has_forcefield_include = self._top_has_defaults_or_forcefield(
+            ownership_scan = self._scan_existing_top_defaults_ownership(
+                system_top_path=existing_top,
                 lines=cleaned_lines,
                 ignore_ranges=None,
+                ctx=ctx,
+                strict=bool(strict_top_update),
             )
-            emit_defaults = not (has_defaults or has_forcefield_include)
+            if ownership_scan.ambiguity_reasons:
+                ambiguity_msg = (
+                    "system.top defaults ownership is ambiguous outside sanitizer-managed "
+                    "content.\n  - "
+                    + "\n  - ".join(ownership_scan.ambiguity_reasons)
+                )
+                if strict_top_update:
+                    raise SanitizerError(ambiguity_msg)
+                print(f"  [WARN][DEGRADED] {ambiguity_msg}")
+            emit_defaults = not (
+                ownership_scan.has_defaults or ownership_scan.has_forcefield_include
+            )
             managed_lines = self._build_sanitizer_managed_block(
                 combined_atomtypes_path,
                 molecule_itp_files,
@@ -3780,12 +4122,14 @@ class TopologySanitizerMixin:
                     "nested_begin": len(nested_begin),
                 },
                 "preprocessor_ambiguity": list(top_preprocessor_issues),
+                "defaults_ownership_ambiguity": list(ownership_scan.ambiguity_reasons),
             }
             rebuilt = self._insert_managed_block_at_safe_location(
                 cleaned_lines,
                 managed_lines,
                 begin_marker,
                 end_marker,
+                owner_insert_after_idx=ownership_scan.owner_insert_after_idx,
             )
             return '\n'.join(rebuilt) + '\n'
 
@@ -3797,11 +4141,25 @@ class TopologySanitizerMixin:
 
         # Detect pre-existing defaults/forcefield include outside managed block(s).
         # If found, do not inject a duplicate [ defaults ] section.
-        has_defaults, has_forcefield_include = self._top_has_defaults_or_forcefield(
+        ownership_scan = self._scan_existing_top_defaults_ownership(
+            system_top_path=existing_top,
             lines=lines,
             ignore_ranges=pairs if pairs else None,
+            ctx=ctx,
+            strict=bool(strict_top_update),
         )
-        emit_defaults = not (has_defaults or has_forcefield_include)
+        if ownership_scan.ambiguity_reasons:
+            ambiguity_msg = (
+                "system.top defaults ownership is ambiguous outside sanitizer-managed "
+                "content.\n  - "
+                + "\n  - ".join(ownership_scan.ambiguity_reasons)
+            )
+            if strict_top_update:
+                raise SanitizerError(ambiguity_msg)
+            print(f"  [WARN][DEGRADED] {ambiguity_msg}")
+        emit_defaults = not (
+            ownership_scan.has_defaults or ownership_scan.has_forcefield_include
+        )
 
         # Build the sanitizer-managed include block
         managed_lines = self._build_sanitizer_managed_block(
@@ -3825,18 +4183,26 @@ class TopologySanitizerMixin:
                 )
                 self._system_top_update_status = {
                     "mode": "replaced_single_managed_block",
-                    "degraded": bool(top_preprocessor_issues),
+                    "degraded": bool(
+                        top_preprocessor_issues or ownership_scan.ambiguity_reasons
+                    ),
                     "preprocessor_ambiguity": list(top_preprocessor_issues),
+                    "defaults_ownership_ambiguity": list(ownership_scan.ambiguity_reasons),
                 }
             else:
                 # Defensive fallback: bad ordering
                 result_lines = self._insert_managed_block_at_safe_location(
-                    lines, managed_lines, begin_marker, end_marker
+                    lines,
+                    managed_lines,
+                    begin_marker,
+                    end_marker,
+                    owner_insert_after_idx=ownership_scan.owner_insert_after_idx,
                 )
                 self._system_top_update_status = {
                     "mode": "fallback_insert_bad_marker_order",
                     "degraded": True,
                     "preprocessor_ambiguity": list(top_preprocessor_issues),
+                    "defaults_ownership_ambiguity": list(ownership_scan.ambiguity_reasons),
                 }
         elif len(pairs) > 1:
             msg = (
@@ -3871,16 +4237,24 @@ class TopologySanitizerMixin:
                 "degraded": True,
                 "blocks_found": len(pairs),
                 "preprocessor_ambiguity": list(top_preprocessor_issues),
+                "defaults_ownership_ambiguity": list(ownership_scan.ambiguity_reasons),
             }
         else:
             # Markers not found: insert at safe location
             result_lines = self._insert_managed_block_at_safe_location(
-                lines, managed_lines, begin_marker, end_marker
+                lines,
+                managed_lines,
+                begin_marker,
+                end_marker,
+                owner_insert_after_idx=ownership_scan.owner_insert_after_idx,
             )
             self._system_top_update_status = {
                 "mode": "inserted_new_managed_block",
-                "degraded": bool(top_preprocessor_issues),
+                "degraded": bool(
+                    top_preprocessor_issues or ownership_scan.ambiguity_reasons
+                ),
                 "preprocessor_ambiguity": list(top_preprocessor_issues),
+                "defaults_ownership_ambiguity": list(ownership_scan.ambiguity_reasons),
             }
         
         return '\n'.join(result_lines) + '\n'
@@ -4039,17 +4413,28 @@ class TopologySanitizerMixin:
         managed_lines: List[str],
         begin_marker: str,
         end_marker: str,
+        owner_insert_after_idx: Optional[int] = None,
     ) -> List[str]:
         """
         Insert the managed block at a safe location in system.top.
         
         Deterministic policy:
-        1. If an unconditional forcefield include exists before the first topology
-           section, insert immediately after its last line.
+        1. If existing topology content already owns defaults (direct [ defaults ],
+           direct pre-section include with direct defaults, or unconditional
+           forcefield include), insert immediately after that ownership prefix.
         2. Otherwise insert before the first non-preamble line, where the preamble
            is limited to leading comments, blanks, and top-level macro definitions.
         3. Never insert after the first topology section header.
         """
+        if owner_insert_after_idx is not None:
+            return self._insert_managed_block_at_index(
+                lines,
+                managed_lines,
+                begin_marker,
+                end_marker,
+                owner_insert_after_idx,
+            )
+
         first_section_idx = len(lines)
         for idx, line in enumerate(lines):
             if parse_section_name(line) is not None:
@@ -4105,6 +4490,41 @@ class TopologySanitizerMixin:
             end_marker,
             insert_idx,
         )
+
+    def _atomic_publish_current_directory(
+        self,
+        source_dir: Path,
+        current_dir: Path,
+    ) -> None:
+        """Crash-safe publish of a current directory via temp copy + replace."""
+        current_dir.parent.mkdir(parents=True, exist_ok=True)
+        temp_dir = current_dir.parent / f".{current_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        backup_dir = current_dir.parent / f".{current_dir.name}.bak.{os.getpid()}.{uuid.uuid4().hex}"
+        current_exists = current_dir.exists() or current_dir.is_symlink()
+        try:
+            shutil.copytree(source_dir, temp_dir, symlinks=True)
+            _best_effort_fsync_dir(temp_dir)
+            if current_exists:
+                os.replace(current_dir, backup_dir)
+                _best_effort_fsync_dir(current_dir.parent)
+            os.replace(temp_dir, current_dir)
+            _best_effort_fsync_dir(current_dir.parent)
+        except Exception:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            if (backup_dir.exists() or backup_dir.is_symlink()) and not (
+                current_dir.exists() or current_dir.is_symlink()
+            ):
+                os.replace(backup_dir, current_dir)
+                _best_effort_fsync_dir(current_dir.parent)
+            raise
+        finally:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            if backup_dir.is_symlink():
+                backup_dir.unlink()
+            elif backup_dir.exists():
+                shutil.rmtree(backup_dir, ignore_errors=True)
     
     def _create_minimal_outputs(
         self,
@@ -4139,12 +4559,7 @@ class TopologySanitizerMixin:
         sanitized_dir.mkdir(parents=True, exist_ok=True)
         
         sanitized_current = system_gromacs_dir / "itp_sanitized_current"
-        if sanitized_current.exists() or sanitized_current.is_symlink():
-            if sanitized_current.is_symlink():
-                sanitized_current.unlink()
-            else:
-                shutil.rmtree(sanitized_current)
-        shutil.copytree(sanitized_dir, sanitized_current)
+        self._atomic_publish_current_directory(sanitized_dir, sanitized_current)
         
         # Minimal system.top
         top_dir = system_gromacs_dir / "top"

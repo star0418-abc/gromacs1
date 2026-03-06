@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from pipeline.stages import topology_sanitizer as topology_sanitizer_module
 from pipeline.charge_neutrality import (
     ChargeNeutralityChecker,
     ChargeNeutralityError,
@@ -42,10 +43,12 @@ class DummyContext:
     def __init__(self, root: Path, **overrides) -> None:
         self.root = root
         self.system_id = "SYS"
+        self.run_id = "RUN123"
         self.project_root = str(root)
         self.itp_include_dirs = ""
         self.itp_include_dirs_priority = "forcefield_first"
         self.strict_include_resolution = False
+        self.strict_top_update = None
         self.allow_include_shadowing = True
         self.allow_unsafe_include_escape = False
         self.strict_forcefield_consistency = False
@@ -460,6 +463,84 @@ def test_update_system_top_includes_uses_safe_anchor_before_non_forcefield_inclu
     assert "[ defaults ]" in updated
 
 
+def test_update_system_top_includes_inserts_after_existing_direct_defaults_section(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "; Banner\n"
+        "[ defaults ]\n"
+        "1 2 yes 0.5 0.8333\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    updated = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_itp],
+        defaults=SimpleNamespace(
+            nbfunc=1,
+            comb_rule=2,
+            gen_pairs="yes",
+            fudge_lj=0.5,
+            fudge_qq=0.8333,
+        ),
+        top_dir=existing_top.parent,
+        ctx=ctx,
+    )
+
+    lines = updated.splitlines()
+    assert updated.count("[ defaults ]") == 1
+    assert lines.index(SANITIZER_BLOCK_BEGIN) > lines.index("1 2 yes 0.5 0.8333")
+    assert lines.index(SANITIZER_BLOCK_BEGIN) < lines.index("[ system ]")
+
+
+def test_update_system_top_includes_inserts_after_direct_presection_defaults_include(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    defaults_include = tmp_path / "IN/systems/SYS/gromacs/top/user_defaults.itp"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        '#include "user_defaults.itp"\n'
+        '#include "user_custom.itp"\n'
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(
+        defaults_include,
+        "[ defaults ]\n"
+        "1 2 yes 0.5 0.8333\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    updated = sanitizer._update_system_top_includes(
+        existing_top,
+        combined_atomtypes,
+        [molecule_itp],
+        top_dir=existing_top.parent,
+        ctx=ctx,
+    )
+
+    lines = updated.splitlines()
+    assert "[ defaults ]" not in updated
+    assert lines.index(SANITIZER_BLOCK_BEGIN) > lines.index('#include "user_defaults.itp"')
+    assert lines.index(SANITIZER_BLOCK_BEGIN) < lines.index('#include "user_custom.itp"')
+
+
 def test_update_system_top_includes_replaces_existing_block_without_duplicate_includes(tmp_path):
     sanitizer = DummySanitizer()
     ctx = DummyContext(tmp_path)
@@ -692,6 +773,39 @@ def test_update_system_top_includes_non_strict_fails_closed_on_unsafe_malformed_
         SanitizerError,
         match="Cannot safely rebuild non-strict system.top because malformed managed-block fragments overlap non-managed topology content",
     ):
+        sanitizer._update_system_top_includes(
+            existing_top,
+            combined_atomtypes,
+            [molecule_itp],
+            top_dir=existing_top.parent,
+            ctx=ctx,
+        )
+
+
+def test_update_system_top_includes_strict_fails_closed_on_nested_presection_defaults_ambiguity(
+    tmp_path,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path, strict_top_update=True)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    wrapper_itp = tmp_path / "IN/systems/SYS/gromacs/top/wrapper.itp"
+    nested_defaults = tmp_path / "IN/systems/SYS/gromacs/top/nested_defaults.itp"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        '#include "wrapper.itp"\n'
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(wrapper_itp, '#include "nested_defaults.itp"\n')
+    _write(nested_defaults, "[ defaults ]\n1 2 yes 0.5 0.8333\n")
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    with pytest.raises(SanitizerError, match="defaults ownership is ambiguous"):
         sanitizer._update_system_top_includes(
             existing_top,
             combined_atomtypes,
@@ -1290,13 +1404,128 @@ def test_negative_sigma_policy_warns_by_default_and_errors_when_requested(tmp_pa
     _write(
         combined,
         "[ atomtypes ]\n"
-        "NEG 12.011 0.000 A -1.000000e-01 2.500000e-01\n",
+        "NEG 12.011 0.000 A -1.000000e-01 2.500000e-01 ; from: legacy.ff/atomtypes.itp:12\n",
     )
 
     warn_ctx = DummyContext(tmp_path)
     warnings = sanitizer._warn_atomtype_outliers(combined, warn_ctx, comb_rule=2)
-    assert any("Negative sigma" in warning for warning in warnings)
+    assert any(
+        "Negative sigma" in warning
+        and "combined_atomtypes.itp:2" in warning
+        and "legacy.ff/atomtypes.itp:12" in warning
+        for warning in warnings
+    )
 
     error_ctx = DummyContext(tmp_path, lj_outlier_policy="error")
-    with pytest.raises(SanitizerError, match="LJ outlier policy=error triggered"):
+    with pytest.raises(
+        SanitizerError,
+        match=r"LJ outlier policy=error triggered .*Negative sigma in atomtype 'NEG' at combined_atomtypes\.itp:2",
+    ):
         sanitizer._warn_atomtype_outliers(combined, error_ctx, comb_rule=2)
+
+
+def test_negative_sigma_with_nonpositive_epsilon_is_explicitly_flagged(tmp_path):
+    sanitizer = DummySanitizer()
+    combined = tmp_path / "combined_atomtypes.itp"
+    _write(
+        combined,
+        "[ atomtypes ]\n"
+        "NEGZ 12.011 0.000 A -1.000000e-01 0.000000e+00\n",
+    )
+
+    warnings = sanitizer._warn_atomtype_outliers(combined, DummyContext(tmp_path), comb_rule=2)
+
+    assert any(
+        "Legacy/special encodings normally still use epsilon>0" in warning
+        and "NEGZ" in warning
+        for warning in warnings
+    )
+
+
+def test_check_lj_outliers_robust_excludes_near_zero_values_from_log_domain_stats(tmp_path):
+    sanitizer = DummySanitizer()
+    combined = tmp_path / "combined_atomtypes.itp"
+    _write(
+        combined,
+        "[ atomtypes ]\n"
+        "A 12.011 0.000 A 1.000000e+00 2.000000e+00\n"
+        "B 12.011 0.000 A 9.500000e-01 2.100000e+00\n"
+        "C 12.011 0.000 A 1.050000e+00 1.900000e+00\n"
+        "TINY 12.011 0.000 A 1.000000e-20 2.000000e+00\n",
+    )
+
+    warnings = sanitizer._warn_atomtype_outliers(combined, DummyContext(tmp_path), comb_rule=1)
+
+    assert any("Near-zero comb-rule=1 p1 value(s) excluded" in warning for warning in warnings)
+    assert not any("Statistical LJ outlier 'TINY' for p1" in warning for warning in warnings)
+
+
+def test_parse_lj_atomtypes_row_supports_missing_ptype_and_shell_ptype(tmp_path):
+    sanitizer = DummySanitizer()
+
+    shell_row = sanitizer._parse_lj_atomtypes_row(
+        "SHEL 12.011 0.000 S 3.000000e-01 2.000000e-01",
+        "shell.itp",
+        4,
+    )
+    missing_ptype_row = sanitizer._parse_lj_atomtypes_row(
+        "MISS opls_001 12.011 0.000 3.100000e-01 2.100000e-01",
+        "missing.itp",
+        8,
+    )
+
+    assert shell_row[:4] == ("SHEL", "S", 0.3, 0.2)
+    assert missing_ptype_row[:4] == ("MISS", None, 0.31, 0.21)
+
+
+def test_parse_lj_atomtypes_row_rejects_ambiguous_missing_ptype_layout(tmp_path):
+    sanitizer = DummySanitizer()
+
+    with pytest.raises(ValueError, match="Ambiguous row without explicit ptype"):
+        sanitizer._parse_lj_atomtypes_row(
+            "AMBIG A 12.011 0.000 3.100000e-01 2.100000e-01",
+            "ambig.itp",
+            5,
+        )
+
+
+def test_create_minimal_outputs_publishes_versioned_and_current_outputs(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = SimpleNamespace(run_id="RUN123", system_id="SYS", manifest=None)
+    system_gromacs_dir = tmp_path / "IN/systems/SYS/gromacs"
+
+    sanitizer._create_minimal_outputs(
+        ctx,
+        system_gromacs_dir,
+        allow_default_defaults=True,
+    )
+
+    assert (system_gromacs_dir / "combined_atomtypes_RUN123.itp").exists()
+    assert (system_gromacs_dir / "combined_atomtypes_current.itp").exists()
+    assert (system_gromacs_dir / "itp_sanitized_RUN123").exists()
+    assert (system_gromacs_dir / "itp_sanitized_current").exists()
+
+
+def test_atomic_publish_current_directory_restores_previous_dir_on_failure(tmp_path, monkeypatch):
+    sanitizer = DummySanitizer()
+    source_dir = tmp_path / "itp_sanitized_RUN123"
+    current_dir = tmp_path / "itp_sanitized_current"
+    _write(source_dir / "new.itp", "new\n")
+    _write(current_dir / "old.itp", "old\n")
+
+    real_replace = topology_sanitizer_module.os.replace
+    replace_calls = {"count": 0}
+
+    def failing_replace(src, dest):
+        replace_calls["count"] += 1
+        if replace_calls["count"] == 2:
+            raise OSError("simulated publish failure")
+        return real_replace(src, dest)
+
+    monkeypatch.setattr(topology_sanitizer_module.os, "replace", failing_replace)
+
+    with pytest.raises(OSError, match="simulated publish failure"):
+        sanitizer._atomic_publish_current_directory(source_dir, current_dir)
+
+    assert (current_dir / "old.itp").read_text(encoding="utf-8") == "old\n"
+    assert not (current_dir / "new.itp").exists()
