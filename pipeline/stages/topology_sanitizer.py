@@ -470,6 +470,19 @@ def _parse_float_token(token: str) -> Optional[float]:
         return None
 
 
+def _parse_strict_float_token(token: str) -> Optional[float]:
+    """Parse a float token only when the full token is numeric."""
+    cleaned = token.strip()
+    if not cleaned:
+        return None
+    if FLOAT_FINDER_RE.fullmatch(cleaned) is None:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def parse_atoms_row(line: str) -> AtomRowParseResult:
     """Parse a supported [ atoms ] row into AtomRecord."""
     data = strip_gmx_comment(line).strip()
@@ -487,15 +500,10 @@ def parse_atoms_row(line: str) -> AtomRowParseResult:
         )
 
     tokens = _tokenize_atoms_row(data)
-    if len(tokens) > 8:
+    if len(tokens) not in {7, 8}:
         return AtomRowParseResult(
             status=ATOMS_ROW_STATUS_UNSUPPORTED,
             reason=f"unsupported [ atoms ] row width ({len(tokens)})",
-        )
-    if len(raw_tokens) == 7 and len(tokens) == 7 and _parse_int_token(raw_tokens[5]) is not None:
-        return AtomRowParseResult(
-            status=ATOMS_ROW_STATUS_UNSUPPORTED,
-            reason="ambiguous raw 7-column [ atoms ] row with integer-like sixth token",
         )
 
     atom_id = _parse_int_token(tokens[0])
@@ -2859,7 +2867,28 @@ class TopologySanitizerMixin:
         """Map molecule names to sanitized ITPs (by moleculetype name)."""
         if not sanitized_current_dir.exists() or not needed_molecule_names:
             return {}
-        name_map = {n.casefold(): n for n in needed_molecule_names}
+        requested_names = sorted(needed_molecule_names, key=lambda name: (name.casefold(), name))
+        names_by_key: Dict[str, List[str]] = {}
+        for name in requested_names:
+            names_by_key.setdefault(name.casefold(), []).append(name)
+        colliding_requested_names = [
+            names
+            for _, names in sorted(names_by_key.items(), key=lambda item: item[0])
+            if len(names) > 1
+        ]
+        if colliding_requested_names:
+            collision_lines = [
+                "  - " + ", ".join(names)
+                for names in colliding_requested_names
+            ]
+            raise SanitizerError(
+                "Case-insensitive requested molecule-name collision(s):\n"
+                + "\n".join(collision_lines)
+            )
+        name_map = {
+            key: names[0]
+            for key, names in sorted(names_by_key.items(), key=lambda item: item[0])
+        }
         mapping: Dict[str, Path] = {}
         for itp_path in self._sorted_paths_casefold(sanitized_current_dir.glob("*.itp")):
             for mol_name in self._get_moleculetype_names(itp_path, ctx=ctx):
@@ -3154,14 +3183,14 @@ class TopologySanitizerMixin:
             raise ValueError(f"Too few fields for [ atomtypes ] row: '{data}'")
 
         atomtype_name = parts[0]
-        lj_tail_floats = _extract_floats_from_text(" ".join(parts[-2:]))
-        if len(lj_tail_floats) != 2:
+        p1 = _parse_strict_float_token(parts[-2])
+        p2 = _parse_strict_float_token(parts[-1])
+        if p1 is None or p2 is None:
             raise ValueError(
                 f"Ambiguous LJ params in atomtype '{atomtype_name}' at "
-                f"{source_name}:{line_no}. Expected exactly two float values in LJ tail, "
-                f"got {len(lj_tail_floats)}. Raw: {data}"
+                f"{source_name}:{line_no}. Expected pure numeric LJ tail tokens, "
+                f"got '{parts[-2]}' and '{parts[-1]}'. Raw: {data}"
             )
-        p1, p2 = lj_tail_floats
 
         def _is_integer_like_token(token: str) -> bool:
             return re.fullmatch(r"[+-]?\d+", token) is not None
@@ -3194,8 +3223,8 @@ class TopologySanitizerMixin:
                         f"Raw: {data}"
                     )
             middle_tokens = parts[1:-5]
-            charge_fields = _extract_floats_from_text(parts[-4])
-            mass_fields = _extract_floats_from_text(parts[-5])
+            charge_value = _parse_strict_float_token(parts[-4])
+            mass_value = _parse_strict_float_token(parts[-5])
         else:
             ptype = None
             if len(parts) == 5:
@@ -3210,8 +3239,8 @@ class TopologySanitizerMixin:
                         f"Raw: {data}"
                     )
             middle_tokens = parts[1:-4]
-            charge_fields = _extract_floats_from_text(parts[-3]) if len(parts) >= 4 else []
-            mass_fields = _extract_floats_from_text(parts[-4]) if len(parts) >= 5 else []
+            charge_value = _parse_strict_float_token(parts[-3]) if len(parts) >= 4 else None
+            mass_value = _parse_strict_float_token(parts[-4]) if len(parts) >= 5 else None
 
         extra_ptypes = [token for token in middle_tokens if token.upper() in PTYPE_TOKENS]
         if extra_ptypes:
@@ -3225,7 +3254,7 @@ class TopologySanitizerMixin:
                 f"{extra_ptypes + [ptype]}. Raw: {data}"
             )
 
-        if len(charge_fields) != 1 or len(mass_fields) != 1:
+        if charge_value is None or mass_value is None:
             raise ValueError(
                 f"Malformed mass/charge columns in {source_name}:{line_no}. Raw: {data}"
             )
@@ -3469,11 +3498,11 @@ class TopologySanitizerMixin:
                 )
                 continue
 
-            if sigma > unit_sigma_max or epsilon > unit_eps_max:
+            if abs(sigma) > unit_sigma_max or abs(epsilon) > unit_eps_max:
                 msg = (
                     f"Unit-screaming LJ value in atomtype '{name}' at {location}: "
                     f"sigma={sigma:.6g} nm, epsilon={epsilon:.6g} kJ/mol "
-                    f"(>{unit_sigma_max} nm or >{unit_eps_max} kJ/mol)."
+                    f"(|sigma|>{unit_sigma_max} nm or |epsilon|>{unit_eps_max} kJ/mol)."
                 )
                 unit_errors.append(
                     {

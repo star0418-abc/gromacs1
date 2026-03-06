@@ -650,7 +650,7 @@ Stage 1 is intentionally narrow:
 - existing sanitizer entrypoints and `TopologySanitizerMixin` call shapes stay the same
 - same-name moleculetype signature/charge comparison now consumes typed `[ atoms ]` rows internally
 - ordered `[ molecules ]` extraction now delegates low-level row parsing to a dedicated helper and preserves unresolved count tokens explicitly
-- only unambiguous supported 7/8-column `[ atoms ]` rows are accepted in this path
+- supported 7/8-column `[ atoms ]` rows are accepted in this path, including 7-column rows whose charge is written as an integer literal
 - unsupported/ambiguous row formats are surfaced as explicit parser states instead of being silently treated as valid data
 
 ### Stage 2 IR Migration Scope
@@ -1205,6 +1205,7 @@ The LJ-validation parser is intentionally conservative:
 - Supported tails are `... mass charge ptype sigma epsilon` and `... mass charge sigma epsilon` (missing `ptype`)
 - `ptype` is recognized only in the canonical third token from the tail and accepts `A/D/S/V`
 - Bare five-/six-field rows whose first numeric token is integer-like are accepted only when the following token is lexically an explicit charge literal (signed or zero-like); otherwise they are rejected as ambiguous between `mass charge` and `at_num mass`
+- Mass, charge, sigma, and epsilon fields must be pure numeric tokens; dirty tokens such as `mass=12.01` or `0.3foo` are rejected instead of being parsed by substring
 - Middle tokens ahead of `mass/charge` may exist, but rows with additional ptype-like middle tokens are rejected as ambiguous instead of guessed
 - Files with unusual or shifted layouts produce actionable errors rather than silently reinterpreting columns
 
@@ -1464,7 +1465,7 @@ Behavior:
 - Dummy/virtual atomtypes (`ptype D/V`) are skipped to reduce false positives
 - Negative sigma with `epsilon > 0` is treated as a compatibility warning/review case, not auto-classified as unit corruption
 - Negative sigma with `epsilon <= 0` stays warning-only by default but is reported as more suspicious than the legacy/special-encoding case
-- A second-level unit-screaming guard always hard-fails for absurd values (e.g., sigma > 10 nm or epsilon > 1e6 kJ/mol)
+- A second-level unit-screaming guard always hard-fails for absurd-magnitude values using absolute value (e.g., `|sigma| > 10` nm or `|epsilon| > 1e6` kJ/mol)
 
 A structured LJ report is always emitted (manifest `sanitizer.lj_validation`) with active profile/policy, thresholds, parse issues, and top offenders including provenance and source locations.
 
@@ -1537,10 +1538,11 @@ The Sanitizer performs charge neutrality preflight checking:
 - Fails if any molecule in `[molecules]` with count > 0 has no corresponding ITP file
 - Fails if an active molecule ITP cannot be parsed or has empty `[ atoms ]` section
 - Fails on case-insensitive alias/moleculetype collisions that make active molecule resolution ambiguous
+- Fails fast when multiple requested active-molecule names collapse to the same case-insensitive key
 - In strict mode, fails if any active molecule has preprocessor directives in/around `[ atoms ]`, or unparsed/ambiguous `[ atoms ]` data lines
 - Fails if system charge |Q| exceeds auto-correction threshold (default: 1e-4)
 - Optional unsafe escape hatch exists only as an explicit checker flag (`allow_unparsed_atoms_lines=True`), skipped lines are recorded in charge-neutrality audit output, and outcomes are marked degraded in non-strict mode
-- The charge checker now uses the same fail-closed row semantics as the Stage 1 `[ atoms ]` parser, so ambiguous raw 7-column, glued charge/mass, or negative-mass rows are treated as unparseable rather than silently counted
+- The charge checker now uses the same fail-closed row semantics as the Stage 1 `[ atoms ]` parser, so malformed rows such as glued charge/mass or negative-mass records are treated as unparseable rather than silently counted
 
 **Alias vs Real ITP Moleculetype**:
 - Molecule counts remain keyed by pipeline alias for backward compatibility
@@ -1601,7 +1603,7 @@ Recommended safer automation settings for GPE workflows:
 - Handles both 8-token format (`nr type resnr residue atom cgnr charge mass`) and 7-token format (missing `cgnr`)
 - Tolerates trailing comments on section headers (`[ atoms ] ; comment`)
 - Unresolved `#if/#ifdef/#else/#endif/#define` regions are never treated as active by the Python fallback parser. Strict mode fails closed; non-strict mode records degraded/uncertain parse reasons instead of trusting hidden `[ moleculetype ]` or `[ molecules ]` content.
-- Recovers glued numeric fields in `[ atoms ]` charge extraction and `[ atomtypes ]` LJ tail parsing (e.g., `1.000-0.001`, `1.234-5.678`)
+- Recovers the supported glued `cgnr+charge` form in `[ atoms ]` rows (for example `1.000-0.001`), but `[ atomtypes ]` LJ fields now require pure numeric tokens
 - Supports scientific notation in charge/mass tokens (e.g., `1.2e-5`)
 - Uses token-based patching for reliable charge replacement
 - Prevents silent charge under-counting by refusing unparseable target `[ atoms ]` data lines unless explicit unsafe override is enabled
@@ -1682,7 +1684,7 @@ Post-correction verification ensures ionic species weren't modified unless `--ch
 - Distinguishes same-topology neutral molecules across charge models (e.g., RESP vs CM5)
 - Default charge quantization in signatures is `1e-6` (`GPE_MOLECULE_SIG_QUANT_STEP`) with secondary per-atom compare tolerance `quant_step/2`
 - Conflict reporting includes deterministic winner and strict/non-strict behavior
-- LJ negative values get loud warnings; zero values (virtual sites) skipped silently
+- LJ negative review-level values get loud warnings, while absurd negative magnitudes still hard-fail via the unit-screaming guard; zero values (virtual sites) are skipped silently
 
 Minimal signature-compare example:
 ```python

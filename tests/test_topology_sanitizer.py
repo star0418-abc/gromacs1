@@ -1335,6 +1335,9 @@ def test_parse_atoms_row_parses_standard_8_column_record():
     ("line", "expected_cgnr", "expected_charge"),
     [
         ("1 HC 1 MOL H1 0.125000 1.008", None, 0.125),
+        ("1 HC 1 MOL H1 1 1.008", None, 1.0),
+        ("1 HC 1 MOL H1 -1 1.008", None, -1.0),
+        ("1 HC 1 MOL H1 0 1.008", None, 0.0),
         ("1 HC 1 MOL H1 3-0.125000 1.008", 3, -0.125),
     ],
 )
@@ -1372,11 +1375,12 @@ def test_parse_atoms_row_returns_explicit_failure_states():
     assert unsupported.record is None
 
 
-def test_parse_atoms_row_rejects_ambiguous_raw_7_column_integer_token():
+def test_parse_atoms_row_rejects_malformed_raw_7_column_row():
     result = parse_atoms_row("1 CT 1 MOL C1 1 -0.125000")
 
-    assert result.status == ATOMS_ROW_STATUS_UNSUPPORTED
+    assert result.status == ATOMS_ROW_STATUS_INVALID
     assert result.record is None
+    assert result.reason == "mass must be non-negative"
 
 
 def test_parse_atoms_row_rejects_raw_6_column_glued_charge_mass_form():
@@ -1484,6 +1488,23 @@ def test_map_sanitized_itps_to_molecules_maps_all_expected_names_deterministical
     assert mapping["B"].name == "z_b.itp"
 
 
+def test_map_sanitized_itps_to_molecules_fails_fast_on_casefold_collisions(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    sanitized_current_dir = tmp_path / "itp_sanitized_current"
+    _write(sanitized_current_dir / "mol.itp", _simple_itp("Mol"))
+
+    with pytest.raises(
+        SanitizerError,
+        match=r"Case-insensitive requested molecule-name collision\(s\):\n  - MOL, Mol",
+    ):
+        sanitizer._map_sanitized_itps_to_molecules(
+            sanitized_current_dir,
+            {"Mol", "MOL"},
+            ctx=ctx,
+        )
+
+
 def test_ordered_molecule_itp_paths_preserves_first_seen_order_and_dedupes_files(tmp_path):
     sanitizer = DummySanitizer()
     a_itp = tmp_path / "a.itp"
@@ -1568,6 +1589,33 @@ def test_negative_sigma_with_nonpositive_epsilon_is_explicitly_flagged(tmp_path)
         and "NEGZ" in warning
         for warning in warnings
     )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "NEG_EPS 12.011 0.000 A 3.000000e-01 -1.000000e+09",
+        "NEG_SIG 12.011 0.000 A -1.100000e+01 2.500000e-01",
+    ],
+)
+def test_unit_screaming_lj_magnitude_uses_absolute_value_even_when_negative(tmp_path, row):
+    sanitizer = DummySanitizer()
+    combined = tmp_path / "combined_atomtypes.itp"
+    _write(
+        combined,
+        "[ atomtypes ]\n"
+        f"{row}\n",
+    )
+
+    with pytest.raises(
+        SanitizerError,
+        match=r"LJ unit-screaming threshold violated: .*Unit-screaming LJ value",
+    ):
+        sanitizer._warn_atomtype_outliers(
+            combined,
+            DummyContext(tmp_path, lj_outlier_policy="off"),
+            comb_rule=2,
+        )
 
 
 def test_lj_outlier_policy_off_suppresses_nonfatal_output(tmp_path, capsys):
@@ -1673,6 +1721,27 @@ def test_parse_lj_atomtypes_row_supports_missing_ptype_and_shell_ptype(tmp_path)
     assert missing_ptype_row[:4] == ("MISS", None, 0.31, 0.21)
     assert zero_charge_explicit_ptype_row[:4] == ("HZERO", "A", 0.2, 0.1)
     assert zero_charge_missing_ptype_row[:4] == ("HZMISS", None, 0.2, 0.1)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "DIRTYM 12.01abc 0.0 A 0.3 0.2",
+        "DIRTYC opls_001 mass=12.01 0.0 0.3 0.2",
+        "DIRTYQ opls_001 12.01 0.0foo 0.3 0.2",
+        "DIRTYS 12.01 0.0 A 0.3foo 0.2",
+        "DIRTYE 12.01 0.0 A 0.3 0.2bar",
+    ],
+)
+def test_parse_lj_atomtypes_row_rejects_dirty_numeric_tokens(tmp_path, line):
+    sanitizer = DummySanitizer()
+
+    with pytest.raises(ValueError, match="Expected pure numeric LJ tail tokens|Malformed mass/charge columns"):
+        sanitizer._parse_lj_atomtypes_row(
+            line,
+            "dirty.itp",
+            3,
+        )
 
 
 def test_parse_lj_atomtypes_row_rejects_ambiguous_missing_ptype_layout(tmp_path):
