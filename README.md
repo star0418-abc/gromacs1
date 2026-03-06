@@ -653,6 +653,17 @@ Stage 1 is intentionally narrow:
 - only unambiguous supported 7/8-column `[ atoms ]` rows are accepted in this path
 - unsupported/ambiguous row formats are surfaced as explicit parser states instead of being silently treated as valid data
 
+### Stage 2 IR Migration Scope
+
+Stage 2 keeps the same public sanitizer facade, but moves two safety-critical internals onto the Stage 1 IR:
+- same-name moleculetype conflict detection now compares explicit IR parse results instead of falling through raw string heuristics
+- deterministic moleculetype signatures now include typed atom fields and any locally resolvable `[ atomtypes ]` LJ definitions used by the target moleculetype
+- uncertain same-name comparisons are never treated as equivalent:
+  - strict mode fails closed
+  - non-strict mode records a degraded comparison and treats the definitions as conflicting
+- charge-fix classification/protection now uses the same typed moleculetype parse result
+- protected/degraded molecules are removed from the checker's default auto-target pool before any charge-fix write occurs; explicit `--charge-fix-target-allowlist` is now the intended opt-in path for those targets
+
 
 ### Include Resolution
 - **Shadowing Detection**: If an included file (e.g., `posre.itp`) exists in multiple search paths, the pipeline detects it.
@@ -686,11 +697,12 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
 - **Classification reliability**:
   - If an active molecule cannot be classified reliably because `[ atoms ]` parsing is incomplete, preprocessed, or partially unparseable, strict mode fails closed.
   - Non-strict mode records the molecule as degraded/unknown and refuses correction on that target unless it is explicitly allowlisted via `--charge-fix-target-allowlist`.
+  - The checker's default target allowlist is prefiltered through this audit, so degraded/protected molecules do not reach auto-patching just because they happen to share a legacy solvent token.
 - **Overrides**:
   - `--charge-fix-allow-solvents`: Allow modification of protected solvents.
   - `--charge-fix-allow-ions`: Allow modification of protected ions.
   - `--charge-fix-target-allowlist <MOL>`: Explicitly allow specific molecules (case-insensitive).
-  - `--charge-fix-protect-resnames <CSV>`: Additional protected residue/molecule names. Matching stays boundary-aware, so names like `TFSI_1` or `G4-ALT` can be protected without broad short-token false positives.
+  - `--charge-fix-protect-resnames <CSV>`: Additional protected residue/molecule names. Matching stays boundary-aware after separator canonicalization, so names like `PEG-400`, `PEG_400`, `TFSI-1`, `TFSI_1`, `TFSI-alpha`, or `G4-ALT` can be protected without broad short-token false positives.
 - **Protected polymer net-charge policy**:
   - `--polymer-net-charge-tol` (default `1e-3`): if a protected polymer has `|q| <= tol`, sanitizer accepts drift and skips correction with manifest audit.
   - If `|q| > tol`: correction requires explicit target allowlist; non-strict mode warns+skips, strict mode fails.

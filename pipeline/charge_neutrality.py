@@ -1305,6 +1305,7 @@ class ChargeNeutralityChecker:
             "tol": self.polymer_net_charge_tol,
             "allowlisted": None,
             "system_q": q,
+            "reason": None,
         }
 
         if not self.protected_polymers:
@@ -1366,6 +1367,12 @@ class ChargeNeutralityChecker:
 
         if not allowlisted:
             decision["decision"] = "strict_fail" if self.strict_mode else "skip_non_strict"
+            decision["reason"] = "not_allowlisted"
+            return decision
+
+        if self.polymer_correction_method != "spread_safe":
+            decision["decision"] = "strict_fail" if self.strict_mode else "skip_non_strict"
+            decision["reason"] = "spread_safe_required"
             return decision
 
         decision["decision"] = "allow_spread_safe"
@@ -2895,10 +2902,25 @@ class ChargeNeutralityChecker:
         if decision == "skip_non_strict":
             target = str(polymer_policy.get("target"))
             net_q = float(polymer_policy.get("net_q") or 0.0)
+            reason_code = str(polymer_policy.get("reason") or "not_allowlisted")
+            if reason_code == "spread_safe_required":
+                policy_detail = (
+                    "is allowlisted but --charge-fix-polymer-method is not spread_safe"
+                )
+                refuse_reason = (
+                    f"Protected polymer '{target}' requires --charge-fix-polymer-method "
+                    "spread_safe before any correction can be attempted."
+                )
+            else:
+                policy_detail = "is not in --charge-fix-target-allowlist"
+                refuse_reason = (
+                    f"Protected polymer '{target}' requires explicit --charge-fix-target-allowlist "
+                    "for correction."
+                )
             print(
                 f"  [WARN][POLICY] Protected polymer '{target}' has net_q={net_q:+.6e} "
-                f"> tol={self.polymer_net_charge_tol:.6e} and is not in "
-                "--charge-fix-target-allowlist; skipping correction in non-strict mode. "
+                f"> tol={self.polymer_net_charge_tol:.6e} and {policy_detail}; "
+                "skipping correction in non-strict mode. "
                 "This is policy-limited, not validated as clean neutrality."
             )
             return _attach_rounding_meta(CorrectionResult(
@@ -2912,10 +2934,7 @@ class ChargeNeutralityChecker:
                 thresholds_used=self._thresholds_used(),
                 neutrality_status="polymer_skipped_non_strict",
                 correction_refused=True,
-                refuse_reason=(
-                    f"Protected polymer '{target}' requires explicit --charge-fix-target-allowlist "
-                    "for correction."
-                ),
+                refuse_reason=refuse_reason,
                 target_molecule=target,
                 polymer_policy=polymer_policy,
                 policy_limited=True,
@@ -2923,6 +2942,13 @@ class ChargeNeutralityChecker:
         if decision == "strict_fail":
             target = str(polymer_policy.get("target"))
             net_q = float(polymer_policy.get("net_q") or 0.0)
+            reason_code = str(polymer_policy.get("reason") or "not_allowlisted")
+            if reason_code == "spread_safe_required":
+                raise ChargeNeutralityError(
+                    f"Protected polymer '{target}' has net_q={net_q:+.6e} "
+                    f"> polymer_net_charge_tol={self.polymer_net_charge_tol:.6e}, but "
+                    "--charge-fix-polymer-method spread_safe is required before correction."
+                )
             raise ChargeNeutralityError(
                 f"Protected polymer '{target}' has net_q={net_q:+.6e} "
                 f"> polymer_net_charge_tol={self.polymer_net_charge_tol:.6e} and is not explicitly "

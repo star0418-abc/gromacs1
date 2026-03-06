@@ -624,6 +624,15 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                     "charge_classification",
                     ion_classification_audit,
                 )
+            effective_target_allowlist = self._derive_charge_fix_checker_allowlist(
+                ion_classifications,
+                ion_classification_audit,
+                target_allowlist,
+            )
+            ion_classification_audit["checker_target_allowlist"] = sorted(
+                effective_target_allowlist,
+                key=str.casefold,
+            )
 
             # Optional explicit correction target(s) from CLI. Checker supports one target;
             # we resolve deterministically and fail-fast on ambiguous strict requests.
@@ -701,7 +710,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                     strict_charge_physics=ctx.strict_charge_physics,
                     # Safe-subset config
                     correction_method=getattr(ctx, "charge_fix_method", "safe_subset"),
-                    target_allowlist=target_allowlist,
+                    target_allowlist=effective_target_allowlist,
                     allowed_atomnames=allowed_atomnames,
                     disallow_atomtypes=disallow_atomtypes,
                     # Part 2: New strict mode and threshold options

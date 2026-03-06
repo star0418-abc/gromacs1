@@ -48,48 +48,35 @@ from .spatial_checker import (
 
 def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
     """
-    Check if name matches any protected pattern using boundary-aware matching.
-
-    Hardening v7: Short patterns (<=3 chars) require exact match after normalization
-    to avoid false positives like "PC" matching "POLYMER_CHAIN".
-
-    Longer patterns can match as substring but require word boundaries (non-alphanumeric
-    or string start/end on both sides).
-
-    Args:
-        name: Molecule name to check
-        patterns: Set of protected patterns (e.g., PROTECTED_SOLVENT_PATTERNS)
-
-    Returns:
-        True if name matches any pattern
+    Check if name matches any protected pattern using canonicalized boundaries.
     """
-    # Local import keeps this helper self-contained for test extraction.
     import re as _re
-    # Normalize: uppercase and remove NON-alphanumerics so "Li+" and "LI" compare equal.
-    # This defends against false negatives when charges/punctuation are present.
-    raw_upper = name.upper()
-    normalized = _re.sub(r"[^A-Z0-9]", "", raw_upper)
+    def _canonical_parts(value: str):
+        raw_upper = value.upper().strip()
+        tokens = [token for token in _re.split(r"[^A-Z0-9]+", raw_upper) if token]
+        normalized = "".join(tokens)
+        return raw_upper, tokens, normalized
 
+    raw_upper, _, normalized = _canonical_parts(name)
     for pattern in patterns:
-        # Normalize patterns the same way as names
-        pat_upper = pattern.upper()
-        pat_upper = _re.sub(r"[^A-Z0-9]", "", pat_upper)
-        if not pat_upper:
+        _, pattern_tokens, pattern_normalized = _canonical_parts(pattern)
+        if not pattern_normalized:
             continue
 
-        if len(pat_upper) <= 3:
-            # Short patterns: exact match only after normalization
-            # This prevents "PC" from matching "POLYMER_CHAIN" or "LIPID_GPC"
-            if normalized == pat_upper:
+        if len(pattern_normalized) <= 3:
+            if normalized == pattern_normalized:
                 return True
-        else:
-            if normalized == pat_upper:
-                return True
-            # Longer patterns: allow substring but check boundaries on ORIGINAL string.
-            # Using the raw string preserves separators so boundary detection is reliable.
-            boundary_re = rf"(?<![A-Z0-9]){_re.escape(pat_upper)}(?![A-Z0-9])"
-            if _re.search(boundary_re, raw_upper):
-                return True
+            continue
+        if normalized == pattern_normalized:
+            return True
+        token_pattern = (
+            r"[^A-Z0-9]*".join(_re.escape(token) for token in pattern_tokens)
+            if pattern_tokens
+            else _re.escape(pattern_normalized)
+        )
+        boundary_re = rf"(?<![A-Z0-9]){token_pattern}(?![A-Z0-9])"
+        if _re.search(boundary_re, raw_upper):
+            return True
     return False
 
 

@@ -7,16 +7,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from pipeline.charge_neutrality import ChargeNeutralityChecker
 from pipeline.stages.topology_sanitizer import (
     ATOMS_ROW_STATUS_INVALID,
     ATOMS_ROW_STATUS_PARSED,
     ATOMS_ROW_STATUS_UNSUPPORTED,
     DEFAULT_MOLECULE_SIG_QUANT_STEP,
+    MOLECULETYPE_COMPARE_UNCERTAIN,
     SanitizerError,
     TOP_MOLECULES_ENTRY_STATUS_PARSED,
     TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED,
     TopMoleculesParseResult,
     TopologySanitizerMixin,
+    _matches_protected_pattern,
     parse_atoms_row,
     parse_top_molecules_entry,
 )
@@ -142,8 +145,59 @@ def test_uncertain_same_name_conflict_is_not_treated_as_equal_in_non_strict_mode
     _write(itp1, content)
     _write(itp2, content)
 
+    comparison = sanitizer._compare_moleculetype_ir(itp1, itp2, "MOL", ctx=ctx)
+
+    assert comparison.status == MOLECULETYPE_COMPARE_UNCERTAIN
     assert sanitizer._moleculetype_signatures_differ(itp1, itp2, "MOL", ctx=ctx) is True
     assert "Treating definitions as conflicting" in capsys.readouterr().out
+
+
+def test_same_name_moleculetype_comparison_uses_ir_for_valid_supported_rows(tmp_path):
+    sanitizer = DummySanitizer()
+    itp1 = tmp_path / "a.itp"
+    itp2 = tmp_path / "b.itp"
+    _write(
+        itp1,
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        "1 CT 1 MOL C1 1 -0.1250000 12.0110000\n"
+        "2 HC 1 MOL H1 1 0.1250000 1.0080000\n",
+    )
+    _write(
+        itp2,
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        "1 CT 1 MOL C1 1 -0.1250004 12.0110004\n"
+        "2 HC 1 MOL H1 1 0.1250004 1.0080004\n",
+    )
+
+    assert sanitizer._moleculetype_signatures_differ(itp1, itp2, "MOL") is False
+
+
+def test_same_name_moleculetype_comparison_detects_local_atomtype_lj_conflict(tmp_path):
+    sanitizer = DummySanitizer()
+    itp1 = tmp_path / "a.itp"
+    itp2 = tmp_path / "b.itp"
+    base = (
+        "[ atomtypes ]\n"
+        "{atomtype_row}\n"
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        "1 CT 1 MOL C1 1 0.000000 12.011\n"
+    )
+    _write(
+        itp1,
+        base.format(atomtype_row="CT 12.011 0.000 A 0.300000 0.100000"),
+    )
+    _write(
+        itp2,
+        base.format(atomtype_row="CT 12.011 0.000 A 0.300000 0.200000"),
+    )
+
+    assert sanitizer._moleculetype_signatures_differ(itp1, itp2, "MOL") is True
 
 
 def test_charge_fix_classification_strict_fails_on_active_parse_uncertainty(tmp_path):
@@ -239,6 +293,114 @@ def test_charge_fix_protect_resnames_extends_built_in_protection(tmp_path):
 
     assert classifications["G4_ALT"] == "protected_configured"
     assert audit["details"]["G4_ALT"]["source"] == "charge_fix_protect_resnames"
+
+
+@pytest.mark.parametrize(
+    ("name", "patterns"),
+    [
+        ("PEG-400", frozenset({"PEG_400"})),
+        ("PEG_400", frozenset({"PEG-400"})),
+        ("TFSI-1", frozenset({"TFSI"})),
+        ("TFSI_1", frozenset({"TFSI"})),
+        ("TFSI-alpha", frozenset({"TFSI"})),
+    ],
+)
+def test_matches_protected_pattern_supports_separator_bearing_names(name, patterns):
+    assert _matches_protected_pattern(name, patterns) is True
+
+
+@pytest.mark.parametrize(
+    ("name", "pattern"),
+    [
+        ("LIPID_GPC", "PC"),
+        ("POLYMER_CHAIN", "PC"),
+        ("SODIUM", "NA"),
+        ("LIPID", "LI"),
+    ],
+)
+def test_matches_protected_pattern_keeps_short_tokens_boundary_safe(name, pattern):
+    assert _matches_protected_pattern(name, frozenset({pattern})) is False
+
+
+@pytest.mark.parametrize("mol_name", ["PEG-400", "PEG_400"])
+def test_charge_fix_protect_resnames_supports_separator_names_in_classification(
+    tmp_path,
+    mol_name,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path, charge_fix_protect_resnames="PEG-400,PEG_400")
+    itp = tmp_path / f"{mol_name}.itp"
+    _write(itp, _simple_itp(mol_name))
+
+    classifications, audit = sanitizer._classify_ionic_moleculetypes({mol_name: itp}, ctx=ctx)
+
+    assert classifications[mol_name] == "protected_configured"
+    assert audit["details"][mol_name]["source"] == "charge_fix_protect_resnames"
+
+
+def test_degraded_or_protected_targets_are_removed_from_default_checker_allowlist(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    broken = tmp_path / "broken.itp"
+    solvent = tmp_path / "pc.itp"
+    _write(
+        broken,
+        "[ moleculetype ]\n"
+        "BROKEN 3\n"
+        "[ atoms ]\n"
+        "#ifdef SOMEFLAG\n"
+        "1 CT 1 BROKEN C1 1 0.000000 12.011\n"
+        "#endif\n",
+    )
+    _write(solvent, _simple_itp("PC"))
+
+    classifications, audit = sanitizer._classify_ionic_moleculetypes(
+        {"BROKEN": broken, "PC": solvent},
+        ctx=ctx,
+    )
+    allowlist = sanitizer._derive_charge_fix_checker_allowlist(
+        classifications,
+        audit,
+        explicit_allowlist=None,
+    )
+
+    assert "BROKEN" not in allowlist
+    assert "PC" not in allowlist
+    assert allowlist == set()
+
+
+def test_allowlisted_polymer_requires_spread_safe_before_any_correction(tmp_path):
+    itp = tmp_path / "polymer.itp"
+    _write(
+        itp,
+        "[ moleculetype ]\n"
+        "POLYMER_CHAIN 3\n"
+        "[ atoms ]\n"
+        "1 CT 1 POLYMER_CHAIN C1 1 0.500000 12.011\n"
+        "2 HC 1 POLYMER_CHAIN H1 1 0.500000 1.008\n",
+    )
+
+    checker = ChargeNeutralityChecker(
+        threshold=2.0,
+        target_allowlist={"POLYMER_CHAIN"},
+        strict_mode=False,
+        protected_polymers={"POLYMER_CHAIN"},
+        polymer_correction_method="skip_if_small",
+        allow_non_rounding_correction=True,
+    )
+
+    result = checker.run(
+        molecule_itp_paths={"POLYMER_CHAIN": itp},
+        molecule_counts={"POLYMER_CHAIN": 1},
+        output_dir=tmp_path / "out",
+        run_id="TEST",
+        target_molecule="POLYMER_CHAIN",
+    )
+
+    assert result.corrected is False
+    assert result.neutrality_status == "polymer_skipped_non_strict"
+    assert "spread_safe" in (result.refuse_reason or "")
+    assert list((tmp_path / "out").glob("*corrected*.itp")) == []
 
 
 def test_moleculetype_signature_quantization_is_deterministic_at_boundaries():

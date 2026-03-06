@@ -43,6 +43,7 @@ GROMPP_TIMEOUT_RETRY_MULTIPLIER = 2.0  # Retry with 2x timeout on first failure
 
 # Moleculetype signature quantization (env-overridable)
 DEFAULT_MOLECULE_SIG_QUANT_STEP = 1e-6
+DEFAULT_MOLECULE_SIG_MASS_QUANT_STEP = 1e-6
 MOLECULE_SIG_QUANT_ENV = "GPE_MOLECULE_SIG_QUANT_STEP"
 GPE_UNWRAP_LOOP_TOL_NM_ENV = "GPE_UNWRAP_LOOP_TOL_NM"
 UNWRAP_LOOP_TOL_FACTOR = 10.0
@@ -248,48 +249,38 @@ def _decimal_places_from_numeric_token(token: str) -> Optional[int]:
 
 def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
     """
-    Check if name matches any protected pattern using boundary-aware matching.
-    
-    Hardening v7: Short patterns (<=3 chars) require exact match after normalization
-    to avoid false positives like "PC" matching "POLYMER_CHAIN".
-    
-    Longer patterns can match as substring but require word boundaries (non-alphanumeric
-    or string start/end on both sides).
-    
-    Args:
-        name: Molecule name to check
-        patterns: Set of protected patterns (e.g., PROTECTED_SOLVENT_PATTERNS)
-        
-    Returns:
-        True if name matches any pattern
+    Check if name matches any protected pattern using canonicalized boundaries.
     """
-    # Local import keeps this helper self-contained for test extraction.
     import re as _re
-    # Normalize: uppercase and remove NON-alphanumerics so "Li+" and "LI" compare equal.
-    # This defends against false negatives when charges/punctuation are present.
-    raw_upper = name.upper()
-    normalized = _re.sub(r"[^A-Z0-9]", "", raw_upper)
-    
+
+    def _canonical_parts(value: str) -> Tuple[str, List[str], str]:
+        raw_upper = value.upper().strip()
+        tokens = [token for token in _re.split(r"[^A-Z0-9]+", raw_upper) if token]
+        normalized = "".join(tokens)
+        return raw_upper, tokens, normalized
+
+    raw_upper, _, normalized = _canonical_parts(name)
     for pattern in patterns:
-        # Normalize patterns the same way as names
-        pat_upper = pattern.upper()
-        pat_upper = _re.sub(r"[^A-Z0-9]", "", pat_upper)
-        if not pat_upper:
+        _, pattern_tokens, pattern_normalized = _canonical_parts(pattern)
+        if not pattern_normalized:
             continue
-        
-        if len(pat_upper) <= 3:
-            # Short patterns: exact match only after normalization
-            # This prevents "PC" from matching "POLYMER_CHAIN" or "LIPID_GPC"
-            if normalized == pat_upper:
+
+        if len(pattern_normalized) <= 3:
+            if normalized == pattern_normalized:
                 return True
-        else:
-            if normalized == pat_upper:
-                return True
-            # Longer patterns: allow substring but check boundaries on ORIGINAL string.
-            # Using the raw string preserves separators so boundary detection is reliable.
-            boundary_re = rf"(?<![A-Z0-9]){_re.escape(pat_upper)}(?![A-Z0-9])"
-            if _re.search(boundary_re, raw_upper):
-                return True
+            continue
+
+        if normalized == pattern_normalized:
+            return True
+
+        token_pattern = (
+            r"[^A-Z0-9]*".join(_re.escape(token) for token in pattern_tokens)
+            if pattern_tokens
+            else _re.escape(pattern_normalized)
+        )
+        boundary_re = rf"(?<![A-Z0-9]){token_pattern}(?![A-Z0-9])"
+        if _re.search(boundary_re, raw_upper):
+            return True
     return False
 
 
@@ -309,6 +300,14 @@ ATOMS_ROW_STATUS_INVALID = "invalid"
 TOP_MOLECULES_ENTRY_STATUS_PARSED = "parsed"
 TOP_MOLECULES_ENTRY_STATUS_UNRESOLVED = "unresolved"
 TOP_MOLECULES_ENTRY_STATUS_INVALID = "invalid"
+
+MOLECULETYPE_IR_STATUS_EXACT = "exact"
+MOLECULETYPE_IR_STATUS_UNCERTAIN = "uncertain"
+MOLECULETYPE_IR_STATUS_MISSING = "missing"
+
+MOLECULETYPE_COMPARE_EQUAL = "equal"
+MOLECULETYPE_COMPARE_DIFFERENT = "different"
+MOLECULETYPE_COMPARE_UNCERTAIN = "uncertain"
 
 
 @dataclass(frozen=True)
@@ -337,6 +336,33 @@ class TopMoleculesEntry:
     name: str
     count_token: str
     count_value: Optional[int]
+
+
+@dataclass(frozen=True)
+class LocalAtomTypeRecord:
+    """Minimal local LJ record for atomtypes used by a target moleculetype."""
+    name: str
+    ptype: str
+    sigma: float
+    epsilon: float
+
+
+@dataclass
+class MoleculeTypeIRParseResult:
+    """Structured target-moleculetype parse result for same-name checks."""
+    status: str
+    molecule: Optional[MoleculeTypeIR] = None
+    actual_name: Optional[str] = None
+    signature: Optional[str] = None
+    total_charge: Optional[float] = None
+    uncertainty_reasons: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MoleculeTypeComparisonResult:
+    """Explicit same-name comparison result."""
+    status: str
+    reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1122,93 +1148,47 @@ class TopologySanitizerMixin:
     ) -> bool:
         """
         Check if moleculetype definitions differ between two ITPs.
-        
-        Uses full-table streaming signature from _compute_moleculetype_signature():
-        - SHA256 over canonicalized [ atoms ] entries (type|name|charge@1e-4)
-        - Section presence flags and cheap charge distribution stats
-        
-        Args:
-            itp1: First ITP path
-            itp2: Second ITP path  
-            mol_name: Moleculetype name to compare
-            
-        Returns:
-            True if signatures differ, False if they match
         """
         strict_compare = self._strict_moleculetype_conflict_mode(ctx)
-        sig1 = self._compute_moleculetype_signature(itp1, mol_name, ctx=ctx)
-        sig2 = self._compute_moleculetype_signature(itp2, mol_name, ctx=ctx)
-        
-        if sig1 is None or sig2 is None:
-            msg = (
-                f"Unable to compute deterministic signature for same-name moleculetype "
-                f"'{mol_name}' while comparing:\n"
-                f"  - {itp1}\n"
-                f"  - {itp2}"
-            )
-            if strict_compare:
-                raise SanitizerError(msg)
-            print(f"  [WARN][DEGRADED] {msg}. Treating definitions as conflicting.")
-            return True
-        if sig1 != sig2:
-            return True
-
-        # Secondary guard: signatures can quantize equal; compare per-atom charges.
-        quant_step = self._molecule_sig_quant_step()
-        charge_tol = max(quant_step / 2.0, 0.0)
-        charges1, uncertain1 = self._extract_moleculetype_atom_charges(
-            itp1, mol_name, ctx=ctx
+        comparison = self._compare_moleculetype_ir(
+            itp1,
+            itp2,
+            mol_name,
+            ctx=ctx,
         )
-        charges2, uncertain2 = self._extract_moleculetype_atom_charges(
-            itp2, mol_name, ctx=ctx
-        )
-        if uncertain1 or uncertain2:
-            msg = (
-                f"Uncertain same-name moleculetype comparison for '{mol_name}': "
-                "charge extraction encountered preprocessing or ambiguous formatting.\n"
-                f"  - {itp1}\n"
-                f"  - {itp2}"
+        if comparison.status == MOLECULETYPE_COMPARE_UNCERTAIN:
+            msg = comparison.reason or (
+                f"Uncertain same-name moleculetype comparison for '{mol_name}'."
             )
             if strict_compare:
                 raise SanitizerError(msg)
             print(f"  [WARN][DEGRADED] {msg}. Treating definitions as conflicting.")
             return True
-        if charges1 is None or charges2 is None:
-            msg = (
-                f"Incomplete charge extraction for same-name moleculetype '{mol_name}' "
-                f"while comparing:\n"
-                f"  - {itp1}\n"
-                f"  - {itp2}"
-            )
-            if strict_compare:
-                raise SanitizerError(msg)
-            print(f"  [WARN][DEGRADED] {msg}. Treating definitions as conflicting.")
-            return True
-        if len(charges1) != len(charges2):
-            return True
-        for q1, q2 in zip(charges1, charges2):
-            if abs(q1 - q2) > charge_tol:
-                return True
-        return False
+        return comparison.status == MOLECULETYPE_COMPARE_DIFFERENT
 
     @staticmethod
-    def _quantize_moleculetype_charge(raw_q: float, quant_step: float) -> float:
+    def _quantize_moleculetype_value(raw_value: float, quant_step: float) -> float:
         """
-        Quantize charge deterministically for signature hashing.
+        Quantize a scalar deterministically for signature hashing.
 
         Decimal arithmetic avoids platform-dependent binary midpoint/tie behavior.
         """
-        if not math.isfinite(raw_q) or not math.isfinite(quant_step) or quant_step <= 0:
-            return raw_q
+        if not math.isfinite(raw_value) or not math.isfinite(quant_step) or quant_step <= 0:
+            return raw_value
         try:
             step_dec = Decimal(str(quant_step))
-            raw_dec = Decimal(str(raw_q))
+            raw_dec = Decimal(str(raw_value))
             scaled = raw_dec / step_dec
             quantized = scaled.to_integral_value(rounding=ROUND_HALF_EVEN) * step_dec
             value = float(quantized)
         except (InvalidOperation, OverflowError, ValueError, ZeroDivisionError):
-            return raw_q
+            return raw_value
         return 0.0 if value == 0.0 else value
+
+    @staticmethod
+    def _quantize_moleculetype_charge(raw_q: float, quant_step: float) -> float:
+        """Compatibility wrapper for charge quantization."""
+        return TopologySanitizerMixin._quantize_moleculetype_value(raw_q, quant_step)
 
     def _molecule_sig_quant_step(self) -> float:
         """Resolve moleculetype charge quantization step from env or default."""
@@ -1236,33 +1216,226 @@ class TopologySanitizerMixin:
         """Return True when value is numerically close to an integer."""
         return abs(value - round(value)) <= tol
 
+    def _resolve_requested_moleculetype_name_in_content(
+        self,
+        content: str,
+        requested_name: str,
+        itp_path: Path,
+    ) -> Tuple[Optional[str], List[str], Optional[str]]:
+        """Resolve request to one real [ moleculetype ] name in content."""
+        available: List[str] = []
+        current_section = ""
+        awaiting_moleculetype = False
+
+        for raw in content.splitlines():
+            section = parse_section_name(raw)
+            if section is not None:
+                current_section = section
+                awaiting_moleculetype = section == "moleculetype"
+                continue
+
+            if current_section != "moleculetype" or not awaiting_moleculetype:
+                continue
+
+            data = strip_gmx_comment(raw.strip()).strip()
+            if not data:
+                continue
+            parts = data.split()
+            if not parts:
+                continue
+            available.append(parts[0])
+            awaiting_moleculetype = False
+
+        if not available:
+            fallback = requested_name or itp_path.stem
+            return fallback, [], None
+        if requested_name in available:
+            return requested_name, available, None
+
+        requested_key = requested_name.casefold()
+        casefold_matches = [
+            name for name in available if name.casefold() == requested_key
+        ]
+        if len(casefold_matches) == 1:
+            return casefold_matches[0], available, None
+        if len(casefold_matches) > 1:
+            return (
+                None,
+                available,
+                (
+                    f"ambiguous case-insensitive moleculetype match for '{requested_name}' "
+                    f"in {itp_path}: {casefold_matches}"
+                ),
+            )
+        if len(available) == 1:
+            return available[0], available, None
+        return (
+            None,
+            available,
+            (
+                f"moleculetype '{requested_name}' not found in {itp_path}; "
+                f"available moleculetypes: {available}"
+            ),
+        )
+
+    def _build_moleculetype_ir_signature(
+        self,
+        molecule: MoleculeTypeIR,
+        topology_entries: List[Tuple[str, str]],
+        local_atomtypes: Dict[str, LocalAtomTypeRecord],
+    ) -> str:
+        """Build deterministic same-name signature from typed IR plus local topology."""
+        hasher = hashlib.sha256()
+        quant_step = self._molecule_sig_quant_step()
+        mass_quant_step = DEFAULT_MOLECULE_SIG_MASS_QUANT_STEP
+        section_counts: Dict[str, int] = {}
+        sections_present: Set[str] = set()
+        qmin: Optional[float] = None
+        qmax: Optional[float] = None
+        sum_abs_q = 0.0
+        sum_q2 = 0.0
+
+        for atom in molecule.atoms:
+            quant_q = self._quantize_moleculetype_charge(atom.charge, quant_step)
+            qmin = quant_q if qmin is None else min(qmin, quant_q)
+            qmax = quant_q if qmax is None else max(qmax, quant_q)
+            sum_abs_q += abs(quant_q)
+            sum_q2 += quant_q * quant_q
+            quant_mass = self._quantize_moleculetype_value(atom.mass, mass_quant_step)
+            cgnr_token = str(atom.cgnr) if atom.cgnr is not None else "-"
+            canonical = (
+                "atoms|"
+                f"{atom.atom_id}|{atom.atom_type}|{atom.resnr}|{atom.residue}|"
+                f"{atom.atom_name}|{cgnr_token}|{quant_q:+.10f}|{quant_mass:.6f}\n"
+            )
+            hasher.update(canonical.encode("utf-8"))
+
+        section_counts["atoms"] = len(molecule.atoms)
+        sections_present.add("atoms")
+
+        for section, canonical_tokens in topology_entries:
+            sections_present.add(section)
+            section_counts[section] = section_counts.get(section, 0) + 1
+            hasher.update(f"{section}|{canonical_tokens}\n".encode("utf-8"))
+
+        if local_atomtypes:
+            sections_present.add("atomtypes_local")
+            section_counts["atomtypes_local"] = len(local_atomtypes)
+            for atomtype_name in sorted(local_atomtypes, key=str.casefold):
+                record = local_atomtypes[atomtype_name]
+                sigma = self._quantize_moleculetype_value(record.sigma, quant_step)
+                epsilon = self._quantize_moleculetype_value(record.epsilon, quant_step)
+                hasher.update(
+                    (
+                        "atomtypes_local|"
+                        f"{record.name}|{record.ptype}|{sigma:.10f}|{epsilon:.10f}\n"
+                    ).encode("utf-8")
+                )
+
+        qmin_val = qmin if qmin is not None else 0.0
+        qmax_val = qmax if qmax is not None else 0.0
+        return (
+            f"atoms={len(molecule.atoms)};"
+            f"digest={hasher.hexdigest()};"
+            f"qmin={qmin_val:+.6f};"
+            f"qmax={qmax_val:+.6f};"
+            f"sum_abs_q={sum_abs_q:.6f};"
+            f"sum_q2={sum_q2:.6f};"
+            f"charge_quant_step={quant_step:.12g};"
+            f"mass_quant_step={mass_quant_step:.12g};"
+            f"sections={','.join(sorted(sections_present))};"
+            f"section_counts={','.join(f'{k}:{section_counts[k]}' for k in sorted(section_counts))}"
+        )
+
+    def _describe_moleculetype_parse_result(
+        self,
+        result: MoleculeTypeIRParseResult,
+        itp_path: Path,
+        requested_name: str,
+    ) -> str:
+        """Format a concise parse status diagnostic for same-name comparisons."""
+        if result.status == MOLECULETYPE_IR_STATUS_MISSING:
+            reason = "; ".join(result.uncertainty_reasons) or "target moleculetype not found"
+            return f"{itp_path}: missing '{requested_name}' ({reason})"
+        if result.status == MOLECULETYPE_IR_STATUS_UNCERTAIN:
+            reason = "; ".join(result.uncertainty_reasons) or "unsupported or ambiguous target parse"
+            actual = result.actual_name or requested_name
+            return f"{itp_path}: uncertain parse for '{actual}' ({reason})"
+        actual = result.actual_name or requested_name
+        atom_count = len(result.molecule.atoms) if result.molecule is not None else 0
+        return f"{itp_path}: exact parse for '{actual}' ({atom_count} atoms)"
+
     def _parse_moleculetype_ir(
         self,
         itp_path: Path,
         mol_name: str,
         ctx: Optional["PipelineContext"] = None,
-    ) -> Tuple[Optional[MoleculeTypeIR], bool]:
-        """Parse one target moleculetype into the minimal IR used in Stage 1."""
+    ) -> MoleculeTypeIRParseResult:
+        """Parse one target moleculetype into the Stage 1 IR with explicit status."""
         if not itp_path.exists():
-            return None, False
+            return MoleculeTypeIRParseResult(
+                status=MOLECULETYPE_IR_STATUS_MISSING,
+                uncertainty_reasons=[f"{itp_path} does not exist"],
+            )
         strict_reads = bool(ctx and ctx.strict_include_resolution)
         content = self.safe_read_text(itp_path, strict=strict_reads)
         if not content:
-            return None, False
+            return MoleculeTypeIRParseResult(
+                status=MOLECULETYPE_IR_STATUS_MISSING,
+                uncertainty_reasons=[f"{itp_path} is empty or unreadable"],
+            )
+
+        resolved_name, available_names, resolution_error = (
+            self._resolve_requested_moleculetype_name_in_content(
+                content,
+                mol_name,
+                itp_path,
+            )
+        )
+        if resolved_name is None:
+            return MoleculeTypeIRParseResult(
+                status=MOLECULETYPE_IR_STATUS_MISSING,
+                uncertainty_reasons=[resolution_error or f"unable to resolve '{mol_name}'"],
+            )
 
         current_section = ""
-        current_mol = None
+        current_mol: Optional[str] = None
         in_target_mol = False
-        parse_uncertain = False
+        target_found = False
+        awaiting_moleculetype = False
         atoms: List[AtomRecord] = []
+        uncertainty_reasons: List[str] = []
+        topology_entries: List[Tuple[str, str]] = []
+        local_atomtypes: Dict[str, LocalAtomTypeRecord] = {}
+        local_atomtype_issues: Dict[str, str] = {}
+        used_atomtypes: Set[str] = set()
+        topology_sections = {
+            "bonds",
+            "pairs",
+            "angles",
+            "dihedrals",
+            "impropers",
+            "constraints",
+            "settles",
+            "virtual_sites2",
+            "virtual_sites3",
+            "virtual_sites4",
+            "virtual_sitesn",
+            "exclusions",
+            "position_restraints",
+            "distance_restraints",
+            "dihedral_restraints",
+            "angle_restraints",
+            "orientation_restraints",
+        }
 
-        for line in content.splitlines():
+        for line_no, line in enumerate(content.splitlines(), start=1):
             stripped = line.strip()
             section = parse_section_name(line)
             if section is not None:
                 current_section = section
-                if current_section == "moleculetype":
-                    current_mol = None
+                awaiting_moleculetype = section == "moleculetype"
+                if section == "moleculetype":
                     in_target_mol = False
                 continue
 
@@ -1270,31 +1443,165 @@ class TopologySanitizerMixin:
             if not data:
                 continue
 
+            if current_section == "atomtypes" and not data.startswith("#"):
+                atomtype_name = data.split()[0]
+                try:
+                    parsed_name, ptype, sigma, epsilon, _ = self._parse_lj_atomtypes_row(
+                        data,
+                        itp_path.name,
+                        line_no,
+                    )
+                except ValueError as exc:
+                    local_atomtype_issues[atomtype_name] = (
+                        f"malformed local [ atomtypes ] row for '{atomtype_name}' at line {line_no}: {exc}"
+                    )
+                    continue
+                record = LocalAtomTypeRecord(
+                    name=parsed_name,
+                    ptype=ptype,
+                    sigma=sigma,
+                    epsilon=epsilon,
+                )
+                previous = local_atomtypes.get(parsed_name)
+                if previous is not None and previous != record:
+                    local_atomtype_issues[parsed_name] = (
+                        f"conflicting local [ atomtypes ] definitions for '{parsed_name}'"
+                    )
+                    continue
+                local_atomtypes[parsed_name] = record
+                continue
+
             if current_section == "moleculetype":
+                if data.startswith("#"):
+                    continue
+                if not awaiting_moleculetype:
+                    continue
                 parts = data.split()
-                if parts:
-                    current_mol = parts[0]
-                    in_target_mol = (current_mol == mol_name)
+                if not parts:
+                    continue
+                current_mol = parts[0]
+                awaiting_moleculetype = False
+                if current_mol == resolved_name:
+                    if target_found:
+                        uncertainty_reasons.append(
+                            f"multiple [ moleculetype ] blocks for '{resolved_name}' in {itp_path}"
+                        )
+                        in_target_mol = False
+                        continue
+                    in_target_mol = True
+                    target_found = True
+                else:
+                    in_target_mol = False
                 continue
 
             if not in_target_mol:
                 continue
 
             if data.startswith("#"):
-                parse_uncertain = True
-                continue
-            if current_section != "atoms":
+                uncertainty_reasons.append(
+                    f"preprocessor directive in target moleculetype '{resolved_name}' at line {line_no}"
+                )
                 continue
 
-            row_result = parse_atoms_row(data)
-            if row_result.status != ATOMS_ROW_STATUS_PARSED or row_result.record is None:
-                parse_uncertain = True
+            if current_section == "atoms":
+                row_result = parse_atoms_row(data)
+                if row_result.status != ATOMS_ROW_STATUS_PARSED or row_result.record is None:
+                    reason = row_result.reason or "unsupported [ atoms ] row"
+                    uncertainty_reasons.append(
+                        f"[ atoms ] line {line_no}: {reason}"
+                    )
+                    continue
+                atoms.append(row_result.record)
+                used_atomtypes.add(row_result.record.atom_type)
                 continue
-            atoms.append(row_result.record)
 
+            if current_section in topology_sections:
+                topology_entries.append((current_section, " ".join(data.split())))
+                continue
+
+        if not target_found:
+            return MoleculeTypeIRParseResult(
+                status=MOLECULETYPE_IR_STATUS_MISSING,
+                uncertainty_reasons=[
+                    (
+                        f"target moleculetype '{mol_name}' not found in {itp_path}; "
+                        f"available moleculetypes: {available_names or ['<none>']}"
+                    )
+                ],
+            )
+
+        for atomtype_name in sorted(used_atomtypes, key=str.casefold):
+            if atomtype_name in local_atomtype_issues:
+                uncertainty_reasons.append(local_atomtype_issues[atomtype_name])
+
+        molecule = MoleculeTypeIR(name=resolved_name, atoms=atoms)
+        total_charge = math.fsum(atom.charge for atom in atoms) if atoms else None
         if not atoms:
-            return None, parse_uncertain
-        return MoleculeTypeIR(name=mol_name, atoms=atoms), parse_uncertain
+            uncertainty_reasons.append(
+                f"target moleculetype '{resolved_name}' has no parseable [ atoms ] rows"
+            )
+
+        status = (
+            MOLECULETYPE_IR_STATUS_EXACT
+            if atoms and not uncertainty_reasons
+            else MOLECULETYPE_IR_STATUS_UNCERTAIN
+        )
+        signature = None
+        if status == MOLECULETYPE_IR_STATUS_EXACT:
+            signature = self._build_moleculetype_ir_signature(
+                molecule,
+                topology_entries,
+                {
+                    name: record
+                    for name, record in local_atomtypes.items()
+                    if name in used_atomtypes
+                },
+            )
+
+        return MoleculeTypeIRParseResult(
+            status=status,
+            molecule=molecule if atoms else None,
+            actual_name=resolved_name,
+            signature=signature,
+            total_charge=total_charge,
+            uncertainty_reasons=uncertainty_reasons,
+        )
+
+    def _compare_moleculetype_ir(
+        self,
+        itp1: Path,
+        itp2: Path,
+        mol_name: str,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> MoleculeTypeComparisonResult:
+        """Compare same-name moleculetype definitions using Stage 1 IR results."""
+        parsed1 = self._parse_moleculetype_ir(itp1, mol_name, ctx=ctx)
+        parsed2 = self._parse_moleculetype_ir(itp2, mol_name, ctx=ctx)
+
+        if (
+            parsed1.status != MOLECULETYPE_IR_STATUS_EXACT
+            or parsed2.status != MOLECULETYPE_IR_STATUS_EXACT
+        ):
+            reason = (
+                f"Uncertain same-name moleculetype comparison for '{mol_name}': "
+                f"{self._describe_moleculetype_parse_result(parsed1, itp1, mol_name)}; "
+                f"{self._describe_moleculetype_parse_result(parsed2, itp2, mol_name)}"
+            )
+            return MoleculeTypeComparisonResult(
+                status=MOLECULETYPE_COMPARE_UNCERTAIN,
+                reason=reason,
+            )
+
+        if parsed1.signature != parsed2.signature:
+            return MoleculeTypeComparisonResult(
+                status=MOLECULETYPE_COMPARE_DIFFERENT,
+                reason=(
+                    f"same-name moleculetype '{mol_name}' differs: deterministic IR signatures mismatch "
+                    f"between {itp1} and {itp2}"
+                ),
+            )
+
+        return MoleculeTypeComparisonResult(status=MOLECULETYPE_COMPARE_EQUAL)
 
     def _extract_atoms_row_charge_value(self, data: str) -> Tuple[Optional[float], bool]:
         """
@@ -1314,14 +1621,17 @@ class TopologySanitizerMixin:
         ctx: Optional["PipelineContext"] = None,
     ) -> Tuple[Optional[List[float]], bool]:
         """Extract per-atom charges for one moleculetype with uncertainty signaling."""
-        mol_ir, charges_uncertain = self._parse_moleculetype_ir(
+        parsed = self._parse_moleculetype_ir(
             itp_path,
             mol_name,
             ctx=ctx,
         )
-        if mol_ir is None or not mol_ir.atoms:
-            return None, charges_uncertain
-        return [atom.charge for atom in mol_ir.atoms], charges_uncertain
+        if parsed.molecule is None or not parsed.molecule.atoms:
+            return None, parsed.status == MOLECULETYPE_IR_STATUS_UNCERTAIN
+        return (
+            [atom.charge for atom in parsed.molecule.atoms],
+            parsed.status == MOLECULETYPE_IR_STATUS_UNCERTAIN,
+        )
     
     def _classify_ionic_moleculetypes(
         self,
@@ -1352,8 +1662,6 @@ class TopologySanitizerMixin:
             - Dict of molecule_name -> classification
             - Classification audit with degraded/uncertain details
         """
-        from ..charge_neutrality import ChargeNeutralityError, ChargeParser
-
         tol = ctx.charge_neutrality_tol if ctx else 1e-6
         classifications: Dict[str, str] = {}
         strict_mode = self._strict_charge_fix_mode(ctx)
@@ -1376,6 +1684,9 @@ class TopologySanitizerMixin:
             total_charge: Optional[float] = None,
             has_preprocessor: bool = False,
             unparsed_atoms_line_count: int = 0,
+            itp_moleculetype_name: Optional[str] = None,
+            parse_status: Optional[str] = None,
+            parse_reasons: Optional[List[str]] = None,
         ) -> None:
             detail = {
                 "classification": classification,
@@ -1383,10 +1694,13 @@ class TopologySanitizerMixin:
                 "source": source,
                 "reason": reason,
                 "itp_path": str(itp_path),
+                "itp_moleculetype_name": itp_moleculetype_name or mol_name,
                 "atom_count": atom_count,
                 "total_charge": total_charge,
                 "has_preprocessor": has_preprocessor,
                 "unparsed_atoms_line_count": unparsed_atoms_line_count,
+                "parse_status": parse_status or status,
+                "parse_reasons": list(parse_reasons or []),
             }
             classifications[mol_name] = classification
             classification_audit["details"][mol_name] = detail
@@ -1405,6 +1719,7 @@ class TopologySanitizerMixin:
                     itp_path,
                     "protected_ion",
                     source="protected_ion_pattern",
+                    itp_moleculetype_name=mol_name,
                 )
                 continue
 
@@ -1414,6 +1729,7 @@ class TopologySanitizerMixin:
                     itp_path,
                     "protected_solvent",
                     source="protected_solvent_pattern",
+                    itp_moleculetype_name=mol_name,
                 )
                 continue
 
@@ -1424,32 +1740,18 @@ class TopologySanitizerMixin:
                     "protected_configured",
                     source="charge_fix_protect_resnames",
                     reason="Matched user-configured protected residue/molecule pattern.",
+                    itp_moleculetype_name=mol_name,
                 )
                 continue
 
             try:
-                mol_charge = ChargeParser.get_molecule_charge(
-                    itp_path,
-                    name=mol_name,
-                    strict=False,
-                    allow_unparsed_atoms_lines=True,
-                )
-
-                issue_bits: List[str] = []
-                if mol_charge.atom_count <= 0 or not mol_charge.charges:
-                    issue_bits.append("missing or empty [ atoms ] charge data")
-                if mol_charge.has_preprocessor:
-                    issue_bits.append("preprocessor directives in [ atoms ]")
-                if mol_charge.unparsed_atoms_lines:
-                    issue_bits.append(
-                        f"{len(mol_charge.unparsed_atoms_lines)} unparseable [ atoms ] data line(s)"
-                    )
-
-                if issue_bits:
+                parsed = self._parse_moleculetype_ir(itp_path, mol_name, ctx=ctx)
+                issue_bits = list(parsed.uncertainty_reasons)
+                if parsed.status != MOLECULETYPE_IR_STATUS_EXACT or parsed.molecule is None:
                     classification = "protected_polymer" if looks_polymer else "unknown"
                     msg = (
                         f"Charge-fix classification for active molecule '{mol_name}' is degraded: "
-                        + "; ".join(issue_bits)
+                        + "; ".join(issue_bits or ["unsupported or ambiguous [ atoms ] parse"])
                     )
                     if strict_mode:
                         raise SanitizerError(msg)
@@ -1459,26 +1761,39 @@ class TopologySanitizerMixin:
                         itp_path,
                         classification,
                         status="degraded",
-                        source="charge_parser_degraded",
-                        reason="; ".join(issue_bits),
-                        atom_count=mol_charge.atom_count,
-                        total_charge=mol_charge.total_charge,
-                        has_preprocessor=mol_charge.has_preprocessor,
-                        unparsed_atoms_line_count=len(mol_charge.unparsed_atoms_lines or []),
+                        source="moleculetype_ir_degraded",
+                        reason="; ".join(issue_bits or ["unsupported or ambiguous [ atoms ] parse"]),
+                        atom_count=(
+                            len(parsed.molecule.atoms)
+                            if parsed.molecule is not None
+                            else 0
+                        ),
+                        total_charge=parsed.total_charge,
+                        has_preprocessor=any(
+                            "preprocessor directive" in item for item in issue_bits
+                        ),
+                        unparsed_atoms_line_count=len(
+                            [item for item in issue_bits if item.startswith("[ atoms ] line ")]
+                        ),
+                        itp_moleculetype_name=parsed.actual_name or mol_name,
+                        parse_status=parsed.status,
+                        parse_reasons=issue_bits,
                     )
                     continue
 
-                n_atoms = mol_charge.atom_count
-                q_total = mol_charge.total_charge
+                n_atoms = len(parsed.molecule.atoms)
+                q_total = parsed.total_charge if parsed.total_charge is not None else 0.0
 
                 if n_atoms == 1 and abs(q_total) > tol:
                     _record(
                         mol_name,
                         itp_path,
                         "monatomic_ion",
-                        source="charge_parser",
+                        source="moleculetype_ir",
                         atom_count=n_atoms,
                         total_charge=q_total,
+                        itp_moleculetype_name=parsed.actual_name or mol_name,
+                        parse_status=parsed.status,
                     )
                     continue
 
@@ -1488,9 +1803,11 @@ class TopologySanitizerMixin:
                         mol_name,
                         itp_path,
                         "ionic",
-                        source="charge_parser",
+                        source="moleculetype_ir",
                         atom_count=n_atoms,
                         total_charge=q_total,
+                        itp_moleculetype_name=parsed.actual_name or mol_name,
+                        parse_status=parsed.status,
                     )
                     continue
 
@@ -1502,6 +1819,8 @@ class TopologySanitizerMixin:
                         source="polymer_name_pattern",
                         atom_count=n_atoms,
                         total_charge=q_total,
+                        itp_moleculetype_name=parsed.actual_name or mol_name,
+                        parse_status=parsed.status,
                     )
                     continue
 
@@ -1509,35 +1828,20 @@ class TopologySanitizerMixin:
                     mol_name,
                     itp_path,
                     "neutral",
-                    source="charge_parser",
+                    source="moleculetype_ir",
                     atom_count=n_atoms,
                     total_charge=q_total,
+                    itp_moleculetype_name=parsed.actual_name or mol_name,
+                    parse_status=parsed.status,
                 )
 
-            except ChargeNeutralityError as exc:
-                classification = "protected_polymer" if looks_polymer else "unknown"
-                msg = (
-                    f"Charge-fix classification for active molecule '{mol_name}' is degraded: "
-                    f"{str(exc).splitlines()[0]}"
-                )
-                if strict_mode:
-                    raise SanitizerError(msg)
-                print(f"  [WARN][DEGRADED] {msg}")
-                _record(
-                    mol_name,
-                    itp_path,
-                    classification,
-                    status="degraded",
-                    source="charge_parser_error",
-                    reason=str(exc).splitlines()[0],
-                )
-                continue
-
+            except SanitizerError:
+                raise
             except Exception as exc:
                 classification = "protected_polymer" if looks_polymer else "unknown"
                 msg = (
-                    f"Charge-fix classification for active molecule '{mol_name}' failed unexpectedly: "
-                    f"{exc}"
+                    f"Charge-fix classification for active molecule '{mol_name}' is degraded: "
+                    f"{str(exc).splitlines()[0] if str(exc) else 'unexpected classification error'}"
                 )
                 if strict_mode:
                     raise SanitizerError(msg)
@@ -1548,7 +1852,8 @@ class TopologySanitizerMixin:
                     classification,
                     status="degraded",
                     source="unexpected_error",
-                    reason=str(exc),
+                    reason=str(exc).splitlines()[0] if str(exc) else "unexpected classification error",
+                    itp_moleculetype_name=mol_name,
                 )
         
         # Log classification summary
@@ -1573,6 +1878,48 @@ class TopologySanitizerMixin:
             print(f"  [WARN][DEGRADED] Charge-fix classification degraded for: {degraded}")
 
         return classifications, classification_audit
+
+    def _derive_charge_fix_checker_allowlist(
+        self,
+        classifications: Dict[str, str],
+        classification_audit: Optional[Dict[str, Any]],
+        explicit_allowlist: Optional[Set[str]],
+    ) -> Set[str]:
+        """
+        Derive the checker allowlist without re-opening protected/degraded auto-targets.
+
+        Explicit user allowlists pass through unchanged. Without an explicit allowlist,
+        keep the legacy default target vocabulary but only for exact neutral molecules.
+        """
+        if explicit_allowlist is not None:
+            return set(explicit_allowlist)
+
+        from ..charge_neutrality import DEFAULT_CORRECTION_TARGET_ALLOWLIST
+
+        default_allowlist = {
+            token.casefold() for token in DEFAULT_CORRECTION_TARGET_ALLOWLIST
+        }
+        detail_by_casefold = {
+            name.casefold(): detail
+            for name, detail in (
+                classification_audit.get("details", {}).items()
+                if isinstance(classification_audit, dict)
+                else []
+            )
+        }
+        effective: Set[str] = set()
+        for alias_name, classification in classifications.items():
+            detail = detail_by_casefold.get(alias_name.casefold(), {})
+            status = str(detail.get("status", "degraded"))
+            if classification != "neutral" or status != "exact":
+                continue
+            actual_name = str(detail.get("itp_moleculetype_name") or alias_name)
+            alias_key = alias_name.casefold()
+            actual_key = actual_name.casefold()
+            if alias_key in default_allowlist or actual_key in default_allowlist:
+                effective.add(alias_name)
+                effective.add(actual_name)
+        return effective
 
     def _warn_electrolyte_fixed_charge_limitations(
         self,
@@ -1863,141 +2210,12 @@ class TopologySanitizerMixin:
         ctx: Optional["PipelineContext"] = None,
     ) -> Optional[str]:
         """
-        Compute a collision-resistant signature for one moleculetype.
-
-        Uses streaming SHA-256 over canonicalized content for topology-relevant
-        sections (atoms/bonds/angles/dihedrals/...); this catches materially
-        different same-name definitions even when atoms-only signatures match.
+        Compute a deterministic signature for one moleculetype using the IR parser.
         """
-        if not itp_path.exists():
+        parsed = self._parse_moleculetype_ir(itp_path, mol_name, ctx=ctx)
+        if parsed.status != MOLECULETYPE_IR_STATUS_EXACT:
             return None
-
-        strict_reads = bool(ctx and ctx.strict_include_resolution)
-        content = self.safe_read_text(itp_path, strict=strict_reads)
-        if not content:
-            return None
-        
-        current_section = ""
-        current_mol = None
-        in_target_mol = False
-        
-        atom_count = 0
-        sections_present: Set[str] = set()
-        section_line_counts: Dict[str, int] = {}
-        qmin: Optional[float] = None
-        qmax: Optional[float] = None
-        sum_abs_q = 0.0
-        sum_q2 = 0.0
-        hasher = hashlib.sha256()
-        quant_step = self._molecule_sig_quant_step()
-        topology_sections = {
-            "atoms",
-            "bonds",
-            "pairs",
-            "angles",
-            "dihedrals",
-            "impropers",
-            "constraints",
-            "settles",
-            "virtual_sites2",
-            "virtual_sites3",
-            "virtual_sites4",
-            "virtual_sitesn",
-            "exclusions",
-            "position_restraints",
-            "distance_restraints",
-            "dihedral_restraints",
-            "angle_restraints",
-            "orientation_restraints",
-        }
-        
-        for line in content.splitlines():
-            stripped = line.strip()
-            
-            # Track section
-            section = parse_section_name(line)
-            if section is not None:
-                current_section = section
-                if current_section == "moleculetype":
-                    current_mol = None
-                    in_target_mol = False
-                continue
-            
-            # Skip comments/blanks
-            data = strip_gmx_comment(stripped).strip()
-            if not data:
-                continue
-            
-            # Track moleculetype name
-            if current_section == "moleculetype":
-                parts = data.split()
-                if parts:
-                    current_mol = parts[0]
-                    in_target_mol = (current_mol == mol_name)
-                continue
-
-            if not in_target_mol:
-                continue
-
-            if data.startswith("#"):
-                preproc_key = f"{current_section}:preproc"
-                sections_present.add(preproc_key)
-                section_line_counts[preproc_key] = section_line_counts.get(preproc_key, 0) + 1
-                hasher.update(f"{preproc_key}|{data}\n".encode("utf-8"))
-                continue
-
-            if current_section in topology_sections:
-                canonical_tokens = " ".join(data.split())
-                sections_present.add(current_section)
-                section_line_counts[current_section] = section_line_counts.get(current_section, 0) + 1
-                hasher.update(f"{current_section}|{canonical_tokens}\n".encode("utf-8"))
-            
-            # Hash all atom entries in target molecule
-            if current_section == "atoms":
-                parts = data.split()
-                if len(parts) >= 5 and parts[0].isdigit():
-                    atom_count += 1
-                    row_result = parse_atoms_row(data)
-                    if row_result.status != ATOMS_ROW_STATUS_PARSED or row_result.record is None:
-                        unknown_key = "atoms:charge_unknown"
-                        if row_result.status == ATOMS_ROW_STATUS_UNSUPPORTED:
-                            unknown_key = "atoms:charge_uncertain"
-                        sections_present.add(unknown_key)
-                        section_line_counts[unknown_key] = section_line_counts.get(unknown_key, 0) + 1
-                        hasher.update(f"{unknown_key}|{' '.join(parts[:5])}\n".encode("utf-8"))
-                        continue
-                    raw_q = row_result.record.charge
-
-                    qmin = raw_q if qmin is None else min(qmin, raw_q)
-                    qmax = raw_q if qmax is None else max(qmax, raw_q)
-                    sum_abs_q += abs(raw_q)
-                    sum_q2 += raw_q * raw_q
-                    quant_q = self._quantize_moleculetype_charge(raw_q, quant_step)
-                    canonical = (
-                        f"{row_result.record.atom_type}|"
-                        f"{row_result.record.atom_name}|"
-                        f"{quant_q:+.10f}\n"
-                    )
-                    hasher.update(canonical.encode("utf-8"))
-        
-        if atom_count == 0:
-            return None
-
-        qmin_val = qmin if qmin is not None else 0.0
-        qmax_val = qmax if qmax is not None else 0.0
-        digest = hasher.hexdigest()
-
-        return (
-            f"atoms={atom_count};"
-            f"digest={digest};"
-            f"qmin={qmin_val:+.6f};"
-            f"qmax={qmax_val:+.6f};"
-            f"sum_abs_q={sum_abs_q:.6f};"
-            f"sum_q2={sum_q2:.6f};"
-            f"charge_quant_step={quant_step:.12g};"
-            f"sections={','.join(sorted(sections_present))};"
-            f"section_counts={','.join(f'{k}:{section_line_counts[k]}' for k in sorted(section_line_counts))}"
-        )
+        return parsed.signature
 
     def _get_ordered_molecules_from_top(self, top_path: Path) -> TopMoleculesParseResult:
         """
