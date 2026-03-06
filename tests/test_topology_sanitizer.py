@@ -7,7 +7,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pipeline.charge_neutrality import ChargeNeutralityChecker
+from pipeline.charge_neutrality import (
+    ChargeNeutralityChecker,
+    ChargeNeutralityError,
+    ChargeParser,
+)
 from pipeline.stages.topology_sanitizer import (
     ATOMS_ROW_STATUS_INVALID,
     ATOMS_ROW_STATUS_PARSED,
@@ -367,6 +371,98 @@ def test_degraded_or_protected_targets_are_removed_from_default_checker_allowlis
     assert "BROKEN" not in allowlist
     assert "PC" not in allowlist
     assert allowlist == set()
+
+
+@pytest.mark.parametrize(
+    "atoms_rows",
+    [
+        (
+            "1 CT 1 MOL C1 -0.125000 12.011\n"
+            "2 HC 1 MOL H1 0.125000 1.008\n"
+        ),
+        (
+            "1 CT 1 MOL C1 3-0.125000 12.011\n"
+            "2 HC 1 MOL H1 4+0.125000 1.008\n"
+        ),
+    ],
+)
+def test_charge_fix_classification_accepts_supported_7_column_variants(
+    tmp_path,
+    atoms_rows,
+):
+    sanitizer = DummySanitizer()
+    itp = tmp_path / "mol.itp"
+    _write(
+        itp,
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        f"{atoms_rows}",
+    )
+
+    classifications, audit = sanitizer._classify_ionic_moleculetypes({"MOL": itp})
+
+    assert classifications["MOL"] == "neutral"
+    assert audit["details"]["MOL"]["status"] == "exact"
+    assert audit["details"]["MOL"]["total_charge"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    "atoms_rows",
+    [
+        (
+            "1 CT 1 MOL C1 -0.125000 12.011\n"
+            "2 HC 1 MOL H1 0.125000 1.008\n"
+        ),
+        (
+            "1 CT 1 MOL C1 3-0.125000 12.011\n"
+            "2 HC 1 MOL H1 4+0.125000 1.008\n"
+        ),
+    ],
+)
+def test_charge_parser_remains_compatible_with_supported_7_column_variants(
+    tmp_path,
+    atoms_rows,
+):
+    itp = tmp_path / "mol.itp"
+    _write(
+        itp,
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        f"{atoms_rows}",
+    )
+
+    result = ChargeParser.get_molecule_charge(itp, "MOL", include_details=True)
+
+    assert result.total_charge == pytest.approx(0.0)
+    assert result.atom_count == 2
+    assert result.unparsed_atoms_lines == []
+
+
+@pytest.mark.parametrize(
+    "atoms_row",
+    [
+        "1 CT 1 MOL C1 1 -0.125000",
+        "1 CT 1 MOL C1 0.125000-12.011",
+        "1 CT 1 MOL C1 1 0.125000 -12.011",
+    ],
+)
+def test_charge_parser_fails_closed_for_stage1_unsupported_atoms_rows(
+    tmp_path,
+    atoms_row,
+):
+    itp = tmp_path / "mol.itp"
+    _write(
+        itp,
+        "[ moleculetype ]\n"
+        "MOL 3\n"
+        "[ atoms ]\n"
+        f"{atoms_row}\n",
+    )
+
+    with pytest.raises(ChargeNeutralityError, match="Unparseable \\[ atoms \\] data line"):
+        ChargeParser.get_molecule_charge(itp, "MOL", include_details=True)
 
 
 def test_allowlisted_polymer_requires_spread_safe_before_any_correction(tmp_path):

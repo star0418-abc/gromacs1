@@ -1495,6 +1495,7 @@ The Sanitizer performs charge neutrality preflight checking:
 - In strict mode, fails if any active molecule has preprocessor directives in/around `[ atoms ]`, or unparsed/ambiguous `[ atoms ]` data lines
 - Fails if system charge |Q| exceeds auto-correction threshold (default: 1e-4)
 - Optional unsafe escape hatch exists only as an explicit checker flag (`allow_unparsed_atoms_lines=True`), skipped lines are recorded in charge-neutrality audit output, and outcomes are marked degraded in non-strict mode
+- The charge checker now uses the same fail-closed row semantics as the Stage 1 `[ atoms ]` parser, so ambiguous raw 7-column, glued charge/mass, or negative-mass rows are treated as unparseable rather than silently counted
 
 **Alias vs Real ITP Moleculetype**:
 - Molecule counts remain keyed by pipeline alias for backward compatibility

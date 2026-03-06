@@ -25,6 +25,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .stages.topology_sanitizer import (
+    ATOMS_ROW_STATUS_PARSED,
+    parse_atoms_row,
+)
+
 
 class ChargeNeutralityError(Exception):
     """Error during charge neutrality check."""
@@ -456,11 +461,10 @@ class ChargeParser:
         Raises:
             ChargeNeutralityError: In strict mode when format is ambiguous
         """
-        # Strip inline comments
         stripped = line.strip()
         if not stripped or stripped.startswith(';'):
             return None
-        
+
         if ';' in stripped:
             data_part, comment_part = stripped.split(';', 1)
             data_part = data_part.strip()
@@ -468,100 +472,34 @@ class ChargeParser:
         else:
             data_part = stripped
             comment_part = ""
-        
+
         if not data_part:
             return None
-        
-        tokens = cls._tokenize_atoms_line(data_part)
-        n_tokens = len(tokens)
-        
-        # Need at least 7 tokens for minimal valid format
-        if n_tokens < 7:
-            if strict:
-                raise ChargeNeutralityError(
-                    f"Line {line_no}: Too few tokens ({n_tokens}) in [ atoms ] line.\n"
-                    f"Expected at least 7 (nr type resnr residue atom charge mass).\n"
-                    f"Line: {line.rstrip()}"
-                )
-            return None
-        
-        def _is_int(idx: int) -> bool:
-            if idx >= n_tokens:
-                return False
-            try:
-                int(tokens[idx])
-                return True
-            except ValueError:
-                return False
 
-        def _is_float(idx: int) -> bool:
-            if idx >= n_tokens:
-                return False
-            try:
-                float(tokens[idx])
-                return True
-            except ValueError:
-                return False
-
-        has_core_ints = _is_int(0) and _is_int(2)
-        looks_like_8 = (
-            has_core_ints and
-            n_tokens >= 8 and
-            _is_int(5) and
-            _is_float(6) and
-            _is_float(7)
-        )
-        looks_like_7 = (
-            has_core_ints and
-            n_tokens >= 7 and
-            _is_float(5) and
-            _is_float(6)
-        )
-
-        if looks_like_8:
-            charge_col_idx = 6
-            mass_col_idx = 7
-            cgnr = int(tokens[5])
-        elif looks_like_7:
-            charge_col_idx = 5
-            mass_col_idx = 6
-            cgnr = None
-        else:
+        row_result = parse_atoms_row(data_part)
+        if row_result.status != ATOMS_ROW_STATUS_PARSED or row_result.record is None:
             msg = (
-                f"Line {line_no}: Ambiguous [ atoms ] format; could not classify as "
-                f"8-token (nr type resnr residue atom cgnr charge mass) or 7-token "
-                f"(nr type resnr residue atom charge mass).\n"
-                f"Line: {line.rstrip()}\n"
-                f"Hint: check for glued numeric fields like '1.000-0.001' or malformed spacing."
+                f"Line {line_no}: Unsupported [ atoms ] line for charge parsing: "
+                f"{row_result.reason or 'unknown parse failure'}.\n"
+                f"Line: {line.rstrip()}"
             )
             if strict:
                 raise ChargeNeutralityError(msg)
-            print(f"    [WARN] {msg}")
             return None
 
-        # Must exist by format checks above
-        nr = int(tokens[0])
-        resnr = int(tokens[2])
-        atomtype = tokens[1]
-        residue = tokens[3]
-        atomname = tokens[4]
-        charge = float(tokens[charge_col_idx])
+        tokens = cls._tokenize_atoms_line(data_part)
+        record = row_result.record
+        charge_col_idx = 6 if record.cgnr is not None else 5
 
-        # Mass is optional in some odd formats; keep None if unparseable.
-        try:
-            mass = float(tokens[mass_col_idx]) if mass_col_idx < len(tokens) else None
-        except ValueError:
-            mass = None
-        
         return {
-            'nr': nr,
-            'atomtype': atomtype,
-            'resnr': resnr,
-            'residue': residue,
-            'atomname': atomname,
-            'cgnr': cgnr,
-            'charge': charge,
-            'mass': mass,
+            'nr': record.atom_id,
+            'atomtype': record.atom_type,
+            'resnr': record.resnr,
+            'residue': record.residue,
+            'atomname': record.atom_name,
+            'cgnr': record.cgnr,
+            'charge': record.charge,
+            'mass': record.mass,
             'charge_col_idx': charge_col_idx,
             'line_no': line_no,
             'original_line': line,
