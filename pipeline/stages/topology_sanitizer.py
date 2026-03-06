@@ -751,6 +751,104 @@ class TopologySanitizerMixin:
             f"Conservative Python fallback used for {purpose} in {file_path}: {summary}"
         )
 
+    def _conservative_topology_lines(
+        self,
+        *,
+        lines: List[str],
+        file_path: Path,
+        purpose: str,
+        strict: bool,
+        ignore_ranges: Optional[List[Tuple[int, int]]] = None,
+    ) -> Tuple[List[Tuple[int, str]], List[str]]:
+        """
+        Return only topology lines that are unambiguous without preprocessing.
+
+        Preprocessor directives make Python parsing ambiguous. Strict mode fails
+        closed via `_record_semantic_scan_issue()`. Non-strict mode records one
+        degraded warning and skips conditionally ambiguous content.
+        """
+        skip_indices: Set[int] = set()
+        if ignore_ranges:
+            for start, end in ignore_ranges:
+                skip_indices.update(range(start, end + 1))
+
+        active_lines: List[Tuple[int, str]] = []
+        semantic_issues: List[str] = []
+        conditional_depth = 0
+
+        for idx, line in enumerate(lines):
+            if idx in skip_indices:
+                continue
+
+            line_no = idx + 1
+            directive = preprocessor_directive_token(line)
+
+            if directive == "#include":
+                if conditional_depth > 0:
+                    self._record_semantic_scan_issue(
+                        issues=semantic_issues,
+                        file_path=file_path,
+                        line_no=line_no,
+                        directive=directive,
+                        purpose=purpose,
+                        strict=strict,
+                    )
+                    continue
+                include_target = parse_include_target(line)
+                if include_target is None:
+                    self._record_semantic_scan_issue(
+                        issues=semantic_issues,
+                        file_path=file_path,
+                        line_no=line_no,
+                        directive="#include(macro-like)",
+                        purpose=purpose,
+                        strict=strict,
+                    )
+                    continue
+                active_lines.append((line_no, line))
+                continue
+
+            if directive is not None:
+                self._record_semantic_scan_issue(
+                    issues=semantic_issues,
+                    file_path=file_path,
+                    line_no=line_no,
+                    directive=directive,
+                    purpose=purpose,
+                    strict=strict,
+                )
+                if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
+                    conditional_depth += 1
+                elif directive in PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES:
+                    if conditional_depth == 0:
+                        conditional_depth = 1
+                elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
+                    if conditional_depth > 0:
+                        conditional_depth -= 1
+                continue
+
+            if conditional_depth > 0:
+                continue
+
+            active_lines.append((line_no, line))
+
+        if conditional_depth > 0:
+            self._record_semantic_scan_issue(
+                issues=semantic_issues,
+                file_path=file_path,
+                line_no=len(lines) or 1,
+                directive=f"unclosed conditional depth={conditional_depth}",
+                purpose=purpose,
+                strict=strict,
+            )
+        if semantic_issues and not strict:
+            self._emit_semantic_scan_warning(
+                file_path=file_path,
+                purpose=purpose,
+                issues=semantic_issues,
+            )
+        return active_lines, semantic_issues
+
     def _candidate_preprocessed_topology_paths(
         self,
         *,
@@ -1054,6 +1152,9 @@ class TopologySanitizerMixin:
                 uncertain = True
                 if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
                     conditional_depth += 1
+                elif directive in PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES:
+                    if conditional_depth == 0:
+                        conditional_depth = 1
                 elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
                     if conditional_depth > 0:
                         conditional_depth -= 1
@@ -1396,6 +1497,9 @@ class TopologySanitizerMixin:
                     )
                     if directive in PREPROCESSOR_CONDITIONAL_START_DIRECTIVES:
                         conditional_depth += 1
+                    elif directive in PREPROCESSOR_CONDITIONAL_BRANCH_DIRECTIVES:
+                        if conditional_depth == 0:
+                            conditional_depth = 1
                     elif directive == PREPROCESSOR_CONDITIONAL_END_DIRECTIVE:
                         if conditional_depth > 0:
                             conditional_depth -= 1
@@ -2738,7 +2842,13 @@ class TopologySanitizerMixin:
         content = self.safe_read_text(system_top_path, strict=strict_includes)
         if not content:
             return
-        for line in content.splitlines():
+        scan_lines, _ = self._conservative_topology_lines(
+            lines=content.splitlines(),
+            file_path=system_top_path,
+            purpose="system.top include validation",
+            strict=strict_includes,
+        )
+        for _line_no, line in scan_lines:
             include_target = parse_include_target(line)
             if not include_target:
                 continue
@@ -3454,6 +3564,13 @@ class TopologySanitizerMixin:
         if strict_top_update is None:
             strict_top_update = getattr(ctx, "strict_include_resolution", False) if ctx else False
 
+        _, top_preprocessor_issues = self._conservative_topology_lines(
+            lines=lines,
+            file_path=existing_top,
+            purpose="system.top managed-block update",
+            strict=bool(strict_top_update),
+        )
+
         # Check sentinel markers and validate pairing before any rewrite.
         begin_marker = SANITIZER_BLOCK_BEGIN
         end_marker = SANITIZER_BLOCK_END
@@ -3525,6 +3642,7 @@ class TopologySanitizerMixin:
                     "unmatched_end": len(unmatched_end),
                     "nested_begin": len(nested_begin),
                 },
+                "preprocessor_ambiguity": list(top_preprocessor_issues),
             }
             rebuilt = self._insert_managed_block_at_safe_location(
                 cleaned_lines,
@@ -3564,7 +3682,8 @@ class TopologySanitizerMixin:
                 )
                 self._system_top_update_status = {
                     "mode": "replaced_single_managed_block",
-                    "degraded": False,
+                    "degraded": bool(top_preprocessor_issues),
+                    "preprocessor_ambiguity": list(top_preprocessor_issues),
                 }
             else:
                 # Defensive fallback: bad ordering
@@ -3574,6 +3693,7 @@ class TopologySanitizerMixin:
                 self._system_top_update_status = {
                     "mode": "fallback_insert_bad_marker_order",
                     "degraded": True,
+                    "preprocessor_ambiguity": list(top_preprocessor_issues),
                 }
         elif len(pairs) > 1:
             msg = (
@@ -3601,11 +3721,12 @@ class TopologySanitizerMixin:
                     inserted = True
                 if idx in skip_indices:
                     continue
-                result_lines.append(line)
+                    result_lines.append(line)
             self._system_top_update_status = {
                 "mode": "collapsed_multiple_managed_blocks",
-                "degraded": False,
+                "degraded": bool(top_preprocessor_issues),
                 "blocks_found": len(pairs),
+                "preprocessor_ambiguity": list(top_preprocessor_issues),
             }
         else:
             # Markers not found: insert at safe location
@@ -3614,7 +3735,8 @@ class TopologySanitizerMixin:
             )
             self._system_top_update_status = {
                 "mode": "inserted_new_managed_block",
-                "degraded": False,
+                "degraded": bool(top_preprocessor_issues),
+                "preprocessor_ambiguity": list(top_preprocessor_issues),
             }
         
         return '\n'.join(result_lines) + '\n'

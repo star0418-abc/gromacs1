@@ -201,6 +201,38 @@ def test_resolve_include_strict_fails_on_shadowing_when_not_allowed(tmp_path):
         )
 
 
+def test_resolve_include_non_strict_reports_shadowing_warning(tmp_path, capsys):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(
+        tmp_path,
+        allow_include_shadowing=False,
+        itp_include_dirs="user_include",
+        itp_include_dirs_priority="sanitized_first",
+    )
+    forcefield_dir = tmp_path / "IN/forcefield/oplsaa"
+    sanitizer._forcefield_dir = forcefield_dir
+
+    root_itp = forcefield_dir / "gromacs/root.itp"
+    user_leaf = tmp_path / "user_include/leaf.itp"
+    ff_leaf = forcefield_dir / "gromacs/leaf.itp"
+    _write(root_itp, "#include \"leaf.itp\"\n")
+    _write(user_leaf, "[ moleculetype ]\nUSER 3\n")
+    _write(ff_leaf, "[ moleculetype ]\nFF 3\n")
+
+    resolved = sanitizer._resolve_include_in_dirs(
+        "leaf.itp",
+        root_itp,
+        [],
+        strict=False,
+        check_shadowing=True,
+        allow_shadowing=False,
+        ctx=ctx,
+    )
+
+    assert resolved == ff_leaf.resolve()
+    assert "Include shadowing detected" in capsys.readouterr().out
+
+
 def test_get_moleculetype_names_strict_fails_closed_on_unresolved_conditionals(tmp_path):
     sanitizer = DummySanitizer()
     ctx = DummyContext(tmp_path, strict_include_resolution=True)
@@ -284,6 +316,68 @@ def test_expand_include_closure_reports_degraded_conditional_includes_in_non_str
     assert class_map[str(root_itp.resolve())] == "staged"
     assert ff_map[str(root_itp.resolve())] == "UNKNOWN"
     assert "Conservative Python fallback used for include closure discovery" in capsys.readouterr().out
+
+
+def test_validate_system_top_includes_strict_fails_closed_on_macro_like_include(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path, strict_include_resolution=True)
+    top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    _write(top, "#include SOME_MACRO\n[molecules]\nA 1\n")
+
+    with pytest.raises(SanitizerError, match="#include\\(macro-like\\)"):
+        sanitizer._validate_system_top_includes(top, ctx)
+
+
+def test_validate_system_top_includes_non_strict_reports_degraded_conditionals(
+    tmp_path,
+    capsys,
+):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path)
+    top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    leaf = tmp_path / "IN/systems/SYS/gromacs/top/leaf.itp"
+    _write(
+        top,
+        "#ifdef USE_LEAF\n"
+        "#include \"leaf.itp\"\n"
+        "#endif\n"
+        "[molecules]\n"
+        "A 1\n",
+    )
+    _write(leaf, "")
+
+    sanitizer._validate_system_top_includes(top, ctx)
+
+    assert "Conservative Python fallback used for system.top include validation" in capsys.readouterr().out
+
+
+def test_update_system_top_includes_strict_fails_closed_on_preprocessor_ambiguity(tmp_path):
+    sanitizer = DummySanitizer()
+    ctx = DummyContext(tmp_path, strict_include_resolution=True)
+    existing_top = tmp_path / "IN/systems/SYS/gromacs/top/system.top"
+    combined_atomtypes = tmp_path / "IN/systems/SYS/gromacs/top/combined_atomtypes_current.itp"
+    molecule_itp = tmp_path / "IN/systems/SYS/gromacs/itp/A.itp"
+    _write(
+        existing_top,
+        "#ifdef USE_FF\n"
+        "#include \"forcefield.itp\"\n"
+        "#endif\n"
+        "[ system ]\n"
+        "Demo\n"
+        "[ molecules ]\n"
+        "A 1\n",
+    )
+    _write(combined_atomtypes, "")
+    _write(molecule_itp, "[ moleculetype ]\nA 3\n")
+
+    with pytest.raises(SanitizerError, match="Cannot safely system.top managed-block update"):
+        sanitizer._update_system_top_includes(
+            existing_top,
+            combined_atomtypes,
+            [molecule_itp],
+            top_dir=existing_top.parent,
+            ctx=ctx,
+        )
 
 
 def test_uncertain_same_name_conflict_fails_closed_in_strict_mode(tmp_path):

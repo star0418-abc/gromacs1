@@ -1095,6 +1095,7 @@ Compatibility-only extra include roots are appended after the configured order; 
 
 If an include cannot be resolved, the sanitizer reports attempted paths (or fails fast if `--strict-include-resolution` is set).
 `system.top` validation uses the same resolver and parses both `"file.itp"` and `<file.itp>` includes.
+`system.top` include validation and managed-block updates now use the same conservative preprocessor policy: strict mode fails on unresolved conditional or macro-like include content, while non-strict mode logs an explicit degraded warning and skips conditionally ambiguous includes instead of treating them as active.
 
 **Shadowing**: If multiple include candidates exist, shadowing is reported. In strict mode this is a hard error unless `--allow-include-shadowing` is enabled.
 For same-basename shadows, sanitizer output is winner-only per include target (no deterministic renaming of losers).
