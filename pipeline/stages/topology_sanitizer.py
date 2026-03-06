@@ -3109,15 +3109,52 @@ class TopologySanitizerMixin:
             )
         p1, p2 = lj_tail_floats
 
+        def _is_integer_like_token(token: str) -> bool:
+            return re.fullmatch(r"[+-]?\d+", token) is not None
+
+        def _is_explicit_charge_literal(token: str) -> bool:
+            stripped = token.strip()
+            if not stripped:
+                return False
+            if stripped[0] in "+-":
+                return True
+            try:
+                numeric = float(stripped)
+            except ValueError:
+                return False
+            return numeric == 0.0
+
         ptype: Optional[str]
         middle_tokens: List[str]
         if len(parts) >= 6 and parts[-3].upper() in PTYPE_TOKENS:
             ptype = parts[-3].upper()
+            if len(parts) == 6:
+                leading_token = parts[1]
+                charge_token = parts[2]
+                if _is_integer_like_token(leading_token) and not _is_explicit_charge_literal(charge_token):
+                    raise ValueError(
+                        f"Ambiguous 6-field explicit-ptype row at {source_name}:{line_no}: "
+                        "the numeric fields before ptype could be interpreted as either "
+                        "'mass charge' or 'at_num mass'. Use a signed/zero-like charge token "
+                        "or include an additional non-numeric field before mass/charge. "
+                        f"Raw: {data}"
+                    )
             middle_tokens = parts[1:-5]
             charge_fields = _extract_floats_from_text(parts[-4])
             mass_fields = _extract_floats_from_text(parts[-5])
         else:
             ptype = None
+            if len(parts) == 5:
+                leading_token = parts[1]
+                charge_token = parts[2]
+                if _is_integer_like_token(leading_token) and not _is_explicit_charge_literal(charge_token):
+                    raise ValueError(
+                        f"Ambiguous 5-field missing-ptype row at {source_name}:{line_no}: "
+                        "the numeric fields before the LJ tail could be interpreted as either "
+                        "'mass charge' or 'at_num mass'. Use a signed/zero-like charge token "
+                        "or include an additional non-numeric field before mass/charge. "
+                        f"Raw: {data}"
+                    )
             middle_tokens = parts[1:-4]
             charge_fields = _extract_floats_from_text(parts[-3]) if len(parts) >= 4 else []
             mass_fields = _extract_floats_from_text(parts[-4]) if len(parts) >= 5 else []
@@ -3284,10 +3321,11 @@ class TopologySanitizerMixin:
 
         # comb-rule=1: retain robust statistical fallback with finite-value guardrails.
         if comb_rule == 1:
-            print(
-                "  [INFO] comb-rule=1: treating last two fields as raw LJ params "
-                "(p1/p2), not sigma/epsilon"
-            )
+            if policy != "off":
+                print(
+                    "  [INFO] comb-rule=1: treating last two fields as raw LJ params "
+                    "(p1/p2), not sigma/epsilon"
+                )
             for row in atomtype_data:
                 name = str(row["name"])
                 p1 = float(row["p1"])
@@ -3504,7 +3542,7 @@ class TopologySanitizerMixin:
         report["warning_count"] = len(warnings)
         report["unit_error_count"] = len(unit_errors)
 
-        if top_offenders:
+        if policy != "off" and top_offenders:
             print(
                 "  [WARN] LJ outlier report: "
                 f"profile={profile}, policy={policy}, offenders={len(offenders)}"

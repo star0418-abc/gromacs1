@@ -1175,6 +1175,7 @@ TIP4P-like water models and other systems with virtual sites (ptype D or V) are 
 The LJ-validation parser is intentionally conservative:
 - Supported tails are `... mass charge ptype sigma epsilon` and `... mass charge sigma epsilon` (missing `ptype`)
 - `ptype` is recognized only in the canonical third token from the tail and accepts `A/D/S/V`
+- Bare five-/six-field rows whose first numeric token is integer-like are accepted only when the following token is lexically an explicit charge literal (signed or zero-like); otherwise they are rejected as ambiguous between `mass charge` and `at_num mass`
 - Middle tokens ahead of `mass/charge` may exist, but rows with additional ptype-like middle tokens are rejected as ambiguous instead of guessed
 - Files with unusual or shifted layouts produce actionable errors rather than silently reinterpreting columns
 

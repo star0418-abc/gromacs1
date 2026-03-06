@@ -1442,6 +1442,25 @@ def test_negative_sigma_with_nonpositive_epsilon_is_explicitly_flagged(tmp_path)
     )
 
 
+def test_lj_outlier_policy_off_suppresses_nonfatal_output(tmp_path, capsys):
+    sanitizer = DummySanitizer()
+    combined = tmp_path / "combined_atomtypes.itp"
+    _write(
+        combined,
+        "[ atomtypes ]\n"
+        "NEG 12.011 0.000 A -1.000000e-01 2.500000e-01\n",
+    )
+
+    warnings = sanitizer._warn_atomtype_outliers(
+        combined,
+        DummyContext(tmp_path, lj_outlier_policy="off"),
+        comb_rule=2,
+    )
+
+    assert warnings == []
+    assert capsys.readouterr().out == ""
+
+
 def test_check_lj_outliers_robust_excludes_near_zero_values_from_log_domain_stats(tmp_path):
     sanitizer = DummySanitizer()
     combined = tmp_path / "combined_atomtypes.itp"
@@ -1473,9 +1492,21 @@ def test_parse_lj_atomtypes_row_supports_missing_ptype_and_shell_ptype(tmp_path)
         "missing.itp",
         8,
     )
+    zero_charge_explicit_ptype_row = sanitizer._parse_lj_atomtypes_row(
+        "HZERO 1 0.000 A 2.000000e-01 1.000000e-01",
+        "hzero.itp",
+        9,
+    )
+    zero_charge_missing_ptype_row = sanitizer._parse_lj_atomtypes_row(
+        "HZMISS 1 0.000 2.000000e-01 1.000000e-01",
+        "hzmiss.itp",
+        10,
+    )
 
     assert shell_row[:4] == ("SHEL", "S", 0.3, 0.2)
     assert missing_ptype_row[:4] == ("MISS", None, 0.31, 0.21)
+    assert zero_charge_explicit_ptype_row[:4] == ("HZERO", "A", 0.2, 0.1)
+    assert zero_charge_missing_ptype_row[:4] == ("HZMISS", None, 0.2, 0.1)
 
 
 def test_parse_lj_atomtypes_row_rejects_ambiguous_missing_ptype_layout(tmp_path):
@@ -1486,6 +1517,28 @@ def test_parse_lj_atomtypes_row_rejects_ambiguous_missing_ptype_layout(tmp_path)
             "AMBIG A 12.011 0.000 3.100000e-01 2.100000e-01",
             "ambig.itp",
             5,
+        )
+
+
+def test_parse_lj_atomtypes_row_rejects_ambiguous_six_field_explicit_ptype_layout(tmp_path):
+    sanitizer = DummySanitizer()
+
+    with pytest.raises(ValueError, match="Ambiguous 6-field explicit-ptype row"):
+        sanitizer._parse_lj_atomtypes_row(
+            "AMBIG6 6 12.011 A 3.100000e-01 2.100000e-01",
+            "ambig6.itp",
+            7,
+        )
+
+
+def test_parse_lj_atomtypes_row_rejects_ambiguous_five_field_missing_ptype_layout(tmp_path):
+    sanitizer = DummySanitizer()
+
+    with pytest.raises(ValueError, match="Ambiguous 5-field missing-ptype row"):
+        sanitizer._parse_lj_atomtypes_row(
+            "AMBIG5 6 12.011 3.100000e-01 2.100000e-01",
+            "ambig5.itp",
+            6,
         )
 
 
