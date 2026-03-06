@@ -666,7 +666,7 @@ Stage 2 keeps the same public sanitizer facade, but moves two safety-critical in
 
 ### Refactor Closeout Status
 
-`topology_sanitizer.py` staged refactor work is complete through the accepted Stage 5 hardening scope and is now the post-refactor baseline for sanitizer topology behavior.
+`topology_sanitizer.py` staged refactor work is complete through the accepted Stage 5 hardening scope and is now the stable maintenance-mode baseline for sanitizer topology behavior.
 
 Freeze rationale:
 - external import/call surface remains stable via `pipeline/stages/sanitizer.py`
@@ -1089,7 +1089,7 @@ Default propagation safeguards:
 
 ## ITP Sanitizer
 
-The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, detecting conflicts, and ensuring consistent `[ defaults ]` settings. `topology_sanitizer.py` is the stable post-refactor baseline for this topology layer; future work should stay in maintenance/bugfix/feature mode rather than new staged refactor phases unless a real blocker is found.
+The ITP Sanitizer prepares topology files for GROMACS by extracting atomtypes, detecting conflicts, and ensuring consistent `[ defaults ]` settings. `topology_sanitizer.py` is the stable maintenance-mode baseline for this topology layer; future work should stay in maintenance/bugfix/feature mode rather than new staged refactor phases unless a real blocker is found.
 
 ### What It Does
 
