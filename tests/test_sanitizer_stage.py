@@ -56,6 +56,8 @@ class FakeContext:
         self.strict_charge_physics = False
         self.charge_fix_method = "safe_subset"
         self.charge_fix_allow_ions = False
+        self.charge_fix_allow_solvents = False
+        self.charge_fix_protect_resnames = None
         self.charge_neutrality_warn = 1e-5
         self.charge_neutrality_tol = 1e-6
         self.polymer_net_charge_tol = 1e-3
@@ -309,3 +311,35 @@ def test_mixed_defaults_generate_requires_cross_group_artifact(tmp_path, monkeyp
 
     with pytest.raises(SanitizerError, match="cross-group remediation include path is missing"):
         stage.run(ctx)
+
+
+def test_mixed_defaults_generate_includes_cross_group_artifact_in_system_top(tmp_path, monkeypatch):
+    ctx = _prepare_base_tree(
+        tmp_path,
+        "[ molecules ]\nA 0\n",
+    )
+    ctx.allow_mixed_defaults = True
+    ctx.allow_mixed_defaults_reason = "test"
+    result = _make_stub_result(
+        ctx.get_input_path("systems", ctx.system_id, "gromacs"),
+        ctx.run_id,
+        mixed_defaults=True,
+    )
+    cross_group = (
+        ctx.get_input_path("systems", ctx.system_id, "gromacs")
+        / "itp_sanitized_current"
+        / "nonbond_params_cross_group_current.itp"
+    )
+    _write(cross_group, "[ nonbond_params ]\n")
+    result.nonbond_params_cross_group_summary = {"policy": "generate", "status": "generated"}
+    result.nonbond_params_cross_group_current_path = cross_group
+    _patch_sanitizer_run(monkeypatch, ctx, result=result)
+
+    stage = SanitizerStage()
+    monkeypatch.setattr(stage, "_warn_atomtype_outliers", lambda *args, **kwargs: [])
+    monkeypatch.setattr(stage, "_warn_pairs_consistency", lambda *args, **kwargs: None)
+
+    assert stage.run(ctx) is True
+    system_top = ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")
+    content = system_top.read_text(encoding="utf-8")
+    assert 'nonbond_params_cross_group_current.itp' in content

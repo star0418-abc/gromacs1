@@ -653,6 +653,7 @@ Module layout:
 - **Priority**: Search order is configurable via `--itp-include-dirs-priority`.
   - `forcefield_first` (default; legacy alias: `last`): Local > System > FF > User.
   - `sanitized_first` (legacy alias: `first`): Local > User > System > FF.
+- **Recursive include context**: nested `#include` parsing re-derives the search stack from the currently included file, so deeper includes do not accidentally inherit the original parent file's local precedence.
 - **Escape protection**: include targets are blocked if they resolve outside allowed roots (including file parent, configured include search dirs, project root). Use `--allow-unsafe-include-escape` only when intentional.
 
 ### Charge Neutrality Protection
@@ -665,13 +666,17 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
 - **Diagnostics**: Charge audit prints a per-moleculetype table (`Q_mol`, `round(Q_mol)`, `d`, count, `Q_system` contribution) and dominant contributors; the same data is written to manifest.
 - **Auto-protection**: 
   - Molecules matching `PROTECTED_SOLVENT_PATTERNS` (e.g., SOL, HOH, TIP3P).
-  - Molecules matching `PROTECTED_ION_PATTERNS` (e.g., LIT, TFSI, CL, NA).
+  - Molecules matching `PROTECTED_ION_PATTERNS` (e.g., LI/LI+, TFSI, CL, NA).
   - Simple ions (monatomic) and known polymers.
+  - Molecules matching `--charge-fix-protect-resnames <CSV>` are classified as user-protected before any charge-based correction targeting.
+- **Classification reliability**:
+  - If an active molecule cannot be classified reliably because `[ atoms ]` parsing is incomplete, preprocessed, or partially unparseable, strict mode fails closed.
+  - Non-strict mode records the molecule as degraded/unknown and refuses correction on that target unless it is explicitly allowlisted via `--charge-fix-target-allowlist`.
 - **Overrides**:
   - `--charge-fix-allow-solvents`: Allow modification of protected solvents.
   - `--charge-fix-allow-ions`: Allow modification of protected ions.
   - `--charge-fix-target-allowlist <MOL>`: Explicitly allow specific molecules (case-insensitive).
-  - `--charge-fix-protect-resnames <CSV>`: Additional residue names to always protect from charge-fix edits.
+  - `--charge-fix-protect-resnames <CSV>`: Additional protected residue/molecule names. Matching stays boundary-aware, so names like `TFSI_1` or `G4-ALT` can be protected without broad short-token false positives.
 - **Protected polymer net-charge policy**:
   - `--polymer-net-charge-tol` (default `1e-3`): if a protected polymer has `|q| <= tol`, sanitizer accepts drift and skips correction with manifest audit.
   - If `|q| > tol`: correction requires explicit target allowlist; non-strict mode warns+skips, strict mode fails.
@@ -687,7 +692,8 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
   - Use `--lj-outlier-policy {off,warn,error}` with `--lj-bounds-profile {aa,coarse_grained,polarizable,custom}`.
   - For `--lj-bounds-profile custom`, provide `--lj-sigma-max-nm` and `--lj-epsilon-max-kj-mol`.
   - Dummy/virtual (`ptype D/V`) LJ outlier checks are skipped.
-  - Negative sigma is treated as a special encoding warning, not auto-classified as unit corruption.
+  - Negative sigma is treated as a special encoding warning by default, not auto-classified as unit corruption.
+  - If you want negative sigma to hard-fail as part of the LJ outlier policy, use `--lj-outlier-policy error` (or legacy `--strict-lj-validation`).
   - Unit-screaming values (for example sigma > 10 nm or epsilon > 1e6 kJ/mol) always hard-fail.
 - **Triclinic Support**:
   - Charges are validated on rectangular boxes.
@@ -1109,7 +1115,7 @@ Atomtype conflicts are detected based on **physical parameters only**:
   - `--mixed-defaults-cross-group-rule {lorentz-berthelot,geometric}` (auto default from canonical comb-rule: `2->LB`, `3->geometric`)
   - `--mixed-defaults-cross-group-max-pairs N` (default: `20000`, hard cap)
   - `--mixed-defaults-cross-group-reason "TEXT"` (required when policy=`generate`)
-- `generate` writes sanitizer-managed `nonbond_params_cross_group_current.itp` and includes it in `system.top`.
+- `generate` writes sanitizer-managed `nonbond_params_cross_group_current.itp`, and `topology_sanitizer.py` includes it when generating a new `system.top` or updating an existing managed block.
 - When policy=`generate`, sanitizer verifies the expected cross-group artifact path exists before continuing; missing remediation artifacts are treated as hard failures.
 - Existing explicit `pairtypes` / `nonbond_params` pairs are never overwritten; generated pairs skip preexisting entries and are reported.
 
@@ -2391,6 +2397,9 @@ Per-pair analysis results include:
 | `--allow-unsanitized-grompp` | Flag | False | Allow grompp without sanitizer outputs (NOT recommended) |
 | `--charge-fix-method` | `safe_subset`, `uniform_all` | `safe_subset` | Correction method: safe-subset or uniform |
 | `--charge-fix-target-allowlist` | String | None | Comma-separated allowed targets (e.g., "PC,EC") |
+| `--charge-fix-protect-resnames` | String | None | Additional protected residue/molecule names for charge-fix classification |
+| `--charge-fix-allow-solvents` | Flag | False | Allow correction on protected solvent targets |
+| `--charge-fix-allow-ions` | Flag | False | Allow correction on protected ion targets |
 | `--polymer-net-charge-tol` | Float | 1e-3 | Acceptable protected-polymer per-molecule drift before correction is required |
 | `--charge-fix-polymer-method` | `skip_if_small`, `spread_safe` | `skip_if_small` | Protected-polymer policy and correction method |
 | `--charge-fix-polymer-exclusion-bonds` | Integer | 2 | Bond-distance exclusion from hetero atoms for polymer spread-safe correction |

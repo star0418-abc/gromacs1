@@ -6,6 +6,7 @@ Contains ITP/include/topology/forcefield sanitization and final output helpers.
 
 from dataclasses import dataclass, field
 from collections import deque
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 import math
@@ -282,6 +283,8 @@ def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
             if normalized == pat_upper:
                 return True
         else:
+            if normalized == pat_upper:
+                return True
             # Longer patterns: allow substring but check boundaries on ORIGINAL string.
             # Using the raw string preserves separators so boundary detection is reliable.
             boundary_re = rf"(?<![A-Z0-9]){_re.escape(pat_upper)}(?![A-Z0-9])"
@@ -327,6 +330,67 @@ class TopologySanitizerMixin:
             return None
         parsed = {token.strip().casefold() for token in raw.split(",") if token.strip()}
         return parsed or None
+
+    @staticmethod
+    def _strict_charge_fix_mode(ctx: Optional["PipelineContext"]) -> bool:
+        """Return True when charge-fix related strict mode is enabled."""
+        return bool(ctx and getattr(ctx, "strict_charge_neutrality", False))
+
+    @staticmethod
+    def _strict_moleculetype_conflict_mode(ctx: Optional["PipelineContext"]) -> bool:
+        """Return True when same-name moleculetype conflicts must fail closed."""
+        return bool(
+            ctx
+            and (
+                getattr(ctx, "strict_forcefield_consistency", False)
+                or getattr(ctx, "strict_include_resolution", False)
+                or getattr(ctx, "strict_charge_neutrality", False)
+            )
+        )
+
+    @staticmethod
+    def _is_polymer_like_molecule_name(name: str) -> bool:
+        """Conservative name-based polymer marker for charge-fix protection."""
+        name_lower = name.lower()
+        return any(
+            token in name_lower
+            for token in ("polymer", "chain", "frag", "oligo", "peo", "peg")
+        )
+
+    def _charge_fix_extra_protected_patterns(
+        self,
+        ctx: Optional["PipelineContext"],
+    ) -> frozenset[str]:
+        """Return user-configured extra protected residue/molecule patterns."""
+        raw = getattr(ctx, "charge_fix_protect_resnames", None) if ctx is not None else None
+        if not raw:
+            return frozenset()
+        return frozenset(token.strip() for token in raw.split(",") if token.strip())
+
+    def _derive_include_search_paths(
+        self,
+        current_file: Path,
+        include_dirs: Optional[List[Path]] = None,
+        ctx: Optional["PipelineContext"] = None,
+    ) -> List[Path]:
+        """
+        Rebuild include search paths for the currently scanned file.
+
+        Recursive include parsing must derive search order from the current include
+        context, not from the original parent file that started the walk.
+        """
+        if ctx is not None:
+            paths = list(self._build_include_search_paths(ctx, current_file))
+            for candidate in include_dirs or []:
+                if candidate not in paths:
+                    paths.append(candidate)
+            return paths
+
+        paths: List[Path] = [current_file.parent]
+        for candidate in include_dirs or []:
+            if candidate not in paths:
+                paths.append(candidate)
+        return paths
 
     def _assert_no_case_insensitive_duplicates(self, paths: List[Path], label: str) -> None:
         """Fail fast on case-insensitive basename duplicates (non-reproducible)."""
@@ -423,11 +487,7 @@ class TopologySanitizerMixin:
                 conflict_lines.append(
                     f"  - {conflict} ({self._moleculetype_source_class(conflict, class_map)})"
                 )
-            strict_conflict = bool(
-                getattr(ctx, "strict_forcefield_consistency", False)
-                or getattr(ctx, "strict_include_resolution", False)
-                or getattr(ctx, "strict_charge_neutrality", False)
-            )
+            strict_conflict = self._strict_moleculetype_conflict_mode(ctx)
             msg = (
                 f"Conflicting moleculetype '{mol_name}' definitions detected:\n"
                 + "\n".join(conflict_lines)
@@ -492,18 +552,19 @@ class TopologySanitizerMixin:
         if resolved in visited:
             return [], False  # Already processed
         visited.add(resolved)
-        
-        # Build search paths if not provided
-        if include_dirs is None and ctx is not None:
-            include_dirs = self._build_include_search_paths(ctx, itp_path)
-        elif include_dirs is None:
+
+        if include_dirs is None and ctx is None:
             # Fallback is intentionally narrow: call-sites should pass ctx/include_dirs
             # when complete include search context exists.
             print(
                 "  [WARN] Include resolution context unavailable while scanning "
                 f"{itp_path}. Falling back to local directory only."
             )
-            include_dirs = [itp_path.parent]
+        include_dirs = self._derive_include_search_paths(
+            itp_path,
+            include_dirs=include_dirs,
+            ctx=ctx,
+        )
         
         names: List[str] = []
         uncertain = False
@@ -874,11 +935,20 @@ class TopologySanitizerMixin:
         Returns:
             True if signatures differ, False if they match
         """
+        strict_compare = self._strict_moleculetype_conflict_mode(ctx)
         sig1 = self._compute_moleculetype_signature(itp1, mol_name, ctx=ctx)
         sig2 = self._compute_moleculetype_signature(itp2, mol_name, ctx=ctx)
         
         if sig1 is None or sig2 is None:
-            # Could not compute signature - assume different to be safe
+            msg = (
+                f"Unable to compute deterministic signature for same-name moleculetype "
+                f"'{mol_name}' while comparing:\n"
+                f"  - {itp1}\n"
+                f"  - {itp2}"
+            )
+            if strict_compare:
+                raise SanitizerError(msg)
+            print(f"  [WARN][DEGRADED] {msg}. Treating definitions as conflicting.")
             return True
         if sig1 != sig2:
             return True
@@ -893,8 +963,26 @@ class TopologySanitizerMixin:
             itp2, mol_name, ctx=ctx
         )
         if uncertain1 or uncertain2:
-            return False
+            msg = (
+                f"Uncertain same-name moleculetype comparison for '{mol_name}': "
+                "charge extraction encountered preprocessing or ambiguous formatting.\n"
+                f"  - {itp1}\n"
+                f"  - {itp2}"
+            )
+            if strict_compare:
+                raise SanitizerError(msg)
+            print(f"  [WARN][DEGRADED] {msg}. Treating definitions as conflicting.")
+            return True
         if charges1 is None or charges2 is None:
+            msg = (
+                f"Incomplete charge extraction for same-name moleculetype '{mol_name}' "
+                f"while comparing:\n"
+                f"  - {itp1}\n"
+                f"  - {itp2}"
+            )
+            if strict_compare:
+                raise SanitizerError(msg)
+            print(f"  [WARN][DEGRADED] {msg}. Treating definitions as conflicting.")
             return True
         if len(charges1) != len(charges2):
             return True
@@ -902,6 +990,25 @@ class TopologySanitizerMixin:
             if abs(q1 - q2) > charge_tol:
                 return True
         return False
+
+    @staticmethod
+    def _quantize_moleculetype_charge(raw_q: float, quant_step: float) -> float:
+        """
+        Quantize charge deterministically for signature hashing.
+
+        Decimal arithmetic avoids platform-dependent binary midpoint/tie behavior.
+        """
+        if not math.isfinite(raw_q) or not math.isfinite(quant_step) or quant_step <= 0:
+            return raw_q
+        try:
+            step_dec = Decimal(str(quant_step))
+            raw_dec = Decimal(str(raw_q))
+            scaled = raw_dec / step_dec
+            quantized = scaled.to_integral_value(rounding=ROUND_HALF_EVEN) * step_dec
+            value = float(quantized)
+        except (InvalidOperation, OverflowError, ValueError, ZeroDivisionError):
+            return raw_q
+        return 0.0 if value == 0.0 else value
 
     def _molecule_sig_quant_step(self) -> float:
         """Resolve moleculetype charge quantization step from env or default."""
@@ -1043,15 +1150,17 @@ class TopologySanitizerMixin:
         self,
         molecule_itp_paths: Dict[str, Path],
         ctx: Optional["PipelineContext"] = None,
-    ) -> Dict[str, str]:
+    ) -> Tuple[Dict[str, str], Dict[str, Any]]:
         """
         Classify moleculetypes for charge correction protection.
         
-        Hardening v6: Extended to protect solvents AND ions.
+        Hardening v8: Explicitly reports degraded/unknown classifications instead
+        of silently treating uncertain parsing as neutral.
         
         Classification rules (priority order):
         1. Pattern match against PROTECTED_ION_PATTERNS -> "protected_ion"
         2. Pattern match against PROTECTED_SOLVENT_PATTERNS -> "protected_solvent"
+        3. Pattern match against ctx.charge_fix_protect_resnames -> "protected_configured"
         3. n_atoms == 1 and |q| > 0 -> "monatomic_ion"
         4. abs(round(q_total)) >= 1 and close to integer -> "ionic"
         5. Name contains polymer/chain patterns -> "protected_polymer"
@@ -1062,87 +1171,231 @@ class TopologySanitizerMixin:
             ctx: PipelineContext for tolerance
             
         Returns:
-            Dict of molecule_name -> classification
+            Tuple of:
+            - Dict of molecule_name -> classification
+            - Classification audit with degraded/uncertain details
         """
-        from ..charge_neutrality import ChargeParser
-        
+        from ..charge_neutrality import ChargeNeutralityError, ChargeParser
+
         tol = ctx.charge_neutrality_tol if ctx else 1e-6
         classifications: Dict[str, str] = {}
-        
-        for mol_name, itp_path in molecule_itp_paths.items():
-            # Hardening v7: Use boundary-aware pattern matching
-            # Priority 1: Check ion patterns
+        strict_mode = self._strict_charge_fix_mode(ctx)
+        configured_patterns = self._charge_fix_extra_protected_patterns(ctx)
+        classification_audit: Dict[str, Any] = {
+            "configured_protected_patterns": sorted(configured_patterns, key=str.casefold),
+            "details": {},
+            "degraded_molecules": {},
+        }
+
+        def _record(
+            mol_name: str,
+            itp_path: Path,
+            classification: str,
+            *,
+            status: str = "exact",
+            source: str,
+            reason: Optional[str] = None,
+            atom_count: Optional[int] = None,
+            total_charge: Optional[float] = None,
+            has_preprocessor: bool = False,
+            unparsed_atoms_line_count: int = 0,
+        ) -> None:
+            detail = {
+                "classification": classification,
+                "status": status,
+                "source": source,
+                "reason": reason,
+                "itp_path": str(itp_path),
+                "atom_count": atom_count,
+                "total_charge": total_charge,
+                "has_preprocessor": has_preprocessor,
+                "unparsed_atoms_line_count": unparsed_atoms_line_count,
+            }
+            classifications[mol_name] = classification
+            classification_audit["details"][mol_name] = detail
+            if status != "exact":
+                classification_audit["degraded_molecules"][mol_name] = detail
+
+        for mol_name, itp_path in sorted(
+            molecule_itp_paths.items(),
+            key=lambda item: item[0].casefold(),
+        ):
+            looks_polymer = self._is_polymer_like_molecule_name(mol_name)
+
             if _matches_protected_pattern(mol_name, PROTECTED_ION_PATTERNS):
-                classifications[mol_name] = "protected_ion"
+                _record(
+                    mol_name,
+                    itp_path,
+                    "protected_ion",
+                    source="protected_ion_pattern",
+                )
                 continue
-            
-            # Priority 2: Check solvent patterns
+
             if _matches_protected_pattern(mol_name, PROTECTED_SOLVENT_PATTERNS):
-                classifications[mol_name] = "protected_solvent"
+                _record(
+                    mol_name,
+                    itp_path,
+                    "protected_solvent",
+                    source="protected_solvent_pattern",
+                )
                 continue
-            
-            # Priority 3-5: Charge-based classification
+
+            if configured_patterns and _matches_protected_pattern(mol_name, configured_patterns):
+                _record(
+                    mol_name,
+                    itp_path,
+                    "protected_configured",
+                    source="charge_fix_protect_resnames",
+                    reason="Matched user-configured protected residue/molecule pattern.",
+                )
+                continue
+
             try:
-                per_mol = ChargeParser.parse_atoms_charges_per_molecule(itp_path)
-                resolved_mol_name = mol_name if mol_name in per_mol else None
-                if resolved_mol_name is None:
-                    matches = [k for k in per_mol if k.casefold() == mol_name.casefold()]
-                    if len(matches) == 1:
-                        resolved_mol_name = matches[0]
-                    elif len(matches) == 0 and len(per_mol) == 1:
-                        resolved_mol_name = next(iter(per_mol.keys()))
-                if resolved_mol_name is None:
-                    # Check if this looks like a polymer/fragment
-                    name_lower = mol_name.lower()
-                    if any(p in name_lower for p in ('polymer', 'chain', 'frag', 'oligo', 'peo', 'peg')):
-                        classifications[mol_name] = "protected_polymer"
-                        continue
-                    classifications[mol_name] = "unknown"
+                mol_charge = ChargeParser.get_molecule_charge(
+                    itp_path,
+                    name=mol_name,
+                    strict=False,
+                    allow_unparsed_atoms_lines=True,
+                )
+
+                issue_bits: List[str] = []
+                if mol_charge.atom_count <= 0 or not mol_charge.charges:
+                    issue_bits.append("missing or empty [ atoms ] charge data")
+                if mol_charge.has_preprocessor:
+                    issue_bits.append("preprocessor directives in [ atoms ]")
+                if mol_charge.unparsed_atoms_lines:
+                    issue_bits.append(
+                        f"{len(mol_charge.unparsed_atoms_lines)} unparseable [ atoms ] data line(s)"
+                    )
+
+                if issue_bits:
+                    classification = "protected_polymer" if looks_polymer else "unknown"
+                    msg = (
+                        f"Charge-fix classification for active molecule '{mol_name}' is degraded: "
+                        + "; ".join(issue_bits)
+                    )
+                    if strict_mode:
+                        raise SanitizerError(msg)
+                    print(f"  [WARN][DEGRADED] {msg}")
+                    _record(
+                        mol_name,
+                        itp_path,
+                        classification,
+                        status="degraded",
+                        source="charge_parser_degraded",
+                        reason="; ".join(issue_bits),
+                        atom_count=mol_charge.atom_count,
+                        total_charge=mol_charge.total_charge,
+                        has_preprocessor=mol_charge.has_preprocessor,
+                        unparsed_atoms_line_count=len(mol_charge.unparsed_atoms_lines or []),
+                    )
                     continue
-                
-                charges = per_mol[resolved_mol_name][0]
-                n_atoms = len(charges)
-                q_total = sum(charges)
-                
-                # Monatomic ion check
+
+                n_atoms = mol_charge.atom_count
+                q_total = mol_charge.total_charge
+
                 if n_atoms == 1 and abs(q_total) > tol:
-                    classifications[mol_name] = "monatomic_ion"
+                    _record(
+                        mol_name,
+                        itp_path,
+                        "monatomic_ion",
+                        source="charge_parser",
+                        atom_count=n_atoms,
+                        total_charge=q_total,
+                    )
                     continue
-                
-                # Integer charge check
+
                 rounded_q = round(q_total)
                 if abs(rounded_q) >= 1 and abs(q_total - rounded_q) < tol:
-                    classifications[mol_name] = "ionic"
+                    _record(
+                        mol_name,
+                        itp_path,
+                        "ionic",
+                        source="charge_parser",
+                        atom_count=n_atoms,
+                        total_charge=q_total,
+                    )
                     continue
-                
-                # Check for polymer patterns in name
-                name_lower = mol_name.lower()
-                if any(p in name_lower for p in ('polymer', 'chain', 'frag', 'oligo', 'peo', 'peg')):
-                    classifications[mol_name] = "protected_polymer"
+
+                if looks_polymer:
+                    _record(
+                        mol_name,
+                        itp_path,
+                        "protected_polymer",
+                        source="polymer_name_pattern",
+                        atom_count=n_atoms,
+                        total_charge=q_total,
+                    )
                     continue
-                
-                # Default: neutral
-                classifications[mol_name] = "neutral"
-                    
-            except Exception:
-                classifications[mol_name] = "unknown"
+
+                _record(
+                    mol_name,
+                    itp_path,
+                    "neutral",
+                    source="charge_parser",
+                    atom_count=n_atoms,
+                    total_charge=q_total,
+                )
+
+            except ChargeNeutralityError as exc:
+                classification = "protected_polymer" if looks_polymer else "unknown"
+                msg = (
+                    f"Charge-fix classification for active molecule '{mol_name}' is degraded: "
+                    f"{str(exc).splitlines()[0]}"
+                )
+                if strict_mode:
+                    raise SanitizerError(msg)
+                print(f"  [WARN][DEGRADED] {msg}")
+                _record(
+                    mol_name,
+                    itp_path,
+                    classification,
+                    status="degraded",
+                    source="charge_parser_error",
+                    reason=str(exc).splitlines()[0],
+                )
+                continue
+
+            except Exception as exc:
+                classification = "protected_polymer" if looks_polymer else "unknown"
+                msg = (
+                    f"Charge-fix classification for active molecule '{mol_name}' failed unexpectedly: "
+                    f"{exc}"
+                )
+                if strict_mode:
+                    raise SanitizerError(msg)
+                print(f"  [WARN][DEGRADED] {msg}")
+                _record(
+                    mol_name,
+                    itp_path,
+                    classification,
+                    status="degraded",
+                    source="unexpected_error",
+                    reason=str(exc),
+                )
         
         # Log classification summary
         prot_ions = [k for k, v in classifications.items() if v in ("protected_ion", "ionic", "monatomic_ion")]
         prot_solvents = [k for k, v in classifications.items() if v == "protected_solvent"]
+        prot_configured = [k for k, v in classifications.items() if v == "protected_configured"]
         prot_polymers = [k for k, v in classifications.items() if v == "protected_polymer"]
         neutral = [k for k, v in classifications.items() if v == "neutral"]
+        degraded = sorted(classification_audit["degraded_molecules"], key=str.casefold)
         
         if prot_ions:
             print(f"  [CHARGE-FIX] Protected ions: {prot_ions}")
         if prot_solvents:
             print(f"  [CHARGE-FIX] Protected solvents: {prot_solvents}")
+        if prot_configured:
+            print(f"  [CHARGE-FIX] User-protected molecules: {prot_configured}")
         if prot_polymers:
             print(f"  [CHARGE-FIX] Protected polymers: {prot_polymers}")
         if neutral:
             print(f"  [CHARGE-FIX] Correction candidates (neutral): {neutral}")
-        
-        return classifications
+        if degraded:
+            print(f"  [WARN][DEGRADED] Charge-fix classification degraded for: {degraded}")
+
+        return classifications, classification_audit
 
     def _warn_electrolyte_fixed_charge_limitations(
         self,
@@ -1158,7 +1411,13 @@ class TopologySanitizerMixin:
         class_by_casefold = {name.casefold(): cls for name, cls in classifications.items()}
         target_class = class_by_casefold.get(target_cf or "", "unknown")
 
-        protected_classes = {"protected_ion", "ionic", "monatomic_ion", "protected_solvent"}
+        protected_classes = {
+            "protected_ion",
+            "ionic",
+            "monatomic_ion",
+            "protected_solvent",
+            "protected_configured",
+        }
         protected_detected = any(cls in protected_classes for cls in classifications.values())
         correction_refused = bool(getattr(correction_result, "correction_refused", False))
         forced_polymer_target = bool(
@@ -1215,6 +1474,7 @@ class TopologySanitizerMixin:
         correction_result,
         classifications: Dict[str, str],
         ctx: "PipelineContext",
+        classification_audit: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Verify that charge correction obeys protected-species policy.
@@ -1230,11 +1490,32 @@ class TopologySanitizerMixin:
         target_allowlist = self._parse_csv_casefold_set(ctx.charge_fix_target_allowlist)
         strict_mode = bool(getattr(ctx, "strict_charge_neutrality", False))
         polymer_mode_cfg = str(getattr(ctx, "charge_fix_polymer_method", "skip_if_small"))
+        classification_details = (
+            classification_audit.get("details", {})
+            if isinstance(classification_audit, dict)
+            else {}
+        )
+        detail_by_casefold = {
+            name.casefold(): detail
+            for name, detail in classification_details.items()
+        }
+        degraded_molecules = {
+            name: detail
+            for name, detail in classification_details.items()
+            if str(detail.get("status", "exact")) != "exact"
+        }
         
         target_mol = correction_result.target_molecule
         target_mol_cf = target_mol.casefold() if target_mol else None
         class_by_casefold = {name.casefold(): cls for name, cls in classifications.items()}
         target_classification = class_by_casefold.get(target_mol_cf or "", "unknown")
+        target_detail = detail_by_casefold.get(target_mol_cf or "", {})
+        target_classification_status = str(
+            target_detail.get(
+                "status",
+                "degraded" if target_classification == "unknown" else "exact",
+            )
+        )
         target_from_allowlist = bool(
             target_allowlist and target_mol_cf and target_mol_cf in target_allowlist
         )
@@ -1248,6 +1529,7 @@ class TopologySanitizerMixin:
                 "monatomic_ion",
                 "protected_solvent",
                 "protected_polymer",
+                "protected_configured",
             }
         }
 
@@ -1261,6 +1543,10 @@ class TopologySanitizerMixin:
                 False,
                 "--charge-fix-target-allowlist + --charge-fix-polymer-method spread_safe",
             ),  # Never auto-allow
+            "protected_configured": (
+                False,
+                "--charge-fix-target-allowlist",
+            ),
         }
 
         if strict_mode and protected_molecules and target_allowlist is None:
@@ -1295,6 +1581,18 @@ class TopologySanitizerMixin:
                         f"(classification={classification}). "
                         f"Use {flag_hint} to allow, or add to --charge-fix-target-allowlist."
                     )
+            if (
+                not target_from_allowlist
+                and (
+                    classification == "unknown"
+                    or target_classification_status != "exact"
+                )
+            ):
+                violations.append(
+                    f"Charge correction targeted '{target_mol}' with {target_classification_status} "
+                    f"classification (classification={classification}). "
+                    "Use --charge-fix-target-allowlist only when you explicitly accept this degraded target."
+                )
 
         polymer_outcome = "not_applicable"
         effective_method = str(getattr(correction_result, "effective_method", "") or "")
@@ -1347,7 +1645,10 @@ class TopologySanitizerMixin:
         audit: Dict[str, Any] = {
             "target_molecule": target_mol,
             "target_classification": target_classification,
+            "target_classification_status": target_classification_status,
             "all_classifications": classifications,
+            "classification_audit": classification_audit,
+            "degraded_molecules": degraded_molecules,
             "protected_molecules": protected_molecules,
             "strict_mode_enforced": strict_mode,
             "explicit_allowlist_provided": target_allowlist is not None,
@@ -1496,7 +1797,7 @@ class TopologySanitizerMixin:
                     qmax = raw_q if qmax is None else max(qmax, raw_q)
                     sum_abs_q += abs(raw_q)
                     sum_q2 += raw_q * raw_q
-                    quant_q = round(raw_q / quant_step) * quant_step
+                    quant_q = self._quantize_moleculetype_charge(raw_q, quant_step)
                     canonical = f"{parts[1]}|{parts[4]}|{quant_q:+.10f}\n"
                     hasher.update(canonical.encode("utf-8"))
         

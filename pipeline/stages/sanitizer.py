@@ -83,6 +83,8 @@ def _matches_protected_pattern(name: str, patterns: frozenset) -> bool:
             if normalized == pat_upper:
                 return True
         else:
+            if normalized == pat_upper:
+                return True
             # Longer patterns: allow substring but check boundaries on ORIGINAL string.
             # Using the raw string preserves separators so boundary detection is reliable.
             boundary_re = rf"(?<![A-Z0-9]){_re.escape(pat_upper)}(?![A-Z0-9])"

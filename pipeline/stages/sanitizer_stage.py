@@ -605,7 +605,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 )
             
             # Hardening v5 - Issue G: Pre-classify ionic moleculetypes
-            ion_classifications = self._classify_ionic_moleculetypes(
+            ion_classifications, ion_classification_audit = self._classify_ionic_moleculetypes(
                 sanitized_molecule_itp_paths, ctx
             )
             protected_classes = {
@@ -614,10 +614,16 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 "monatomic_ion",
                 "protected_solvent",
                 "protected_polymer",
+                "protected_configured",
             }
             protected_detected = any(
                 cls in protected_classes for cls in ion_classifications.values()
             )
+            if ctx.manifest:
+                ctx.manifest.set_sanitizer_output(
+                    "charge_classification",
+                    ion_classification_audit,
+                )
 
             # Optional explicit correction target(s) from CLI. Checker supports one target;
             # we resolve deterministically and fail-fast on ambiguous strict requests.
@@ -758,6 +764,7 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                         "max_dipole_shift_debye": dipole_limit,
                     },
                     "strict_mode_enforced": bool(ctx.strict_charge_neutrality),
+                    "classification_audit": ion_classification_audit,
                 }
                 electrolyte_warning = self._warn_electrolyte_fixed_charge_limitations(
                     correction_result=correction_result,
@@ -864,7 +871,10 @@ class SanitizerStage(TopologySanitizerMixin, SpatialCheckerMixin, BaseStage):
                 
                 # Hardening v5 - Issue G: Post-correction ion protection check
                 protection_audit = self._verify_ion_protection(
-                    correction_result, ion_classifications, ctx
+                    correction_result,
+                    ion_classifications,
+                    ctx,
+                    classification_audit=ion_classification_audit,
                 )
                 violations = protection_audit.get("violations", [])
                 charge_summary["target_policy"] = protection_audit

@@ -57,7 +57,20 @@ def test_pattern_matching():
     assert _matches_protected_pattern('CL', frozenset({'CL'})) == True, 'CL exact match should work'
     assert _matches_protected_pattern('CHLORIDE', frozenset({'CL'})) == False, 'CL should NOT match CHLORIDE'
     print("  [OK] Ion patterns require exact match")
-    
+
+    # Requested protected-pattern edge cases
+    assert _matches_protected_pattern('LI', frozenset({'LI'})) == True, 'LI exact match should work'
+    assert _matches_protected_pattern('LI+', frozenset({'LI'})) == True, 'LI+ should normalize to LI'
+    assert _matches_protected_pattern('TFSI', frozenset({'TFSI'})) == True, 'TFSI exact match should work'
+    assert _matches_protected_pattern('TFSI-', frozenset({'TFSI'})) == True, 'TFSI- should match TFSI boundary'
+    assert _matches_protected_pattern('TFSI_1', frozenset({'TFSI'})) == True, 'TFSI_1 should match TFSI boundary'
+    assert _matches_protected_pattern('TFSI-alpha', frozenset({'TFSI'})) == True, 'TFSI-alpha should match TFSI boundary'
+    assert _matches_protected_pattern('G4_ALT', frozenset({'G4_ALT'})) == True, 'Exact long pattern should survive separator normalization'
+    assert _matches_protected_pattern('PEG4', frozenset({'PC'})) == False, 'PC should NOT match PEG4'
+    assert _matches_protected_pattern('POLYMER_CHAIN', frozenset({'PC'})) == False, 'PC should NOT match POLYMER_CHAIN'
+    assert _matches_protected_pattern('LIPID_GPC', frozenset({'PC'})) == False, 'PC should NOT match LIPID_GPC'
+    print("  [OK] Edge-case protected-pattern matching stays tight")
+
     # Underscore/dash normalized patterns
     assert _matches_protected_pattern('P_C', frozenset({'PC'})) == True, 'P_C should match PC after normalization'
     assert _matches_protected_pattern('P-C', frozenset({'PC'})) == True, 'P-C should match PC after normalization'
