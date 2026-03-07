@@ -261,6 +261,48 @@ def _install_common_stage_stubs(monkeypatch):
     return calls
 
 
+def _install_completion_order_probe(monkeypatch, stage_dir: Path, run_root: Path):
+    order = []
+    done_sentinel = stage_dir / "done.ok"
+
+    original_write_stage_state = gromacs._write_stage_state
+    original_write_repro_json = gromacs._write_repro_json
+    original_write_run_report = gromacs._write_run_report
+    path_type = type(done_sentinel)
+    original_write_text = path_type.write_text
+
+    def wrapped_write_stage_state(path, data, ctx):
+        result = original_write_stage_state(path, data, ctx)
+        if Path(path) == stage_dir / "stage_state.json":
+            order.append("stage_state.json")
+        return result
+
+    def wrapped_write_repro_json(ctx, current_stage_dir, data):
+        result = original_write_repro_json(ctx, current_stage_dir, data)
+        if Path(current_stage_dir) == stage_dir:
+            order.append("repro.json")
+        return result
+
+    def wrapped_write_run_report(ctx):
+        result = original_write_run_report(ctx)
+        order.append("run_report.json")
+        return result
+
+    def wrapped_write_text(self, data, *args, **kwargs):
+        if self == done_sentinel:
+            assert (stage_dir / "stage_state.json").exists()
+            assert (stage_dir / "repro.json").exists()
+            assert (run_root / "run_report.json").exists()
+            order.append("done.ok")
+        return original_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(gromacs, "_write_stage_state", wrapped_write_stage_state)
+    monkeypatch.setattr(gromacs, "_write_repro_json", wrapped_write_repro_json)
+    monkeypatch.setattr(gromacs, "_write_run_report", wrapped_write_run_report)
+    monkeypatch.setattr(path_type, "write_text", wrapped_write_text)
+    return order
+
+
 def _build_md_state_for_resume(ctx: FakeContext, monkeypatch, *, velocity_mode=None):
     _install_common_stage_stubs(monkeypatch)
     output_dir = ctx.ensure_output_dir("03_gromacs", "md")
@@ -301,6 +343,11 @@ def test_gmx_em_run_writes_done_ok_after_success(tmp_path, monkeypatch):
     _write_gro(gro_path)
     _write_topology(top_path)
     monkeypatch.setattr(gromacs, "verify_staged_inputs", lambda ctx: (gro_path, top_path))
+    order = _install_completion_order_probe(
+        monkeypatch,
+        ctx.get_output_path("03_gromacs", "em"),
+        ctx.get_output_path(),
+    )
 
     stage = GmxEmStage()
     assert stage.run(ctx) is True
@@ -310,6 +357,8 @@ def test_gmx_em_run_writes_done_ok_after_success(tmp_path, monkeypatch):
     assert (output_dir / "stage_state.json").exists()
     assert (output_dir / "repro.json").exists()
     assert (output_dir / "done.ok").exists()
+    assert order[-1] == "done.ok"
+    assert "run_report.json" in order
 
 
 def test_gmx_em_skips_only_when_done_ok_exists(tmp_path, monkeypatch):
@@ -321,6 +370,26 @@ def test_gmx_em_skips_only_when_done_ok_exists(tmp_path, monkeypatch):
 
     stage = GmxEmStage()
     assert stage.run(ctx) is True
+
+
+def test_gmx_em_existing_outputs_without_done_ok_do_not_skip(tmp_path, monkeypatch):
+    ctx = FakeContext(tmp_path)
+    output_dir = ctx.ensure_output_dir("03_gromacs", "em")
+    _write_valid_done_state(output_dir, "em", "em")
+    (output_dir / "done.ok").unlink()
+
+    calls = _install_common_stage_stubs(monkeypatch)
+    gro_path = ctx.get_input_path("systems", ctx.system_id, "gromacs", "gro", "system.gro")
+    top_path = ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")
+    _write_gro(gro_path)
+    _write_topology(top_path)
+    monkeypatch.setattr(gromacs, "verify_staged_inputs", lambda ctx: (gro_path, top_path))
+
+    stage = GmxEmStage()
+    assert stage.run(ctx) is True
+
+    assert calls
+    assert (output_dir / "done.ok").exists()
 
 
 def test_gmx_prod_fresh_run_writes_done_ok_after_success(tmp_path, monkeypatch):
@@ -335,6 +404,11 @@ def test_gmx_prod_fresh_run_writes_done_ok_after_success(tmp_path, monkeypatch):
     top_path = ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")
     _write_topology(top_path)
     monkeypatch.setattr(gromacs, "verify_staged_inputs", lambda ctx: (npt_gro, top_path))
+    order = _install_completion_order_probe(
+        monkeypatch,
+        ctx.get_output_path("03_gromacs", "md"),
+        ctx.get_output_path(),
+    )
 
     stage = GmxProdStage()
     assert stage.run(ctx) is True
@@ -343,18 +417,27 @@ def test_gmx_prod_fresh_run_writes_done_ok_after_success(tmp_path, monkeypatch):
     assert (output_dir / "stage_state.json").exists()
     assert (output_dir / "repro.json").exists()
     assert (output_dir / "done.ok").exists()
+    assert order[-1] == "done.ok"
+    assert "run_report.json" in order
 
 
 def test_gmx_prod_resume_run_writes_done_ok_when_resume_matches(tmp_path, monkeypatch):
     ctx = FakeContext(tmp_path)
     _build_md_state_for_resume(ctx, monkeypatch, velocity_mode=None)
     monkeypatch.setattr(gromacs, "verify_staged_inputs", lambda ctx: (None, ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")))
+    order = _install_completion_order_probe(
+        monkeypatch,
+        ctx.get_output_path("03_gromacs", "md"),
+        ctx.get_output_path(),
+    )
 
     stage = GmxProdStage()
     assert stage.run(ctx) is True
 
     output_dir = ctx.get_output_path("03_gromacs", "md")
     assert (output_dir / "done.ok").exists()
+    assert order[-1] == "done.ok"
+    assert "run_report.json" in order
 
 
 def test_gmx_prod_same_stage_resume_keeps_velocity_mode_in_fingerprint(tmp_path, monkeypatch):
@@ -368,6 +451,30 @@ def test_gmx_prod_same_stage_resume_keeps_velocity_mode_in_fingerprint(tmp_path,
     state = json.loads((output_dir / "stage_state.json").read_text(encoding="utf-8"))
     assert state["velocity_mode"] == "checkpoint"
     assert state["fingerprint_payload"]["velocity_mode"] == "checkpoint"
+
+
+def test_gmx_prod_resume_denies_when_new_fingerprint_drops_recorded_key(tmp_path, monkeypatch, capsys):
+    ctx = FakeContext(tmp_path)
+    output_dir, _, _, _ = _build_md_state_for_resume(ctx, monkeypatch, velocity_mode="checkpoint")
+    monkeypatch.setattr(gromacs, "verify_staged_inputs", lambda ctx: (None, ctx.get_input_path("systems", ctx.system_id, "gromacs", "top", "system.top")))
+
+    original_build_stage_state = gromacs._build_stage_state
+
+    def drop_velocity_mode(*args, **kwargs):
+        state = original_build_stage_state(*args, **kwargs)
+        state["fingerprint_payload"].pop("velocity_mode", None)
+        state["resume_gate_payload"].pop("velocity_mode", None)
+        return state
+
+    monkeypatch.setattr(gromacs, "_build_stage_state", drop_velocity_mode)
+
+    stage = GmxProdStage()
+    assert stage.run(ctx) is False
+
+    captured = capsys.readouterr()
+    assert "Resume denied" in captured.out
+    assert "velocity_mode" in captured.out
+    assert not (output_dir / "done.ok").exists()
 
 
 def test_gmx_eq_npt_mutually_exclusive_restart_flags_fail_cleanly(tmp_path, monkeypatch, capsys):

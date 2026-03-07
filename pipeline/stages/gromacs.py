@@ -3332,20 +3332,16 @@ class GmxProdStage(BaseStage):
                 new_gate_payload,
                 ignore_runtime,
             )
-            compare_keys = sorted(set(old_for_compare.keys()) & set(new_for_compare.keys()))
             schema_only_old = sorted(set(old_for_compare.keys()) - set(new_for_compare.keys()))
             schema_only_new = sorted(set(new_for_compare.keys()) - set(old_for_compare.keys()))
             if schema_only_old or schema_only_new:
-                print(
-                    "  [WARN] Resume fingerprint schema differs between recorded and current payload; "
-                    "comparing common keys only."
-                )
+                print("  [ERROR] Resume denied: fingerprint schema mismatch.")
                 if schema_only_old:
                     print("    - Keys only in recorded payload: " + ", ".join(schema_only_old))
                 if schema_only_new:
                     print("    - Keys only in current payload: " + ", ".join(schema_only_new))
-            old_for_compare = {k: old_for_compare[k] for k in compare_keys}
-            new_for_compare = {k: new_for_compare[k] for k in compare_keys}
+                print("  Use --force to restart cleanly.")
+                return False
             runtime_only_diffs = []
             if ignore_runtime:
                 runtime_only_diffs = [
