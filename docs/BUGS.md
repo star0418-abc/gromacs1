@@ -63,6 +63,7 @@ Select-String -Path .ai/bugs.jsonl -Pattern '"tags":.*"parser"'
 - If strict mode would reject malformed or ambiguous parser input, fail before patching rather than preserving a silently reinterpreted template.
 - Treat malformed `.ndx` group-body tokens as unsafe input when thermostat auto decisions depend on group sizes; never silently undercount atoms and continue.
 - Sanitize non-finite or boundary safety thresholds in one helper before auto/fallback decisions so invalid config cannot create mode-dependent behavior.
+- When validation helpers stage diagnostics in a local sink, flush that sink before every early return triggered by missing dependent values; incomplete input must not suppress earlier warnings.
 - Add paired tests for strict and tolerant paths using the same raw input.
 - Search tags: `parser`, `strictness`, `normalization`, `semantics`, `mdp`, `itp`.
 - Promote a fix into this section when one input can be interpreted differently across parsers or strictness modes.
