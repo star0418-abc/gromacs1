@@ -2,6 +2,13 @@
 
 Before making any changes, read **all** files under `AGENT_SKILLS/` in numeric order.
 
+## Bug Knowledge (mandatory for bug fixes)
+- Before editing a bug fix, read `docs/BUGS.md`.
+- Before editing a bug fix, scan `.ai/bugs.jsonl` for the same file path, function or section, tags, and root-cause pattern.
+- After a bug fix is verified, append a new record to `.ai/bugs.jsonl`.
+- Update `docs/BUGS.md` when the fix exposes a recurring pattern or reusable prevention rule.
+- If this repository is under Git, commit the fix and record the relevant commit hash in the bug record.
+
 ## Non-negotiable rules (summary)
 1) **Read inputs only from `IN/`.**
 2) **Write all GROMACS runtime outputs only to `OUT_GMX/<RUN_ID>/`.**

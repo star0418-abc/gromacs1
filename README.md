@@ -8,6 +8,7 @@ Automated pipeline for molecular dynamics simulations of gel polymer electrolyte
 
 - 馃敀 **Strict path isolation**: Inputs from `IN/` only, outputs to `OUT_GMX/` only
 - 馃摝 **Manifest tracking**: Full reproducibility with SHA256 hashes and command logs
+- 馃搱 **Bug knowledge system**: Append-only `.ai/bugs.jsonl` ledger plus `docs/BUGS.md` recurring-pattern guide
 - 鈴革笍 **Resume support**: Sentinel-based stage completion tracking with checkpoint resume
 - 馃敡 **Modular stages**: Easy to extend and customize
 - 馃И **Composition model**: wt% 鈫?integer molecule count conversion with auto-scaling
@@ -24,6 +25,12 @@ Automated pipeline for molecular dynamics simulations of gel polymer electrolyte
 - 馃И **Quality Gates (Dispatcher)**: pipeline success can include thermodynamic sanity checks (temperature/pressure/density) with `off|warn|error` policy
 - 馃К **Extended Provenance**: raw tool probes with parsed GROMACS build features, runtime/platform details, git code state, and resolved executable/token metadata
 - 馃И **Audit Artifacts**: per-stage `repro.json`, dispatcher `run_report.json`, standalone `provenance.txt`, and SI-ready `computational_details.md`
+
+## Bug Knowledge Workflow
+
+Before starting any bug fix, read [`docs/BUGS.md`](docs/BUGS.md) and scan [`.ai/bugs.jsonl`](.ai/bugs.jsonl) for the same file path, function or section, tags, and root-cause pattern. The ledger is append-only and machine-readable; [`.ai/bug_schema.md`](.ai/bug_schema.md) defines the record format and example entries.
+
+After a bug fix is verified, record it by appending one new JSON object to `.ai/bugs.jsonl`, update `docs/BUGS.md` if the fix establishes a reusable rule, and update the relevant README section when behavior or workflow changed. In Git workflows, commit the fix first so the bug record can reference the real commit hash.
 
 ## Quick Start
 
@@ -69,6 +76,11 @@ python tools/export_computational_details.py --run-root OUT_GMX/<RUN_ID> \
 ```
 
 ## Directory Layout
+
+Persistent bug knowledge lives outside runtime data:
+- `.ai/bugs.jsonl` is the canonical append-only structured bug ledger.
+- `.ai/bug_schema.md` defines the bug-record schema and worked examples.
+- `docs/BUGS.md` summarizes recurring failure patterns and the pre-fix/post-fix workflow.
 
 ```
 project/
