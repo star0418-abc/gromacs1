@@ -794,10 +794,13 @@ Solvents, ions, and protected polymers are guarded against accidental charge cor
 - **Non-repairable partial state**: if `md.tpr` exists but `md.cpt` is missing, continuation is blocked with actionable guidance (restore `md.cpt` or start fresh with `--force`).
 - **No destructive 鈥渞epair鈥?*: resume-repair never archives/deletes prior outputs.
 - **Resume state refresh**: after successful production resume, `stage_state.json` is rewritten so subsequent resumes stay consistent with latest checkpoint/audit state.
+- **Resume state preserves restart semantics**: same-stage production resume reuses the recorded `velocity_mode` during compatibility checks and state refresh, so the first normal resume does not fail on self-inflicted fingerprint drift.
 - **`done.ok` is a final marker**: GROMACS stage sentinels are only written after required outputs and metadata are persisted.
+- **Direct stage runs and dispatcher runs match**: `gmx_em`, `gmx_eq` substages, and `gmx_prod` each write their own final `done.ok` after `stage_state.json`/`repro.json` are durable, so resume/skip logic stays deterministic even when stages are exercised directly in tests or tooling.
 - **No unsafe implicit restart**: missing `nvt.cpt` or `npt.cpt` is a hard error unless an explicit recovery path is selected, or non-strict auto-fallback can validate `.gro` velocities.
 - **Velocity reset is explicit**: when `--allow-velocity-reset` is used, the MDP is forced to `continuation=no`, `gen_vel=yes`, and `gen_temp` is set (from `--temperature` or template/ref_t).
 - **Velocity reset MDP validation is strict**: for both NPT and production MD velocity-reset paths, final patched MDP must still contain `continuation=no`, `gen_vel=yes`, and matching `gen_temp`.
+- **Programmatic restart-policy errors stay stage-scoped**: if mutually exclusive recovery flags reach the stage layer (for example via tests or direct API use), NPT/production report a normal stage failure with the clear restart-policy message instead of throwing an uncaught exception.
 - **POSRES detection is robust**: POSRES is detected from any `define` token containing `POSRES` (e.g., `-DPOSRES_HEAVY`, `-DPOSRES_FC=1000`, `-D POSRES_LIGAND`, quoted values).
 - **POSRES reference is explicit or sticky-pinned**: if an MDP enables POSRES, `grompp` always receives `-r`. Use `--posres-reference` in strict mode; with `--no-strict-posres-reference`, the first encountered structure is pinned to `OUT_GMX/<RUN_ID>/03_gromacs/_shared/posres_reference.gro` and reused across stages/resume.
 - **Restart strictness is decoupled**: checkpoint/restart strictness can be controlled with `--strict-restart-policy`. If unset, restart strictness inherits `--strict-mdp-validation` for backward compatibility.
@@ -818,6 +821,7 @@ Dispatcher QC gates add lightweight sanity checks on machine-readable stage metr
   - warn/error if `rel_err > --qc-density-rel-tol`
 - **Temperature sanity**: warn/error if average is NaN or outside `[50 K, 1000 K]`
 - **Pressure sanity**: warn/error if average is NaN or `|P| > 5000 bar`
+- **NPT tail-window metrics are diagnostic-only**: `gmx_eq` writes `window_ps_configured`, `last_window_ps`, and `window_semantics=diagnostic_tail_window` in `stage_metrics.json`. The default remains `20 ps`, but the output now states explicitly that this is a short tail-window diagnostic, not a proof of full equilibration.
 
 Policy controls:
 - `--qc-policy {off,warn,error}`  
@@ -832,7 +836,7 @@ All-mode review points:
 
 ## Audit Artifacts & SI Exporter
 
-- **Per-stage**: `OUT_GMX/<RUN_ID>/03_gromacs/<stage>/repro.json` with hashes, commands, host/git/GROMACS provenance (launcher vs binary: `gmx_launcher_token`, `gmx_binary_token`, resolved paths, and version).
+- **Per-stage**: `OUT_GMX/<RUN_ID>/03_gromacs/<stage>/repro.json` with hashes, commands, host/git/GROMACS provenance. Wrapped launches record launcher and binary distinctly: `gmx_launcher_token`/`gmx_launcher_resolved` for the wrapper (for example `mpirun`) and `gmx_cmd_used`/`gmx_bin_resolved`/`gmx_binary_token`/`gmx_binary_resolved` for the actual GROMACS executable.
 - **Run-level (dispatcher-owned)**: `OUT_GMX/<RUN_ID>/run_report.json` is always written, including on stage failure/interruption. It includes:
   - run identity + selected stage/resume/force
   - deterministic `stages_to_run`
@@ -1895,7 +1899,8 @@ For advanced workflows restarting from a `.gro` with embedded velocities (no che
 > [!IMPORTANT]
 > **GRO Velocity Validation**: When using `--allow-gro-velocity-restart`, the pipeline now validates
 > multiple sampled atom lines across the `.gro` atom block and requires parseable coordinate/velocity columns.
-> If velocities are missing, it fails immediately with a clear error instead of silently starting near 0K.
+> Syntactically present but numerically all-zero velocities are treated as missing restart velocities.
+> If reusable velocities are missing, it fails immediately with a clear error instead of silently starting near 0K.
 
 If `.gro` velocity status is known missing, this is a hard error even in non-strict mode:
 - thermostat startup can inject large energy

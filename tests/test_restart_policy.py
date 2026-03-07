@@ -60,6 +60,22 @@ def create_gro_file(with_velocities: bool) -> Path:
     return Path(path)
 
 
+def create_gro_file_with_velocity_values(velocity_triplets) -> Path:
+    """Create a temporary GRO file with explicit numeric velocity triplets."""
+    fd, path = tempfile.mkstemp(suffix=".gro")
+    with open(path, "w") as f:
+        f.write("Test GRO file\n")
+        f.write(f"{len(velocity_triplets)}\n")
+        for atom_idx, (vx, vy, vz) in enumerate(velocity_triplets, start=1):
+            f.write(
+                f"{1:5d}{'MOL':<5}{f'A{atom_idx}':>5}{atom_idx:5d}"
+                f"{0.100 * (atom_idx - 1):8.3f}{0.100 * (atom_idx - 1):8.3f}{0.100 * (atom_idx - 1):8.3f}"
+                f"{vx:8.4f}{vy:8.4f}{vz:8.4f}\n"
+            )
+        f.write("   1.00000   1.00000   1.00000\n")
+    return Path(path)
+
+
 def create_cpt_file() -> Path:
     """Create a dummy checkpoint file."""
     fd, path = tempfile.mkstemp(suffix=".cpt")
@@ -101,6 +117,22 @@ class TestGROVelocityDetection:
     def test_nonexistent_file(self):
         """Non-existent file should return None (unreadable)."""
         assert _gro_has_velocities(Path("/nonexistent/file.gro")) is None
+
+    def test_gro_with_all_zero_velocities_is_rejected(self):
+        """Syntactically present but numerically zero velocities must not count as restartable."""
+        gro = create_gro_file_with_velocity_values([(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)])
+        try:
+            assert _gro_has_velocities(gro) == False
+        finally:
+            gro.unlink()
+
+    def test_gro_with_tiny_near_zero_velocities_is_rejected(self):
+        """Near-zero numeric noise should not be accepted as meaningful restart velocities."""
+        gro = create_gro_file_with_velocity_values([(1e-8, -1e-8, 1e-8), (0.0, 0.0, 0.0)])
+        try:
+            assert _gro_has_velocities(gro) == False
+        finally:
+            gro.unlink()
 
 
 class TestRestartPolicy:
@@ -265,6 +297,26 @@ class TestRestartPolicy:
             gro_missing_vel.unlink()
             gro_with_vel.unlink()
 
+    def test_h_gro_restart_rejects_all_zero_velocities(self):
+        """Explicit GRO restart must fail when velocities are present but numerically all zero."""
+        cpt = Path("/nonexistent.cpt")
+        gro = create_gro_file_with_velocity_values([(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)])
+        try:
+            cpt_available, _, velocity_mode, warnings, meta = decide_prev_state_policy(
+                stage_name="test",
+                prev_cpt_path=cpt,
+                strict_mode=True,
+                allow_velocity_reset=False,
+                allow_gro_velocity_restart=True,
+                prev_gro_path=gro,
+            )
+            assert cpt_available is False
+            assert velocity_mode == "error"
+            assert "lacks velocities" in warnings[0]
+            assert meta["gro_velocity_validation_outcome"] == "missing_velocities"
+        finally:
+            gro.unlink()
+
 
 def run_tests():
     """Run all tests."""
@@ -273,7 +325,13 @@ def run_tests():
     
     print("=== GRO Velocity Detection Tests ===")
     t = TestGROVelocityDetection()
-    for name in ["test_gro_with_velocities", "test_gro_without_velocities", "test_nonexistent_file"]:
+    for name in [
+        "test_gro_with_velocities",
+        "test_gro_without_velocities",
+        "test_nonexistent_file",
+        "test_gro_with_all_zero_velocities_is_rejected",
+        "test_gro_with_tiny_near_zero_velocities_is_rejected",
+    ]:
         try:
             getattr(t, name)()
             print(f"  PASS: {name}")
@@ -287,7 +345,8 @@ def run_tests():
     for name in ["test_a_checkpoint_exists", "test_b_no_cpt_both_false_strict",
                  "test_c_no_cpt_velocity_reset", "test_d_no_cpt_gro_restart_with_velocities",
                  "test_e_mutual_exclusivity", "test_f_gro_restart_without_velocities",
-                 "test_g_no_cpt_non_strict_no_flags_requires_validation"]:
+                 "test_g_no_cpt_non_strict_no_flags_requires_validation",
+                 "test_h_gro_restart_rejects_all_zero_velocities"]:
         try:
             getattr(t2, name)()
             print(f"  PASS: {name}")

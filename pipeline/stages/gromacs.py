@@ -53,7 +53,7 @@ from ..gromacs_cmd import resolve_gmx_command
 
 def _gro_has_velocities(gro_path: Path) -> Optional[bool]:
     """
-    Check if a GRO file robustly carries parseable velocities.
+    Check if a GRO file robustly carries parseable, materially non-zero velocities.
 
     The check validates multiple atom lines (up to 8 evenly sampled lines across the
     atom block) to avoid optimistic single-line classification. Returns `None` for
@@ -88,6 +88,8 @@ def _gro_has_velocities(gro_path: Path) -> Optional[bool]:
                 }
 
             sampled = 0
+            has_nonzero_velocity = False
+            velocity_nonzero_tol = 1e-6
             for atom_idx in range(1, atom_count + 1):
                 atom_line = fh.readline()
                 if atom_line == "":
@@ -108,11 +110,17 @@ def _gro_has_velocities(gro_path: Path) -> Optional[bool]:
                 if len(line) < 68:
                     return False
                 try:
-                    float(line[44:52])
-                    float(line[52:60])
-                    float(line[60:68])
+                    vx = float(line[44:52])
+                    vy = float(line[52:60])
+                    vz = float(line[60:68])
                 except ValueError:
                     return False
+                if (
+                    abs(vx) > velocity_nonzero_tol
+                    or abs(vy) > velocity_nonzero_tol
+                    or abs(vz) > velocity_nonzero_tol
+                ):
+                    has_nonzero_velocity = True
 
             if sampled != len(sample_indices):
                 return None
@@ -120,7 +128,7 @@ def _gro_has_velocities(gro_path: Path) -> Optional[bool]:
             # Box line must exist for a structurally valid GRO.
             if fh.readline() == "":
                 return None
-            return True
+            return has_nonzero_velocity
     except OSError:
         return None
     except Exception:
@@ -867,13 +875,16 @@ def _resolve_gmx_cmd_used(
     grompp_cmd: Any = None,
     mdrun_cmd_base: Any = None,
 ) -> Optional[str]:
-    """Resolve launcher/front-end token used by stage commands (legacy field)."""
+    """Resolve the actual gmx/gmx_mpi executable token used by stage commands."""
     tokens = _resolve_gmx_command_tokens(
         ctx=ctx,
         grompp_cmd=grompp_cmd,
         mdrun_cmd_base=mdrun_cmd_base,
     )
     if tokens:
+        gmx_binary_token = _extract_gromacs_binary_token(tokens)
+        if gmx_binary_token:
+            return gmx_binary_token
         return tokens[0]
     return resolve_gmx_command(ctx) if ctx is not None else "gmx"
 
@@ -919,13 +930,14 @@ def _get_gromacs_provenance(
         mdrun_cmd_base=mdrun_cmd_base,
     )
     gmx_binary_token = _extract_gromacs_binary_token(command_tokens) or gmx_cmd_used
+    launcher_resolved = shutil.which(launcher_token) if launcher_token else None
     gmx_bin_resolved = shutil.which(gmx_cmd_used) if gmx_cmd_used else None
     gmx_binary_resolved = shutil.which(gmx_binary_token) if gmx_binary_token else None
     gmx_version = _get_gromacs_version(gmx_binary_token)
     return {
         "gmx_command_tokens": command_tokens,
         "gmx_launcher_token": launcher_token,
-        "gmx_launcher_resolved": gmx_bin_resolved,
+        "gmx_launcher_resolved": launcher_resolved,
         "gmx_cmd_used": gmx_cmd_used,
         "gmx_bin_resolved": gmx_bin_resolved,
         "gmx_binary_token": gmx_binary_token,
@@ -2114,6 +2126,14 @@ def _write_gmx_eq_metrics(ctx: "PipelineContext", npt_dir: Path) -> Optional[Pat
         window_ps = 20.0
 
     metrics = _build_gmx_eq_metrics(ctx, npt_dir, window_ps=window_ps)
+    metrics.setdefault("window_ps_configured", float(window_ps))
+    metrics.setdefault("window_semantics", "diagnostic_tail_window")
+    notes = metrics.get("notes")
+    if not isinstance(notes, list):
+        notes = []
+    if "diagnostic_tail_window" not in notes:
+        notes.append("diagnostic_tail_window")
+    metrics["notes"] = notes
     primary_path = npt_dir / "stage_metrics.json"
     _atomic_write_json(primary_path, metrics, sort_keys=True)
 
@@ -2607,6 +2627,8 @@ class GmxEmStage(BaseStage):
 
         _write_repro_json(ctx, output_dir, repro)
         _write_run_report(ctx)
+        if not ctx.dry_run:
+            done_sentinel.write_text("Energy minimization complete\n")
         
         print(f"  [OK] Energy minimization complete")
         return True
@@ -2873,16 +2895,20 @@ class GmxEqStage(BaseStage):
         template_dir = ctx.get_input_path("systems", ctx.system_id, "gromacs", "mdp")
         template_path = template_dir / "npt.mdp"
         
-        cpt_available, extra_overrides, velocity_mode, policy_warnings, policy_metadata = decide_prev_state_policy(
-            stage_name="npt",
-            prev_cpt_path=nvt_cpt,
-            strict_mode=_is_restart_policy_strict(ctx),
-            allow_velocity_reset=ctx.allow_velocity_reset,
-            allow_gro_velocity_restart=getattr(ctx, "allow_gro_velocity_restart", False),
-            template_mdp_path=template_path,
-            ctx=ctx,
-            prev_gro_path=nvt_gro,
-        )
+        try:
+            cpt_available, extra_overrides, velocity_mode, policy_warnings, policy_metadata = decide_prev_state_policy(
+                stage_name="npt",
+                prev_cpt_path=nvt_cpt,
+                strict_mode=_is_restart_policy_strict(ctx),
+                allow_velocity_reset=ctx.allow_velocity_reset,
+                allow_gro_velocity_restart=getattr(ctx, "allow_gro_velocity_restart", False),
+                template_mdp_path=template_path,
+                ctx=ctx,
+                prev_gro_path=nvt_gro,
+            )
+        except ValueError as e:
+            print(f"  [ERROR] {e}")
+            return False
         
         # Handle error case
         if velocity_mode == "error":
@@ -3220,6 +3246,10 @@ class GmxProdStage(BaseStage):
                 print("  [ERROR] stage_state.json missing fingerprint_payload.")
                 print("  Restore a valid stage_state.json, or use --force to restart cleanly.")
                 return False
+            if "velocity_mode" in old_payload:
+                resume_velocity_mode = old_payload.get("velocity_mode")
+            else:
+                resume_velocity_mode = old_state.get("velocity_mode")
 
             resume_fallback_warnings: List[str] = []
 
@@ -3286,6 +3316,7 @@ class GmxProdStage(BaseStage):
                 stage_overrides=stage_overrides,
                 extra_overrides=extra_overrides_resolved,
                 effective_overrides=effective_overrides,
+                velocity_mode=resume_velocity_mode,
             )
 
             ignore_runtime = bool(getattr(ctx, "resume_ignore_runtime", False))
@@ -3435,6 +3466,7 @@ class GmxProdStage(BaseStage):
                     stage_overrides=stage_overrides,
                     extra_overrides=extra_overrides_resolved,
                     effective_overrides=effective_overrides,
+                    velocity_mode=resume_velocity_mode,
                 )
                 _write_stage_state(stage_state_path, stage_state, ctx)
 
@@ -3504,6 +3536,8 @@ class GmxProdStage(BaseStage):
             
             _write_repro_json(ctx, output_dir, repro)
             _write_run_report(ctx)
+            if not ctx.dry_run:
+                done_sentinel.write_text("Production MD complete\n")
 
             print(f"  [OK] Production MD resumed and completed")
             return True
@@ -3513,16 +3547,20 @@ class GmxProdStage(BaseStage):
         template_dir = ctx.get_input_path("systems", ctx.system_id, "gromacs", "mdp")
         template_path = template_dir / "md.mdp"
         
-        cpt_available, extra_overrides, velocity_mode, policy_warnings, policy_metadata = decide_prev_state_policy(
-            stage_name="md",
-            prev_cpt_path=npt_cpt,
-            strict_mode=_is_restart_policy_strict(ctx),
-            allow_velocity_reset=ctx.allow_velocity_reset,
-            allow_gro_velocity_restart=getattr(ctx, "allow_gro_velocity_restart", False),
-            template_mdp_path=template_path,
-            ctx=ctx,
-            prev_gro_path=npt_gro,
-        )
+        try:
+            cpt_available, extra_overrides, velocity_mode, policy_warnings, policy_metadata = decide_prev_state_policy(
+                stage_name="md",
+                prev_cpt_path=npt_cpt,
+                strict_mode=_is_restart_policy_strict(ctx),
+                allow_velocity_reset=ctx.allow_velocity_reset,
+                allow_gro_velocity_restart=getattr(ctx, "allow_gro_velocity_restart", False),
+                template_mdp_path=template_path,
+                ctx=ctx,
+                prev_gro_path=npt_gro,
+            )
+        except ValueError as e:
+            print(f"  [ERROR] {e}")
+            return False
         
         # Handle error case
         if velocity_mode == "error":
@@ -3738,6 +3776,8 @@ class GmxProdStage(BaseStage):
         
         _write_repro_json(ctx, output_dir, repro)
         _write_run_report(ctx)
+        if not ctx.dry_run:
+            done_sentinel.write_text("Production MD complete\n")
 
         print(f"  [OK] Production MD complete")
         return True
