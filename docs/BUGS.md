@@ -72,6 +72,10 @@ Select-String -Path .ai/bugs.jsonl -Pattern '"tags":.*"parser"'
 
 - Read inputs only from `IN/` and keep runtime outputs under `OUT_GMX/<RUN_ID>/`.
 - Preserve deterministic sentinels, checkpoint selection, and crash context when fixing resume or failure paths.
+- If a stage runner can be invoked directly or owns substage skip logic, it must write its own final `done.ok` after `stage_state.json`/`repro.json` are durable; do not rely only on an outer dispatcher wrapper to create the success sentinel.
+- Same-stage resume compatibility checks must preserve recorded semantic fields such as `velocity_mode` when rebuilding `stage_state.json`, or the first normal resume can fail on self-inflicted fingerprint drift.
+- GRO velocity restart validation must require parseable and materially non-zero velocities; syntactically present all-zero velocity columns count as missing restart state.
+- Under wrapper launchers such as `mpirun ... gmx_mpi`, record launcher provenance separately from the actual GROMACS binary provenance so audit output does not attribute wrapper paths to the binary.
 - Do not weaken the requirement to keep the full failing workdir and the last log context on error.
 - Search tags: `resume`, `checkpoint`, `sentinel`, `provenance`, `crash-context`.
 - Promote a fix into this section when the bug changes skip logic, checkpoint choice, or failure preservation rules.
