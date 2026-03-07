@@ -16,6 +16,7 @@ Safety features:
 - Comment formatting preserves original structure (Issue E)
 """
 
+import math
 import os
 import re
 import tempfile
@@ -55,6 +56,12 @@ GEN_TEMP_REF_T_TOLERANCE_K = 0.5
 
 # Heuristic keywords for percolated polymer/gel network COM-risk detection
 PERCOLATED_RISK_KEYWORDS = ("polymer", "gel", "network", "matrix")
+
+MDP_READ_ENCODING = "utf-8-sig"
+MDP_WRITE_ENCODING = "utf-8"
+DEFAULT_TC_GRPS_MIN_ATOMS = 50
+DEFAULT_TC_GRPS_MIN_FRACTION = 0.01
+MAX_TC_GRPS_MIN_FRACTION = 0.99
 
 # Default tau_p values for barostats
 # Parrinello-Rahman uses larger value for gel/semi-solid stability
@@ -175,6 +182,15 @@ class OverrideOutcome:
 
 
 @dataclass
+class MDPTextAnalysis:
+    """Normalized view of MDP content plus input-quality diagnostics."""
+    params: Dict[str, str]
+    duplicate_exact: Dict[str, List[Tuple[int, str]]] = field(default_factory=dict)
+    duplicate_semantic: Dict[str, List[Tuple[int, str]]] = field(default_factory=dict)
+    malformed_lines: List[Tuple[int, str]] = field(default_factory=list)
+
+
+@dataclass
 class DiagnosticSink:
     """
     Collects warnings/errors and applies strict escalation in one place.
@@ -203,6 +219,176 @@ class DiagnosticSink:
 
     def error(self, msg: str) -> None:
         self.errors.append(self._with_stage(msg))
+
+
+def _read_mdp_text(mdp_path: Path) -> str:
+    """Read MDP text with the repository-wide decoding policy."""
+    if not mdp_path.exists():
+        raise MDPParseError(f"MDP file not found: {mdp_path}")
+    try:
+        return mdp_path.read_text(encoding=MDP_READ_ENCODING, errors="strict")
+    except UnicodeDecodeError as e:
+        raise MDPParseError(
+            f"Failed to decode MDP file {mdp_path} with encoding {MDP_READ_ENCODING}: {e}"
+        ) from e
+    except OSError as e:
+        raise MDPParseError(f"Failed to read MDP file {mdp_path}: {e}") from e
+
+
+def _analyze_mdp_text(content: str) -> MDPTextAnalysis:
+    """Parse raw MDP text while tracking duplicates and malformed lines."""
+    params: Dict[str, str] = {}
+    exact_occurrences: Dict[str, List[Tuple[int, str]]] = {}
+    semantic_occurrences: Dict[str, List[Tuple[int, str]]] = {}
+    malformed_lines: List[Tuple[int, str]] = []
+    latest_semantic_key: Dict[str, Tuple[str, int]] = {}
+
+    for line_num, line in enumerate(content.splitlines(), 1):
+        stripped = line.split(";", 1)[0].strip()
+        if not stripped:
+            continue
+        if "=" not in stripped:
+            malformed_lines.append((line_num, stripped))
+            continue
+
+        key, value = stripped.split("=", 1)
+        key_norm = normalize_key(key)
+        value = value.strip()
+        exact_occurrences.setdefault(key_norm, []).append((line_num, key_norm))
+
+        semantic_name = VARIANT_TO_SEMANTIC.get(key_norm)
+        if semantic_name is not None:
+            semantic_occurrences.setdefault(semantic_name, []).append((line_num, key_norm))
+            previous = latest_semantic_key.get(semantic_name)
+            if previous is not None:
+                previous_key, _previous_line = previous
+                if previous_key != key_norm:
+                    params.pop(previous_key, None)
+            latest_semantic_key[semantic_name] = (key_norm, line_num)
+
+        params[key_norm] = value
+
+    duplicate_exact = {
+        key: occs
+        for key, occs in exact_occurrences.items()
+        if len(occs) > 1
+    }
+    duplicate_semantic = {
+        semantic_name: occs
+        for semantic_name, occs in semantic_occurrences.items()
+        if len({key for _, key in occs}) > 1
+    }
+
+    return MDPTextAnalysis(
+        params=params,
+        duplicate_exact=duplicate_exact,
+        duplicate_semantic=duplicate_semantic,
+        malformed_lines=malformed_lines,
+    )
+
+
+def _format_mdp_input_issues(analysis: MDPTextAnalysis, source: str) -> List[str]:
+    """Render duplicate/malformed MDP input issues into user-facing messages."""
+    messages: List[str] = []
+    for key in sorted(analysis.duplicate_exact):
+        occs = analysis.duplicate_exact[key]
+        lines = ", ".join(str(line_num) for line_num, _ in occs)
+        messages.append(
+            f"{source}: duplicate MDP key '{key}' at lines {lines}; "
+            f"keeping last occurrence at line {occs[-1][0]}."
+        )
+    for semantic_name in sorted(analysis.duplicate_semantic):
+        occs = analysis.duplicate_semantic[semantic_name]
+        line_info = ", ".join(f"{line_num}:{key}" for line_num, key in occs)
+        winner_line, winner_key = occs[-1]
+        messages.append(
+            f"{source}: duplicate semantic MDP key '{semantic_name}' via {line_info}; "
+            f"keeping last occurrence '{winner_key}' at line {winner_line}."
+        )
+    for line_num, text in analysis.malformed_lines:
+        messages.append(
+            f"{source}: malformed MDP line {line_num} has no '=' after comment stripping: {text!r}"
+        )
+    return messages
+
+
+def _handle_mdp_input_issues(
+    analysis: MDPTextAnalysis,
+    source: str,
+    strict: bool = False,
+    sink: Optional[DiagnosticSink] = None,
+    emit_warnings: bool = True,
+) -> None:
+    """Apply strict/non-strict policy to duplicate or malformed MDP input."""
+    messages = _format_mdp_input_issues(analysis, source)
+    if not messages:
+        return
+    if strict:
+        raise MDPValidationError(
+            "MDP input validation failed:\n"
+            + "\n".join(f"  - {message}" for message in messages)
+        )
+    if emit_warnings and sink is not None:
+        for message in messages:
+            sink.warn(message, escalate_in_strict=False)
+
+
+def _duplicate_mdp_line_indices_to_skip(analysis: MDPTextAnalysis) -> set[int]:
+    """Return zero-based line indices that should be removed by last-wins cleanup."""
+    lines_to_skip: set[int] = set()
+    for occs in analysis.duplicate_exact.values():
+        for line_num, _ in occs[:-1]:
+            lines_to_skip.add(line_num - 1)
+    for occs in analysis.duplicate_semantic.values():
+        for line_num, _ in occs[:-1]:
+            lines_to_skip.add(line_num - 1)
+    return lines_to_skip
+
+
+def _sanitize_tc_grps_thresholds(
+    min_atoms_raw: Any,
+    min_fraction_raw: Any,
+) -> Tuple[int, float, List[str]]:
+    """Normalize tc-grps safety thresholds in one place."""
+    warnings: List[str] = []
+
+    try:
+        min_atoms = int(min_atoms_raw)
+    except (TypeError, ValueError, OverflowError):
+        warnings.append(
+            f"Invalid tc_grps_min_atoms={min_atoms_raw!r}; using default {DEFAULT_TC_GRPS_MIN_ATOMS}."
+        )
+        min_atoms = DEFAULT_TC_GRPS_MIN_ATOMS
+    if min_atoms < 1:
+        warnings.append(f"Invalid tc_grps_min_atoms={min_atoms}; clamping to 1.")
+        min_atoms = 1
+
+    try:
+        min_fraction = float(min_fraction_raw)
+    except (TypeError, ValueError, OverflowError):
+        warnings.append(
+            "Invalid tc_grps_min_fraction="
+            f"{min_fraction_raw!r}; using default {DEFAULT_TC_GRPS_MIN_FRACTION}."
+        )
+        min_fraction = DEFAULT_TC_GRPS_MIN_FRACTION
+    if not math.isfinite(min_fraction):
+        warnings.append(
+            "Invalid tc_grps_min_fraction="
+            f"{min_fraction_raw!r}; using default {DEFAULT_TC_GRPS_MIN_FRACTION}."
+        )
+        min_fraction = DEFAULT_TC_GRPS_MIN_FRACTION
+    elif min_fraction <= 0.0:
+        warnings.append(
+            f"Invalid tc_grps_min_fraction={min_fraction}; using {DEFAULT_TC_GRPS_MIN_FRACTION}."
+        )
+        min_fraction = DEFAULT_TC_GRPS_MIN_FRACTION
+    elif min_fraction >= 1.0:
+        warnings.append(
+            f"Invalid tc_grps_min_fraction={min_fraction}; clamping to {MAX_TC_GRPS_MIN_FRACTION}."
+        )
+        min_fraction = MAX_TC_GRPS_MIN_FRACTION
+
+    return min_atoms, min_fraction, warnings
 
 
 def find_existing_key(params: Dict[str, str], semantic_name: str) -> Optional[str]:
@@ -384,7 +570,7 @@ def parse_ndx_group_sizes(ndx_path: Path) -> Dict[str, int]:
 
     try:
         with open(ndx_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_num, line in enumerate(f, 1):
                 stripped = _strip_ndx_inline_comment(line)
                 if not stripped:
                     continue
@@ -401,9 +587,11 @@ def parse_ndx_group_sizes(ndx_path: Path) -> Dict[str, int]:
                     try:
                         int(token)
                         token_count += 1
-                    except ValueError:
-                        # Ignore non-index tokens safely (comments already stripped).
-                        continue
+                    except ValueError as exc:
+                        raise MDPParseError(
+                            f"Invalid atom index token '{token}' in group '{current_group}' "
+                            f"at line {line_num} of {ndx_path}"
+                        ) from exc
                 sizes[current_group] = sizes.get(current_group, 0) + token_count
     except Exception as e:
         raise MDPParseError(f"Failed to parse index group sizes from {ndx_path}: {e}")
@@ -435,8 +623,8 @@ def _decide_auto_tc_grps_mode(ctx: Optional["PipelineContext"]) -> Dict[str, Any
         "group_sizes": {},
         "group_fractions": {},
         "thresholds": {
-            "min_atoms": 50,
-            "min_fraction": 0.01,
+            "min_atoms": DEFAULT_TC_GRPS_MIN_ATOMS,
+            "min_fraction": DEFAULT_TC_GRPS_MIN_FRACTION,
         },
         "ndx_path": None,
     }
@@ -462,22 +650,12 @@ def _decide_auto_tc_grps_mode(ctx: Optional["PipelineContext"]) -> Dict[str, Any
         )
         return decision
 
-    min_atoms = getattr(ctx, "tc_grps_min_atoms", 50)
-    min_fraction = getattr(ctx, "tc_grps_min_fraction", 0.01)
-    try:
-        min_atoms = int(min_atoms)
-    except (TypeError, ValueError):
-        min_atoms = 50
-    if min_atoms < 1:
-        min_atoms = 1
-    try:
-        min_fraction = float(min_fraction)
-    except (TypeError, ValueError):
-        min_fraction = 0.01
-    if min_fraction <= 0.0:
-        min_fraction = 0.01
-    if min_fraction >= 1.0:
-        min_fraction = 0.99
+    min_atoms, min_fraction, threshold_warnings = _sanitize_tc_grps_thresholds(
+        getattr(ctx, "tc_grps_min_atoms", DEFAULT_TC_GRPS_MIN_ATOMS),
+        getattr(ctx, "tc_grps_min_fraction", DEFAULT_TC_GRPS_MIN_FRACTION),
+    )
+    for warning in threshold_warnings:
+        decision["warnings"].append(f"tc-grps auto mode: {warning}")
 
     decision["thresholds"] = {
         "min_atoms": min_atoms,
@@ -854,29 +1032,9 @@ def parse_mdp(mdp_path: Path) -> Dict[str, str]:
     Returns:
         Dictionary mapping parameter names to values (as strings)
     """
-    params = {}
-    
-    if not mdp_path.exists():
-        raise MDPParseError(f"MDP file not found: {mdp_path}")
-    
-    with open(mdp_path, "r") as f:
-        for line_num, line in enumerate(f, 1):
-            # Strip comments
-            if ";" in line:
-                line = line.split(";", 1)[0]
-            
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Parse key = value
-            if "=" in line:
-                key, value = line.split("=", 1)
-                key = normalize_key(key)  # MDP params are case-insensitive
-                value = value.strip()
-                params[key] = value
-    
-    return params
+    content = _read_mdp_text(mdp_path)
+    analysis = _analyze_mdp_text(content)
+    return dict(analysis.params)
 
 
 def write_mdp(
@@ -910,48 +1068,16 @@ def write_mdp(
     params = _dedupe_semantic_keys(params, patched_values=patched_values, sink=sink)
     
     if original_content and preserve_comments:
-        # Issue 6: Line-level semantic dedupe - ensure no alias duplicates remain
-        # First pass: build map of semantic_name -> list of line indices (in order)
+        analysis = _analyze_mdp_text(original_content)
+        _handle_mdp_input_issues(
+            analysis,
+            f"MDP template for {mdp_path.name}",
+            strict=strict,
+            sink=None,
+            emit_warnings=False,
+        )
         lines = original_content.split("\n")
-        semantic_occurrences = {}  # semantic_name -> list[(idx, key)]
-        
-        for idx, line in enumerate(lines):
-            stripped = line.split(";", 1)[0].strip()
-            if "=" in stripped:
-                key = normalize_key(stripped.split("=", 1)[0])
-                semantic_name = VARIANT_TO_SEMANTIC.get(key)
-                if semantic_name:
-                    semantic_occurrences.setdefault(semantic_name, []).append((idx, key))
-        
-        duplicates = {
-            s: occs for s, occs in semantic_occurrences.items() if len(occs) > 1
-        }
-        
-        if duplicates:
-            if strict:
-                details = []
-                for semantic_name, occs in duplicates.items():
-                    line_info = ", ".join(f"{idx+1}:{key}" for idx, key in occs)
-                    details.append(f"  - {semantic_name}: {line_info}")
-                raise MDPValidationError(
-                    "MDP template contains duplicate semantic key variants:\n"
-                    + "\n".join(details)
-                )
-            else:
-                for semantic_name, occs in duplicates.items():
-                    line_info = ", ".join(f"{idx+1}:{key}" for idx, key in occs)
-                    keep_line = occs[-1][0] + 1
-                    if sink is not None:
-                        sink.warn(
-                            f"MDP contains duplicate semantic key variants for '{semantic_name}': "
-                            f"{line_info}. Keeping last occurrence at line {keep_line} "
-                            f"and removing earlier duplicates (last-wins)."
-                        )
-        
-        lines_to_skip = set()  # line indices to skip (duplicate aliases)
-        for occs in duplicates.values():
-            for idx, _key in occs[:-1]:
-                lines_to_skip.add(idx)
+        lines_to_skip = _duplicate_mdp_line_indices_to_skip(analysis)
         
         # Second pass: rebuild lines, patching and skipping duplicates
         new_lines = []
@@ -1023,7 +1149,7 @@ def write_mdp(
         content = "\n".join(lines)
     
     mdp_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(mdp_path, content, encoding="utf-8")
+    _atomic_write_text(mdp_path, content, encoding=MDP_WRITE_ENCODING)
 
 
 def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -1654,20 +1780,28 @@ def copy_and_patch_mdp(
     """
     if not template_path.exists():
         raise MDPPatchError(f"MDP template not found: {template_path}")
-    
-    # Read original content
-    original_content = template_path.read_text()
-    original_params = parse_mdp(template_path)
-    
+
+    strict = getattr(ctx, "strict_mdp_validation", False) if ctx else False
+    sink = DiagnosticSink(strict=strict, stage=stage)
+
+    # Read original content through the same explicit decode and duplicate-policy path.
+    original_content = _read_mdp_text(template_path)
+    original_analysis = _analyze_mdp_text(original_content)
+    _handle_mdp_input_issues(
+        original_analysis,
+        str(template_path),
+        strict=strict,
+        sink=sink,
+        emit_warnings=True,
+    )
+    original_params = dict(original_analysis.params)
+
     # Record original values for patched params
     original_values = {}
     patched_values = {}
 
     # Build patched params
     patched_params = dict(original_params)
-
-    strict = getattr(ctx, "strict_mdp_validation", False) if ctx else False
-    sink = DiagnosticSink(strict=strict, stage=stage)
 
     # Track how each override resolved to avoid false "unapplied" errors.
     applied_overrides: Dict[str, OverrideOutcome] = {}
@@ -2104,21 +2238,24 @@ def copy_and_patch_mdp(
         validation_warnings.extend(gvc_warnings)
         
         # Verify written values match expected
-        written_params = parse_mdp(output_path)
-        
-        # Post-write semantic validation (independent of patched_values)
-        for semantic_name, variants in SEMANTIC_KEY_GROUPS.items():
-            existing = [normalize_key(v) for v in variants if normalize_key(v) in written_params]
-            if len(existing) > 1:
-                variant_values = {v: written_params[v] for v in existing}
-                msg = (
-                    f"Semantic key '{semantic_name}' has multiple variants in output: "
-                    f"{variant_values}. Only one variant should remain."
-                )
-                if strict:
-                    validation_errors.append(msg)
-                else:
-                    validation_warnings.append(msg)
+        written_content = _read_mdp_text(output_path)
+        written_analysis = _analyze_mdp_text(written_content)
+        written_params = dict(written_analysis.params)
+
+        duplicate_only_analysis = MDPTextAnalysis(
+            params={},
+            duplicate_exact=written_analysis.duplicate_exact,
+            duplicate_semantic=written_analysis.duplicate_semantic,
+            malformed_lines=[],
+        )
+        for msg in _format_mdp_input_issues(
+            duplicate_only_analysis,
+            f"Output MDP {output_path.name}",
+        ):
+            if strict:
+                validation_errors.append(msg)
+            else:
+                validation_warnings.append(msg)
         
         for key, expected in patched_values.items():
             key_norm = normalize_key(key)
@@ -2303,29 +2440,13 @@ def _apply_tc_grps_split(
             reason=f"{reason} Falling back to tc-grps=System for thermostat safety.",
         )
 
-    min_atoms = getattr(ctx, "tc_grps_min_atoms", 50) if ctx else 50
-    min_fraction = getattr(ctx, "tc_grps_min_fraction", 0.01) if ctx else 0.01
+    min_atoms, min_fraction, threshold_warnings = _sanitize_tc_grps_thresholds(
+        getattr(ctx, "tc_grps_min_atoms", DEFAULT_TC_GRPS_MIN_ATOMS) if ctx else DEFAULT_TC_GRPS_MIN_ATOMS,
+        getattr(ctx, "tc_grps_min_fraction", DEFAULT_TC_GRPS_MIN_FRACTION) if ctx else DEFAULT_TC_GRPS_MIN_FRACTION,
+    )
     allow_small_tc_grps = getattr(ctx, "allow_small_tc_grps", False) if ctx else False
-    try:
-        min_atoms = int(min_atoms)
-    except (TypeError, ValueError):
-        min_atoms = 50
-    if min_atoms < 1:
-        sink.warn(
-            f"Invalid tc_grps_min_atoms={min_atoms}; using minimum threshold 1.",
-            escalate_in_strict=False,
-        )
-        min_atoms = 1
-    try:
-        min_fraction = float(min_fraction)
-    except (TypeError, ValueError):
-        min_fraction = 0.01
-    if min_fraction <= 0.0 or min_fraction >= 1.0:
-        sink.warn(
-            f"Invalid tc_grps_min_fraction={min_fraction}; using 0.01.",
-            escalate_in_strict=False,
-        )
-        min_fraction = 0.01
+    for warning in threshold_warnings:
+        sink.warn(warning, escalate_in_strict=False)
 
     if ndx_group_sizes is not None and split_group_names:
         casefold_lookup = {name.casefold(): (name, size) for name, size in ndx_group_sizes.items()}

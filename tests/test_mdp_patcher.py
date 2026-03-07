@@ -15,15 +15,19 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline.mdp_patcher import (
+    _decide_auto_tc_grps_mode,
     _validate_gen_vel_continuation_consistency,
     _validate_gen_vel_consistency,
     _validate_vector_lengths,
     copy_and_patch_mdp,
     get_mdp_overrides_for_stage,
+    parse_mdp,
     parse_ndx_group_sizes,
     parse_ndx_groups,
     validate_mdp_consistency,
+    MDPParseError,
     MDPPatchError,
+    MDPValidationError,
 )
 
 
@@ -53,6 +57,7 @@ class MockContext:
         self.npt_barostat = "Berendsen"
         self.allow_comm_mode_angular_with_pbc = False
         self.tc_grps_min_atoms = 50
+        self.tc_grps_min_fraction = 0.01
         self.allow_small_tc_grps = False
         self.system_type = None
         # Override with provided values
@@ -284,6 +289,133 @@ class TestSemanticKeyOverrideCollision:
         
         content = output.read_text()
         assert "gen_temp = 300" in content, f"Expected gen_temp=300, got: {content}"
+
+
+class TestInputSideDuplicateHandling:
+    """Input duplicate handling must match write-side cleanup and strictness policy."""
+
+    def test_duplicate_exact_key_input_nonstrict_warns_and_keeps_last(self, tmp_path):
+        template = tmp_path / "dup_exact.mdp"
+        template.write_text("nsteps = 1\nnsteps = 2\n")
+        output = tmp_path / "out.mdp"
+        ctx = MockContext(strict_mdp_validation=False)
+
+        _, _, errors, warns = copy_and_patch_mdp(
+            template,
+            output,
+            {},
+            validate=False,
+            ctx=ctx,
+            stage="nvt",
+            return_diagnostics=True,
+        )
+
+        assert errors == []
+        assert any("duplicate mdp key 'nsteps'" in w.lower() for w in warns)
+        assert parse_mdp(template)["nsteps"] == "2"
+        assert parse_mdp(output)["nsteps"] == "2"
+        assert output.read_text().count("nsteps") == 1
+
+    def test_duplicate_exact_key_input_strict_errors(self, tmp_path):
+        template = tmp_path / "dup_exact_strict.mdp"
+        template.write_text("nsteps = 1\nnsteps = 2\n")
+        output = tmp_path / "out.mdp"
+        ctx = MockContext(strict_mdp_validation=True)
+
+        try:
+            copy_and_patch_mdp(
+                template,
+                output,
+                {},
+                validate=False,
+                ctx=ctx,
+                stage="nvt",
+            )
+        except MDPValidationError as e:
+            assert "duplicate MDP key 'nsteps'" in str(e)
+            assert "lines 1, 2" in str(e)
+        else:
+            raise AssertionError("Expected strict duplicate exact-key validation error")
+
+    def test_duplicate_semantic_alias_input_nonstrict_warns_and_keeps_last(self, tmp_path):
+        template = tmp_path / "dup_semantic.mdp"
+        template.write_text("ref_t = 300\nref-t = 310\n")
+        output = tmp_path / "out.mdp"
+        ctx = MockContext(strict_mdp_validation=False)
+
+        parsed_template = parse_mdp(template)
+        assert parsed_template == {"ref-t": "310"}
+
+        _, _, errors, warns = copy_and_patch_mdp(
+            template,
+            output,
+            {},
+            validate=False,
+            ctx=ctx,
+            stage="nvt",
+            return_diagnostics=True,
+        )
+
+        assert errors == []
+        assert any("duplicate semantic mdp key 'ref_t'" in w.lower() for w in warns)
+        assert parse_mdp(output) == parsed_template
+        content = output.read_text()
+        assert "ref-t = 310" in content
+        assert "ref_t =" not in content
+
+    def test_duplicate_semantic_alias_input_strict_errors(self, tmp_path):
+        template = tmp_path / "dup_semantic_strict.mdp"
+        template.write_text("ref_t = 300\nref-t = 310\n")
+        output = tmp_path / "out.mdp"
+        ctx = MockContext(strict_mdp_validation=True)
+
+        try:
+            copy_and_patch_mdp(
+                template,
+                output,
+                {},
+                validate=False,
+                ctx=ctx,
+                stage="nvt",
+            )
+        except MDPValidationError as e:
+            text = str(e)
+            assert "duplicate semantic MDP key 'ref_t'" in text
+            assert "1:ref_t, 2:ref-t" in text
+        else:
+            raise AssertionError("Expected strict duplicate semantic-key validation error")
+
+    def test_malformed_input_line_warns_nonstrict_and_fails_strict(self, tmp_path):
+        template = tmp_path / "malformed_input.mdp"
+        template.write_text("ref_t = 300\nBROKEN LINE\n")
+        output = tmp_path / "out.mdp"
+
+        _, _, errors, warns = copy_and_patch_mdp(
+            template,
+            output,
+            {},
+            validate=False,
+            ctx=MockContext(strict_mdp_validation=False),
+            stage="nvt",
+            return_diagnostics=True,
+        )
+        assert errors == []
+        assert any("malformed mdp line 2" in w.lower() for w in warns)
+        assert "BROKEN LINE" in output.read_text()
+
+        try:
+            copy_and_patch_mdp(
+                template,
+                output,
+                {},
+                validate=False,
+                ctx=MockContext(strict_mdp_validation=True),
+                stage="nvt",
+            )
+        except MDPValidationError as e:
+            assert "malformed MDP line 2" in str(e)
+        else:
+            raise AssertionError("Expected strict malformed-line validation error")
 
 
 # =============================================================================
@@ -743,6 +875,81 @@ class TestNdxInlineCommentParsing:
         assert groups == ["Polymer", "NonPolymer"]
         assert sizes["Polymer"] == 5
         assert sizes["NonPolymer"] == 2
+
+    def test_ndx_group_sizes_rejects_non_integer_tokens(self, tmp_path):
+        ndx = tmp_path / "bad_index.ndx"
+        ndx.write_text("[ Polymer ]\n1 2 bad 3\n")
+        try:
+            parse_ndx_group_sizes(ndx)
+        except MDPParseError as e:
+            assert "Invalid atom index token 'bad'" in str(e)
+            assert "line 2" in str(e)
+        else:
+            raise AssertionError("Expected MDPParseError for malformed ndx group body")
+
+
+class TestAutoTcGrpsHardening:
+    def test_auto_mode_malformed_ndx_falls_back_to_system(self, tmp_path):
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text(
+            "[ Polymer ]\n1 2 bad 3\n"
+            "[ NonPolymer ]\n4 5 6\n"
+            "[ System ]\n1 2 3 4 5 6\n"
+        )
+        ctx = MockContext(
+            tc_grps_mode="auto",
+            active_ndx_path=str(ndx),
+            comm_grps_policy="system",
+        )
+
+        overrides = get_mdp_overrides_for_stage(ctx, "nvt")
+        decision = getattr(ctx, "tc_grps_auto_decision")
+
+        assert overrides.get("tc_grps_mode") == "system"
+        assert decision["applied_mode"] == "system"
+        assert decision["reason"] == "auto_mode_ndx_parse_failed"
+        assert any("failed to parse ndx groups" in w.lower() for w in decision["warnings"])
+
+    def test_auto_thresholds_nonfinite_values_use_defaults(self, tmp_path):
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text(
+            "[ Polymer ]\n" + " ".join(str(i) for i in range(1, 61)) + "\n"
+            "[ NonPolymer ]\n" + " ".join(str(i) for i in range(61, 121)) + "\n"
+            "[ System ]\n" + " ".join(str(i) for i in range(1, 121)) + "\n"
+        )
+        ctx = MockContext(
+            active_ndx_path=str(ndx),
+            tc_grps_min_atoms="nan",
+            tc_grps_min_fraction=float("nan"),
+        )
+
+        decision = _decide_auto_tc_grps_mode(ctx)
+
+        assert decision["thresholds"] == {"min_atoms": 50, "min_fraction": 0.01}
+        assert decision["applied_mode"] == "split"
+        assert any("invalid tc_grps_min_atoms" in w.lower() for w in decision["warnings"])
+        assert any("invalid tc_grps_min_fraction" in w.lower() for w in decision["warnings"])
+
+    def test_auto_thresholds_boundary_values_are_sanitized_once(self, tmp_path):
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text(
+            "[ Polymer ]\n" + " ".join(str(i) for i in range(1, 61)) + "\n"
+            "[ NonPolymer ]\n" + " ".join(str(i) for i in range(61, 121)) + "\n"
+            "[ System ]\n" + " ".join(str(i) for i in range(1, 121)) + "\n"
+        )
+        ctx = MockContext(
+            active_ndx_path=str(ndx),
+            tc_grps_min_atoms=0,
+            tc_grps_min_fraction=1.0,
+        )
+
+        decision = _decide_auto_tc_grps_mode(ctx)
+
+        assert decision["thresholds"] == {"min_atoms": 1, "min_fraction": 0.99}
+        assert decision["applied_mode"] == "system"
+        assert decision["reason"] == "auto_mode_groups_too_small"
+        assert any("clamping to 1" in w.lower() for w in decision["warnings"])
+        assert any("clamping to 0.99" in w.lower() for w in decision["warnings"])
 
 
 class TestPolicyNoneAndNstepsRobustness:
