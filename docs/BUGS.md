@@ -59,6 +59,10 @@ Select-String -Path .ai/bugs.jsonl -Pattern '"tags":.*"parser"'
 - Normalize aliases, case, and spelling before semantic validation.
 - Strict and non-strict modes must operate on the same canonical representation; tolerant mode may relax the outcome, not reinterpret the input.
 - When tolerant mode continues, warnings and manifests must preserve the original token and the canonical key that was used.
+- Detect duplicate exact keys and semantic alias collisions during the initial parse, then apply the same deterministic winner on read, patch, and write paths.
+- If strict mode would reject malformed or ambiguous parser input, fail before patching rather than preserving a silently reinterpreted template.
+- Treat malformed `.ndx` group-body tokens as unsafe input when thermostat auto decisions depend on group sizes; never silently undercount atoms and continue.
+- Sanitize non-finite or boundary safety thresholds in one helper before auto/fallback decisions so invalid config cannot create mode-dependent behavior.
 - Add paired tests for strict and tolerant paths using the same raw input.
 - Search tags: `parser`, `strictness`, `normalization`, `semantics`, `mdp`, `itp`.
 - Promote a fix into this section when one input can be interpreted differently across parsers or strictness modes.

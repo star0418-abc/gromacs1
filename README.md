@@ -1786,6 +1786,7 @@ This ensures `--temperature 300` plus `--tc-grps-mode split` always yields `ref_
   - atom fraction >= `--tc-grps-min-fraction`
 - If auto split is selected, applied groups are exactly `Polymer NonPolymer` from that decision (no fallback to arbitrary first-two ndx groups).
 - If checks fail, patcher falls back to `tc-grps = System` with warning.
+- Malformed non-integer tokens inside `.ndx` group bodies are treated as unsafe input; auto mode falls back to `System` instead of silently undercounting atoms.
 
 **System mode rewrite policy**:
 - `tc-grps-mode=system` actively rewrites final state (not a no-op): `tc-grps=System`, `comm-grps=System`, and compatible `comm-mode`.
@@ -1822,6 +1823,7 @@ python run_pipeline.py ... --tc-grps-mode split --allow-tau-t-autofill
 - Split mode checks group atom counts from `.ndx` when available.
 - Default threshold: `--tc-grps-min-atoms 50`.
 - Default fraction threshold: `--tc-grps-min-fraction 0.01`.
+- Invalid/non-finite threshold values are sanitized once before the decision (`min_atoms` clamps to at least `1`; `min_fraction` falls back/clamps into the safe open interval).
 - Auto-detected tiny groups: split is disabled and patcher falls back to `tc-grps = System`.
 - Explicit tiny groups: strict mode errors; non-strict mode falls back to `System` unless `--allow-small-tc-grps` is set.
 - Rationale: very small thermostat groups can amplify noise (low DOF), causing temperature spikes and instability.
@@ -2056,7 +2058,8 @@ The patcher has two validation modes:
 | tc-grps/tau_t/ref_t length mismatch | Error | Error |
 | ref_p/compressibility dimensionality mismatch vs pcoupltype | Warning | Error |
 | Unknown override key | Warning (adds new line) | Error (likely typo) |
-| Duplicate semantic key variants in template | Warning (last wins) | Error (line numbers) |
+| Duplicate exact key or semantic alias variant in template | Warning (last wins) | Error (line numbers) |
+| Malformed MDP line without `=` | Warning (line preserved) | Error |
 
 Enable strict mode:
 ```bash
@@ -2125,6 +2128,7 @@ When splitting tc-grps, the patcher now validates:
 The patcher now includes a reverse mapping (`VARIANT_TO_SEMANTIC`) for robust override handling:
 - Overrides using `ref-t` will correctly modify template lines using `ref_t`
 - No duplicate keys created when alias styles differ
+- Input parsing resolves duplicate exact keys and underscore/hyphen alias collisions before patching; strict mode fails, non-strict mode keeps the last occurrence with diagnostics
 
 ### LINCS Tuning for Gel Systems
 
