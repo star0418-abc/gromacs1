@@ -2102,6 +2102,9 @@ NPT pressure coupling now validates `ref_p` value count against `pcoupltype`:
 | `anisotropic` | 6 | `ref_p = 1.0 1.0 1.0 0 0 0` (xx yy zz xy xz yz) |
 
 Mismatches are warnings by default, errors in strict mode.
+If `pcoupl` is enabled but `ref_p` is omitted, the patcher still preserves any
+`pcoupltype` diagnostics (for example missing or unknown `pcoupltype`) instead
+of silently dropping them on the early-return path.
 
 ### Hardening v2: force_gen_vel Consistency
 

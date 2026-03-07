@@ -1278,6 +1278,11 @@ def _validate_ref_p_dimensionality(
     ref_p = get_semantic_value(params, "ref_p")
     if not ref_p:
         # ref_p not specified - GROMACS will use defaults, skip validation
+        warn_list.extend(local_sink.warnings)
+        if strict:
+            errors.extend(local_sink.errors)
+        else:
+            warn_list.extend(local_sink.errors)
         return errors, warn_list
     
     ref_p_values = ref_p.split()

@@ -12,10 +12,12 @@ Tests P0/P1 safety improvements:
 from pathlib import Path
 
 import sys
+import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pipeline.mdp_patcher import (
     _decide_auto_tc_grps_mode,
+    _validate_ref_p_dimensionality,
     _validate_gen_vel_continuation_consistency,
     _validate_gen_vel_consistency,
     _validate_vector_lengths,
@@ -458,6 +460,27 @@ class TestTemperatureInjection:
         assert "gen-temp = 300" in content or "gen_temp = 300" in content, \
             f"Expected gen_temp/gen-temp=300 to be injected, got: {content}"
 
+    @pytest.mark.xfail(
+        reason="Pending bug fix: temperature->gen_temp injection still depends on override ordering.",
+        strict=True,
+    )
+    def test_inject_gen_temp_when_gen_vel_override_is_applied_later(self, tmp_path):
+        """Temperature override should still inject gen_temp when later overrides enable gen_vel=yes."""
+        template = tmp_path / "test.mdp"
+        template.write_text("nsteps = 1000\n")
+        output = tmp_path / "output.mdp"
+
+        copy_and_patch_mdp(
+            template,
+            output,
+            {"temperature": 300, "gen_vel": "yes"},
+            validate=False,
+        )
+
+        content = output.read_text()
+        assert "gen_vel = yes" in content or "gen-vel = yes" in content
+        assert "gen-temp = 300" in content or "gen_temp = 300" in content
+
 
 class TestSplitAndCommPolicy:
     """Sanity checks for override outcome status and comm-grps policy hardening."""
@@ -485,6 +508,36 @@ class TestSplitAndCommPolicy:
         assert any("split skipped" in w.lower() for w in warns)
         content = output.read_text()
         assert "tc-grps = A B" in content
+
+    @pytest.mark.xfail(
+        reason="Pending bug fix: non-strict split still emits known-invalid tcoupl/tau_t state.",
+        strict=True,
+    )
+    def test_split_missing_tau_t_nonstrict_degrades_without_emitting_split(self, tmp_path):
+        template = tmp_path / "test.mdp"
+        template.write_text(
+            "tc-grps = System\n"
+            "ref_t = 300\n"
+            "tcoupl = v-rescale\n"
+        )
+        output = tmp_path / "output.mdp"
+        ctx = MockContext(tc_grps_groups="Polymer NonPolymer", strict_mdp_validation=False)
+
+        _, _, errors, warns = copy_and_patch_mdp(
+            template,
+            output,
+            {"tc_grps_mode": "split"},
+            validate=True,
+            ctx=ctx,
+            stage="nvt",
+            return_diagnostics=True,
+        )
+
+        assert errors == []
+        assert any("tau_t is missing" in w.lower() for w in warns)
+        content = output.read_text()
+        assert "tc-grps = System" in content
+        assert "tc-grps = Polymer NonPolymer" not in content
 
     def test_comm_policy_auto_chooses_system_for_polymer_risk(self, tmp_path):
         template = tmp_path / "test.mdp"
@@ -557,6 +610,36 @@ class TestSplitAndCommPolicy:
         else:
             raise AssertionError("Expected MDPPatchError for missing strict comm-grps ndx group")
 
+    @pytest.mark.xfail(
+        reason="Pending bug fix: single-token explicit comm-grps bypasses ndx existence validation.",
+        strict=True,
+    )
+    def test_comm_policy_explicit_single_group_must_exist_in_ndx(self, tmp_path):
+        template = tmp_path / "test.mdp"
+        template.write_text(
+            "tc-grps = System\n"
+            "comm-grps = System\n"
+            "comm-mode = Linear\n"
+        )
+        output = tmp_path / "output.mdp"
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text("[ System ]\n1 2 3\n")
+        ctx = MockContext(
+            active_ndx_path=str(ndx),
+            strict_mdp_validation=True,
+            comm_grps_explicit="GhostGroup",
+        )
+
+        with pytest.raises(MDPPatchError, match="missing in index file"):
+            copy_and_patch_mdp(
+                template,
+                output,
+                {"comm_grps_policy": "explicit"},
+                validate=True,
+                ctx=ctx,
+                stage="md",
+            )
+
 
 class TestValidateConsistencyCtxPassThrough:
     """Ensure final validation honors context flags and .gro velocity detection."""
@@ -578,6 +661,22 @@ class TestValidateConsistencyCtxPassThrough:
 
 
 class TestCompressibilitySafety:
+    @pytest.mark.parametrize(
+        ("params", "expected_fragment"),
+        [
+            ({"pcoupl": "Berendsen"}, "pcoupltype is not set"),
+            (
+                {"pcoupl": "Berendsen", "pcoupltype": "mystery-coupling"},
+                "unknown pcoupltype='mystery-coupling'",
+            ),
+        ],
+    )
+    def test_missing_ref_p_keeps_pcoupltype_diagnostics(self, params, expected_fragment):
+        errors, warns = _validate_ref_p_dimensionality(params, "npt", strict=False)
+
+        assert errors == []
+        assert any(expected_fragment in w.lower() for w in warns)
+
     def test_pr_gel_injects_small_compressibility_with_dimensionality(self, tmp_path):
         template = tmp_path / "npt.mdp"
         template.write_text(
@@ -910,6 +1009,29 @@ class TestAutoTcGrpsHardening:
         assert decision["reason"] == "auto_mode_ndx_parse_failed"
         assert any("failed to parse ndx groups" in w.lower() for w in decision["warnings"])
 
+    def test_auto_mode_bad_group_tokens_never_apply_split_from_partial_counts(self, tmp_path):
+        ndx = tmp_path / "index.ndx"
+        ndx.write_text(
+            "[ Polymer ]\n1 2 3 bad 4 5 6 7 8 9 10\n"
+            "[ NonPolymer ]\n11 12 13 14 15 16 17 18 19 20\n"
+            "[ System ]\n"
+            + " ".join(str(i) for i in range(1, 21))
+            + "\n"
+        )
+        ctx = MockContext(
+            tc_grps_mode="auto",
+            active_ndx_path=str(ndx),
+            tc_grps_min_atoms=5,
+            tc_grps_min_fraction=0.2,
+            comm_grps_policy="system",
+        )
+
+        decision = _decide_auto_tc_grps_mode(ctx)
+
+        assert decision["applied_mode"] == "system"
+        assert decision["reason"] == "auto_mode_ndx_parse_failed"
+        assert any("failed to parse ndx groups" in w.lower() for w in decision["warnings"])
+
     def test_auto_thresholds_nonfinite_values_use_defaults(self, tmp_path):
         ndx = tmp_path / "index.ndx"
         ndx.write_text(
@@ -1006,6 +1128,43 @@ class TestPolicyNoneAndNstepsRobustness:
             assert "'abc'" in text
         else:
             raise AssertionError("Expected MDPPatchError for non-integer nsteps")
+
+
+class TestReadPatchWriteDuplicateRegression:
+    def test_semantic_duplicate_temperature_override_is_deterministic_nonstrict_and_fail_closed_strict(
+        self, tmp_path
+    ):
+        template = tmp_path / "dup_semantic_patch.mdp"
+        template.write_text("ref_t = 290\nref-t = 295\ngen_vel = yes\n")
+
+        output = tmp_path / "out_nonstrict.mdp"
+        _, _, errors, warns = copy_and_patch_mdp(
+            template,
+            output,
+            {"temperature": 300},
+            validate=False,
+            ctx=MockContext(strict_mdp_validation=False),
+            stage="nvt",
+            return_diagnostics=True,
+        )
+
+        assert errors == []
+        assert any("duplicate semantic mdp key 'ref_t'" in w.lower() for w in warns)
+        parsed_output = parse_mdp(output)
+        assert parsed_output["ref-t"] == "300"
+        assert output.read_text().count("ref-t") == 1
+        assert "ref_t =" not in output.read_text()
+
+        strict_output = tmp_path / "out_strict.mdp"
+        with pytest.raises(MDPValidationError, match="duplicate semantic MDP key 'ref_t'"):
+            copy_and_patch_mdp(
+                template,
+                strict_output,
+                {"temperature": 300},
+                validate=False,
+                ctx=MockContext(strict_mdp_validation=True),
+                stage="nvt",
+            )
 
 
 if __name__ == "__main__":
